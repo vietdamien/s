@@ -122,7 +122,7 @@ async fn get_connection(
     let mgr = state.cm.lock().await;
     let has_proxy = mgr.find_proxy_config(&id).is_some();
 
-    let (status, body) = match mgr.get_credentials(&id) {
+    let (status, body) = match mgr.get_credentials(&id).await {
         Ok(Some(creds)) => (StatusCode::OK, json!({ "credentials": creds })),
         Ok(None) => (StatusCode::OK, json!({ "credentials": {} })),
         Err(e) => (StatusCode::BAD_REQUEST, json!({ "error": e.to_string() })),
@@ -157,7 +157,7 @@ async fn connect_integration(
     Json(body): Json<ConnectRequest>,
 ) -> (StatusCode, Json<Value>) {
     let mgr = state.cm.lock().await;
-    match mgr.connect(&id, body.credentials) {
+    match mgr.connect(&id, body.credentials).await {
         Ok(()) => (StatusCode::OK, Json(json!({ "success": true }))),
         Err(e) => (
             StatusCode::BAD_REQUEST,
@@ -172,7 +172,7 @@ async fn disconnect_integration(
     Path(id): Path<String>,
 ) -> (StatusCode, Json<Value>) {
     let mgr = state.cm.lock().await;
-    match mgr.disconnect(&id) {
+    match mgr.disconnect(&id).await {
         Ok(()) => (StatusCode::OK, Json(json!({ "success": true }))),
         Err(e) => (
             StatusCode::BAD_REQUEST,
@@ -210,7 +210,7 @@ async fn list_instances(
     Path(id): Path<String>,
 ) -> (StatusCode, Json<Value>) {
     let mgr = state.cm.lock().await;
-    match mgr.get_all_instances(&id) {
+    match mgr.get_all_instances(&id).await {
         Ok(instances) => {
             let items: Vec<Value> = instances
                 .into_iter()
@@ -238,7 +238,7 @@ async fn connect_instance(
     Json(body): Json<ConnectRequest>,
 ) -> (StatusCode, Json<Value>) {
     let mgr = state.cm.lock().await;
-    match mgr.connect_instance(&id, Some(&instance), body.credentials) {
+    match mgr.connect_instance(&id, Some(&instance), body.credentials).await {
         Ok(()) => (StatusCode::OK, Json(json!({ "success": true }))),
         Err(e) => (
             StatusCode::BAD_REQUEST,
@@ -253,7 +253,7 @@ async fn disconnect_instance_route(
     Path((id, instance)): Path<(String, String)>,
 ) -> (StatusCode, Json<Value>) {
     let mgr = state.cm.lock().await;
-    match mgr.disconnect_instance(&id, Some(&instance)) {
+    match mgr.disconnect_instance(&id, Some(&instance)).await {
         Ok(()) => (StatusCode::OK, Json(json!({ "success": true }))),
         Err(e) => (
             StatusCode::BAD_REQUEST,
@@ -1076,8 +1076,12 @@ async fn connection_proxy(
     };
 
     // Load credentials
-    let creds = mgr.get_credentials(&id).ok().flatten();
-    let oauth_token = screenpipe_connect::oauth::read_oauth_token(&id);
+    let creds = mgr.get_credentials(&id).await.ok().flatten();
+    let oauth_token = screenpipe_connect::oauth::read_oauth_token_instance(
+        state.secret_store.as_deref(),
+        &id,
+        None,
+    );
 
     // Resolve auth
     let auth = resolve_auth(
@@ -1212,7 +1216,7 @@ async fn connection_config(
     Path(id): Path<String>,
 ) -> (StatusCode, Json<Value>) {
     let mgr = state.cm.lock().await;
-    match mgr.get_credentials(&id) {
+    match mgr.get_credentials(&id).await {
         Ok(Some(creds)) => {
             // Filter out secret fields
             let def = mgr.find_def(&id);

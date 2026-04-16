@@ -6,6 +6,7 @@ use super::{Category, Integration, IntegrationDef, ProxyAuth, ProxyConfig};
 use crate::oauth::{self, OAuthConfig};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
+use screenpipe_secrets::SecretStore;
 use serde_json::{Map, Value};
 
 // Same GCP project as Gmail but different OAuth client.
@@ -61,8 +62,8 @@ impl Integration for GoogleCalendar {
         Some(&CFG)
     }
 
-    async fn test(&self, client: &reqwest::Client, _creds: &Map<String, Value>) -> Result<String> {
-        let token = oauth::get_valid_token(client, "google-calendar")
+    async fn test(&self, client: &reqwest::Client, _creds: &Map<String, Value>, secret_store: Option<&SecretStore>) -> Result<String> {
+        let token = oauth::get_valid_token_instance(secret_store, client, "google-calendar", None)
             .await
             .ok_or_else(|| anyhow!("not connected — use 'Connect Google Calendar' button"))?;
 

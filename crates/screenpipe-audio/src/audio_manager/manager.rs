@@ -339,7 +339,8 @@ impl AudioManager {
 
     /// Stop a device's recording without removing it from enabled_devices.
     /// Idempotent — safe to call on already-stopped devices.
-    async fn stop_device_recording(&self, device: &AudioDevice) -> Result<()> {
+    /// Used by device monitor for force-cycling devices after sleep/wake.
+    pub async fn stop_device_recording(&self, device: &AudioDevice) -> Result<()> {
         // Signal the recording loop to stop BEFORE aborting the handle,
         // so it exits cleanly without triggering "stream dead" warnings.
         if let Some(is_running) = self.device_manager.is_running_mut(device) {

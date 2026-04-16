@@ -5,6 +5,7 @@
 use super::{require_str, Category, FieldDef, Integration, IntegrationDef};
 use anyhow::Result;
 use async_trait::async_trait;
+use screenpipe_secrets::SecretStore;
 use serde_json::{Map, Value};
 
 static DEF: IntegrationDef = IntegrationDef {
@@ -39,7 +40,7 @@ impl Integration for Trello {
         &DEF
     }
 
-    async fn test(&self, client: &reqwest::Client, creds: &Map<String, Value>) -> Result<String> {
+    async fn test(&self, client: &reqwest::Client, creds: &Map<String, Value>, _secret_store: Option<&SecretStore>) -> Result<String> {
         let api_key = require_str(creds, "api_key")?;
         let api_token = require_str(creds, "api_token")?;
         let resp: Value = client

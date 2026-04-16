@@ -589,6 +589,8 @@ async fn main() {
                 update_global_shortcuts,
                 spawn_screenpipe,
                 stop_screenpipe,
+                recording::start_capture,
+                recording::stop_capture,
                 recording::get_monitors,
                 recording::get_audio_devices,
                 // Commands from commands.rs
@@ -616,6 +618,8 @@ async fn main() {
                 commands::reset_onboarding,
                 commands::set_onboarding_step,
                 commands::show_onboarding_window,
+                commands::get_keychain_status,
+                commands::enable_keychain_encryption,
                 commands::open_search_window,
                 // Shortcut reminder commands
                 commands::show_shortcut_reminder,
@@ -882,6 +886,8 @@ async fn main() {
             commands::reset_onboarding,
             commands::set_onboarding_step,
             commands::show_onboarding_window,
+            commands::get_keychain_status,
+            commands::enable_keychain_encryption,
             commands::open_search_window,
             // Shortcut reminder commands
             commands::show_shortcut_reminder,

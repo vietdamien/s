@@ -10,6 +10,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
 use screenpipe_core::pipes::PipeManager;
+use screenpipe_secrets::SecretStore;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -125,6 +126,7 @@ pub struct RunPipeBody {
 /// Accepts an optional JSON body with `notification_context` to inject into the pipe prompt.
 pub async fn run_pipe_now(
     State(pm): State<SharedPipeManager>,
+    secret_store: Option<axum::Extension<Arc<SecretStore>>>,
     Path(id): Path<String>,
     body: Option<Json<RunPipeBody>>,
 ) -> Json<Value> {
@@ -165,17 +167,21 @@ pub async fn run_pipe_now(
                 .parent()
                 .unwrap_or(mgr.pipes_dir())
                 .to_path_buf();
-            let store = screenpipe_connect::connections::load_store(&screenpipe_dir);
-            let missing: Vec<&str> = required
-                .iter()
-                .filter(|conn_id| {
-                    !store
-                        .get(conn_id.as_str())
-                        .map(|c| c.enabled && !c.credentials.is_empty())
-                        .unwrap_or(false)
-                })
-                .map(|s| s.as_str())
-                .collect();
+            let ss = secret_store.as_ref().map(|e| e.0.as_ref());
+            let mut missing = Vec::new();
+            for conn_id in required {
+                let configured = screenpipe_connect::connections::load_connection(
+                    ss,
+                    &screenpipe_dir,
+                    conn_id,
+                )
+                .await
+                .map(|c| c.enabled && !c.credentials.is_empty())
+                .unwrap_or(false);
+                if !configured {
+                    missing.push(conn_id.as_str());
+                }
+            }
             if !missing.is_empty() {
                 return Json(json!({
                     "error": format!(

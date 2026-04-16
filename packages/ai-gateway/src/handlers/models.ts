@@ -245,6 +245,22 @@ const CURATED_MODELS: ModelEntry[] = [
     cost_tier: 'free',
     recommended_for: ['pipes', 'chat'],
   },
+  // ── Confidential inference (Tinfoil — secure enclaves) ──
+  {
+    id: 'gemma4-31b',
+    object: 'model',
+    owned_by: 'tinfoil',
+    name: 'Gemma 4 31B (Confidential)',
+    description: 'runs in secure enclaves — your data stays encrypted, even from the provider. text only.',
+    tags: ['confidential', 'private', 'encrypted'],
+    free: false,
+    context_window: 256000,
+    best_for: ['private queries', 'sensitive data', 'general'],
+    speed: 'medium',
+    intelligence: 'high',
+    cost_tier: 'low',
+    recommended_for: ['chat', 'analysis'],
+  },
   // ── Included with screenpipe ──
   {
     id: 'claude-opus-4-6',

@@ -214,10 +214,24 @@ fn decide_status(
                 current_status
             }
         }
+        Ok(health) if health.status == "degraded" && !health.drm_content_paused => {
+            // Server responding but degraded (vision or audio pipeline failed)
+            // and NOT caused by DRM content detection.
+            // Most common cause: screen recording permission revoked.
+            // Show Error after debounce so the tray icon reflects the problem.
+            if consecutive_unhealthy >= unhealthy_threshold {
+                RecordingStatus::Error
+            } else if current_status == RecordingStatus::Recording {
+                RecordingStatus::Recording
+            } else {
+                current_status
+            }
+        }
         Ok(_) => {
-            // Server is responding (healthy, degraded, or stale) — it's running.
+            // Server is responding (healthy, stale, or degraded-with-DRM-pause).
             // "stale" means timestamps are old but the server process is alive;
             // this happens during DB pool saturation and resolves on its own.
+            // DRM pause is intentional — don't show error for it.
             RecordingStatus::Recording
         }
         Err(_) => {
@@ -353,6 +367,9 @@ pub async fn start_health_check(app: tauri::AppHandle) -> Result<()> {
     let mut last_restart_triggered: Option<Instant> = None;
     // Track last known spawn epoch to detect user-initiated restarts
     let mut last_known_spawn_epoch: u64 = 0;
+    // Cooldown for health-based permission-lost emission (macOS only)
+    #[cfg(target_os = "macos")]
+    let mut last_emitted_health_permission: Option<Instant> = None;
 
     tokio::spawn(async move {
         loop {
@@ -365,7 +382,7 @@ pub async fn start_health_check(app: tauri::AppHandle) -> Result<()> {
             // Connection errors = server unreachable (crash, restart, port conflict).
             // Unhealthy = server responding but reporting a problem (DB issues, stalls).
             match &health_result {
-                Ok(health) if health.status == "unhealthy" || health.status == "error" => {
+                Ok(health) if health.status == "unhealthy" || health.status == "error" || health.status == "degraded" => {
                     ever_connected = true;
                     consecutive_failures = 0;
                     consecutive_unhealthy = consecutive_unhealthy.saturating_add(1);
@@ -394,6 +411,61 @@ pub async fn start_health_check(app: tauri::AppHandle) -> Result<()> {
                 CONSECUTIVE_UNHEALTHY_THRESHOLD,
                 current_status,
             );
+
+            // macOS only: emit permission-lost when health reports degraded with
+            // vision/audio pipeline failure. CGPreflightScreenCaptureAccess returns
+            // stale results when the user toggles the permission off in System Settings
+            // (the app stays in TCC but preflight still says "permitted"), so the
+            // health endpoint is the only reliable detection.
+            //
+            // Guards against false positives:
+            // - Skip during startup grace period (pipelines still initializing)
+            // - Skip during restart grace period (wake, settings change, etc.)
+            // - Skip if DRM pause is active (intentional capture stop)
+            // - macOS only (Windows/Linux don't have TCC permissions)
+            // - 5-minute cooldown between emissions (same as permission monitor)
+            #[cfg(target_os = "macos")]
+            if let Ok(health) = &health_result {
+                let past_startup = start_time.elapsed() > STARTUP_GRACE_PERIOD * 2;
+                let past_restart = last_restart_triggered
+                    .map(|t| t.elapsed() > Duration::from_secs(120))
+                    .unwrap_or(true);
+
+                if health.status == "degraded"
+                    && consecutive_unhealthy >= CONSECUTIVE_UNHEALTHY_THRESHOLD
+                    && past_startup
+                    && past_restart
+                    && !health.drm_content_paused
+                {
+                    let vision_down = health.frame_status.as_deref() == Some("not_started");
+                    let audio_down = health.audio_status.as_deref() == Some("not_started");
+                    if vision_down || audio_down {
+                        // Cooldown: don't re-emit within 5 minutes
+                        let should_emit = match last_emitted_health_permission {
+                            Some(t) => t.elapsed() >= Duration::from_secs(300),
+                            None => true,
+                        };
+                        if should_emit {
+                            warn!(
+                                "health check: degraded for {}s — vision={}, audio={}. emitting permission-lost",
+                                consecutive_unhealthy,
+                                health.frame_status.as_deref().unwrap_or("unknown"),
+                                health.audio_status.as_deref().unwrap_or("unknown"),
+                            );
+                            let _ = app.emit(
+                                "permission-lost",
+                                serde_json::json!({
+                                    "screen_recording": vision_down,
+                                    "microphone": audio_down,
+                                    "accessibility": false,
+                                    "browser_automation": false,
+                                }),
+                            );
+                            last_emitted_health_permission = Some(Instant::now());
+                        }
+                    }
+                }
+            }
 
             // Parse device info from health response, filtered by monitor settings
             let mut devices = parse_devices_from_health(&health_result);

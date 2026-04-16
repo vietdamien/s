@@ -567,6 +567,10 @@ jobs:
           tar -xzf artifacts/screenpipe-macos-aarch64-apple-darwin/screenpipe-*.tar.gz -C /tmp/darwin-arm64 || true
           cp /tmp/darwin-arm64/bin/screenpipe packages/cli/screenpipe-darwin-arm64/bin/ 2>/dev/null || \
             (cd artifacts/screenpipe-macos-aarch64-apple-darwin && tar -xzf screenpipe-*.tar.gz && cp bin/screenpipe ../../packages/cli/screenpipe-darwin-arm64/bin/)
+          # Bundle mlx.metallib for Parakeet MLX GPU support
+          cp /tmp/darwin-arm64/bin/mlx.metallib packages/cli/screenpipe-darwin-arm64/bin/ 2>/dev/null || \
+            (cd artifacts/screenpipe-macos-aarch64-apple-darwin && cp bin/mlx.metallib ../../packages/cli/screenpipe-darwin-arm64/bin/ 2>/dev/null) || \
+            echo "⚠️ mlx.metallib not found in artifact"
           chmod +x packages/cli/screenpipe-darwin-arm64/bin/screenpipe
 
           # macOS x64

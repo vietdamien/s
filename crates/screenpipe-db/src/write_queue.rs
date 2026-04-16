@@ -20,10 +20,11 @@
 
 use chrono::{DateTime, Utc};
 use sqlx::{Pool, Sqlite};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 /// Maximum writes per batch. Caps transaction size to avoid holding
 /// the write lock too long and starving readers.
@@ -35,6 +36,31 @@ const DRAIN_INTERVAL: Duration = Duration::from_millis(100);
 /// Channel capacity. 4096 provides headroom for burst writes without
 /// backpressure reaching capture threads.
 const CHANNEL_CAPACITY: usize = 4096;
+
+// ── Sleep/wake pause mechanism ───────────────────────────────────────────
+
+/// When true, the drain loop holds pending writes instead of executing them.
+/// Set by the sleep monitor before macOS sleep, cleared on wake.
+static WRITE_PAUSED: AtomicBool = AtomicBool::new(false);
+
+/// Notifies the drain loop to resume after being paused.
+static RESUME_NOTIFY: std::sync::OnceLock<tokio::sync::Notify> = std::sync::OnceLock::new();
+
+/// Pause the write queue. Safe to call from any thread (including ObjC callbacks).
+/// The drain loop will finish its current in-flight batch, then block.
+pub fn request_write_pause() {
+    WRITE_PAUSED.store(true, Ordering::SeqCst);
+    info!("write_queue: pause requested (sleep)");
+}
+
+/// Resume the write queue. Safe to call from any thread.
+pub fn request_write_resume() {
+    WRITE_PAUSED.store(false, Ordering::SeqCst);
+    if let Some(notify) = RESUME_NOTIFY.get() {
+        notify.notify_one();
+    }
+    info!("write_queue: resume requested (wake)");
+}
 
 // ── Write operation definitions ──────────────────────────────────────────
 
@@ -371,6 +397,27 @@ async fn drain_loop(
                 Ok(pw) => batch.push(pw),
                 Err(_) => break,
             }
+        }
+
+        // ── Sleep/wake pause gate ──
+        // If paused (system going to sleep), hold all pending writes
+        // until resumed. This prevents WAL corruption from I/O errors
+        // during sleep transitions.
+        if WRITE_PAUSED.load(Ordering::SeqCst) {
+            if !batch.is_empty() {
+                info!("write_queue: paused for sleep, holding {} writes", batch.len());
+            }
+            let notify = RESUME_NOTIFY.get_or_init(|| tokio::sync::Notify::new());
+            tokio::select! {
+                _ = notify.notified() => {
+                    info!("write_queue: resumed after sleep, {} pending", batch.len());
+                }
+                _ = tokio::time::sleep(Duration::from_secs(120)) => {
+                    warn!("write_queue: pause timed out after 120s, auto-resuming");
+                    WRITE_PAUSED.store(false, Ordering::SeqCst);
+                }
+            }
+            continue;
         }
 
         if batch.is_empty() {

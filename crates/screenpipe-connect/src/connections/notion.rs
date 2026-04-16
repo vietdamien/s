@@ -6,6 +6,7 @@ use super::{Category, Integration, IntegrationDef, ProxyAuth, ProxyConfig};
 use crate::oauth::{self, OAuthConfig};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
+use screenpipe_secrets::SecretStore;
 use serde_json::{Map, Value};
 
 static OAUTH: OAuthConfig = OAuthConfig {
@@ -47,8 +48,8 @@ impl Integration for Notion {
         Some(&CFG)
     }
 
-    async fn test(&self, client: &reqwest::Client, _creds: &Map<String, Value>) -> Result<String> {
-        let token = oauth::read_oauth_token("notion")
+    async fn test(&self, client: &reqwest::Client, _creds: &Map<String, Value>, secret_store: Option<&SecretStore>) -> Result<String> {
+        let token = oauth::read_oauth_token_instance(secret_store, "notion", None)
             .await
             .ok_or_else(|| anyhow!("not connected — use 'Connect with Notion' button"))?;
         let resp: Value = client

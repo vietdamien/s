@@ -7,7 +7,12 @@ import { StreamTimeSeriesResponse } from "@/components/rewind/timeline";
 import { hasFramesForDate } from "../actions/has-frames-date";
 import { subDays } from "date-fns";
 import { saveFramesToCache, loadCachedFrames } from "./use-timeline-cache";
-import { getApiBaseUrl } from "@/lib/api";
+import {
+	appendAuthToken,
+	ensureApiReady,
+	getApiBaseUrl,
+	redactApiUrlForLogs,
+} from "@/lib/api";
 
 // Frame buffer for batching updates - reduces 68 re-renders to ~3-5
 let frameBuffer: StreamTimeSeriesResponse[] = [];
@@ -315,51 +320,57 @@ export const useTimelineStore = create<TimelineState>((set, get) => ({
 	},
 
 	connectWebSocket: () => {
-		// Cancel any pending reconnect timeout to prevent cascade
-		if (reconnectTimeout) {
-			clearTimeout(reconnectTimeout);
-			reconnectTimeout = null;
-		}
+		void (async () => {
+			await ensureApiReady();
 
-		// Increment WebSocket ID to invalidate old connection handlers
-		currentWsId++;
-		const thisWsId = currentWsId;
+			// Cancel any pending reconnect timeout to prevent cascade
+			if (reconnectTimeout) {
+				clearTimeout(reconnectTimeout);
+				reconnectTimeout = null;
+			}
 
-		// Close existing websocket if any (including CONNECTING state to handle React Strict Mode double-render)
-		const existingWs = get().websocket;
-		if (existingWs && (existingWs.readyState === WebSocket.OPEN || existingWs.readyState === WebSocket.CONNECTING)) {
-			existingWs.close();
-		}
+			// Increment WebSocket ID to invalidate old connection handlers
+			currentWsId++;
+			const thisWsId = currentWsId;
 
-		// OPTIMISTIC: Don't reset frames on reconnect - keep showing existing data
-		// Only reset request tracking and connection state
-		const currentFrames = get().frames;
-		const currentTimestamps = get().frameTimestamps;
-		
-		set({
-			// Keep existing frames visible!
-			frames: currentFrames,
-			frameTimestamps: currentTimestamps,
-			sentRequests: new Set<string>(),
-			isLoading: currentFrames.length === 0, // Only show loading if no frames
-			loadingProgress: { loaded: currentFrames.length, isStreaming: false },
-			error: null,
-			message: currentFrames.length > 0 ? null : "connecting...",
-			isConnected: false,
-		});
-		
-		frameBuffer = [];
-		requestRetryCount = 0; // Reset retry counter on reconnection
-		if (progressUpdateTimer) {
-			clearTimeout(progressUpdateTimer);
-			progressUpdateTimer = null;
-		}
-		if (requestTimeoutTimer) {
-			clearTimeout(requestTimeoutTimer);
-			requestTimeoutTimer = null;
-		}
+			// Close existing websocket if any (including CONNECTING state to handle React Strict Mode double-render)
+			const existingWs = get().websocket;
+			if (existingWs && (existingWs.readyState === WebSocket.OPEN || existingWs.readyState === WebSocket.CONNECTING)) {
+				existingWs.close();
+			}
 
-		const ws = new WebSocket(`${getApiBaseUrl().replace("http", "ws")}/stream/frames`);
+			// OPTIMISTIC: Don't reset frames on reconnect - keep showing existing data
+			// Only reset request tracking and connection state
+			const currentFrames = get().frames;
+			const currentTimestamps = get().frameTimestamps;
+			
+			set({
+				// Keep existing frames visible!
+				frames: currentFrames,
+				frameTimestamps: currentTimestamps,
+				sentRequests: new Set<string>(),
+				isLoading: currentFrames.length === 0, // Only show loading if no frames
+				loadingProgress: { loaded: currentFrames.length, isStreaming: false },
+				error: null,
+				message: currentFrames.length > 0 ? null : "connecting...",
+				isConnected: false,
+			});
+			
+			frameBuffer = [];
+			requestRetryCount = 0; // Reset retry counter on reconnection
+			if (progressUpdateTimer) {
+				clearTimeout(progressUpdateTimer);
+				progressUpdateTimer = null;
+			}
+			if (requestTimeoutTimer) {
+				clearTimeout(requestTimeoutTimer);
+				requestTimeoutTimer = null;
+			}
+
+			// Same as health/metrics WS: cookie may not cross webview port; ?token= is reliable.
+			const wsBase = getApiBaseUrl().replace("http://", "ws://");
+			const wsUrl = appendAuthToken(`${wsBase}/stream/frames`);
+			const ws = new WebSocket(wsUrl);
 
 		ws.onopen = () => {
 			// Ignore events from old WebSocket instances
@@ -513,14 +524,17 @@ export const useTimelineStore = create<TimelineState>((set, get) => ({
 			}
 		};
 
-		ws.onerror = (error) => {
+		ws.onerror = () => {
 			// Ignore events from old WebSocket instances
 			if (thisWsId !== currentWsId) return;
 
 			connectionAttempts++;
 
 			if (!hasLoggedTimelineDisconnect) {
-				console.warn("timeline WebSocket: server unreachable, retrying silently...");
+				console.warn(
+					"timeline WebSocket onerror (browsers do not expose the failure; see onclose and engine logs for auth/port issues)",
+					{ url: redactApiUrlForLogs(ws.url), readyState: ws.readyState },
+				);
 				hasLoggedTimelineDisconnect = true;
 			}
 
@@ -545,7 +559,12 @@ export const useTimelineStore = create<TimelineState>((set, get) => ({
 			} else {
 				// Max retries exceeded - but still don't block if we have frames
 				if (currentFrames.length === 0) {
-					set({ error: "Connection error occurred", isLoading: false, isConnected: false });
+					set({
+						error:
+							"Timeline WebSocket failed after retries. Check devtools onclose code/reason and terminal for `api auth: rejected WebSocket upgrade`.",
+						isLoading: false,
+						isConnected: false,
+					});
 				} else {
 					// Have frames - show subtle indicator, not error
 					set({ error: null, isLoading: false, isConnected: false, message: null });
@@ -553,10 +572,22 @@ export const useTimelineStore = create<TimelineState>((set, get) => ({
 			}
 		};
 
-		ws.onclose = () => {
+		ws.onclose = (event: CloseEvent) => {
 			// Ignore events from old WebSocket instances (e.g., when refresh button is clicked)
 			if (thisWsId !== currentWsId) {
 				return;
+			}
+
+			const closeDetail = {
+				code: event.code,
+				reason: event.reason || "",
+				wasClean: event.wasClean,
+				url: redactApiUrlForLogs(ws.url),
+			};
+			if (event.code === 1000 && event.wasClean) {
+				console.debug("[timeline WS] closed (clean)", closeDetail);
+			} else {
+				console.warn("[timeline WS] closed", closeDetail);
 			}
 
 			// Flush any remaining frames before closing
@@ -599,6 +630,7 @@ export const useTimelineStore = create<TimelineState>((set, get) => ({
 				}, delay);
 			}
 		};
+		})();
 	},
 
 	fetchTimeRange: async (startTime: Date, endTime: Date) => {

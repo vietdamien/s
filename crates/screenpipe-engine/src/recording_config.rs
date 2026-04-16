@@ -123,6 +123,10 @@ pub struct RecordingConfig {
     /// Set to 0.0.0.0 to allow access from other devices on the network.
     /// When set to 0.0.0.0, api_auth should be enabled for security.
     pub listen_address: std::net::Ipv4Addr,
+
+    /// When true, create a keychain encryption key if one doesn't exist.
+    /// Without this, the CLI only uses an existing key (created by the desktop app).
+    pub encrypt_secrets: bool,
 }
 
 impl RecordingConfig {
@@ -217,6 +221,7 @@ impl RecordingConfig {
             api_auth: settings.api_auth,
             api_auth_key: None,
             listen_address: std::net::Ipv4Addr::LOCALHOST,
+            encrypt_secrets: false, // desktop app handles keychain via Tauri commands
         }
     }
 

@@ -439,6 +439,9 @@ async fn main() -> anyhow::Result<()> {
                         json!(record_args.sync_interval_secs),
                     );
                     map.insert("debug".into(), json!(record_args.debug));
+                    map.insert("api_auth".into(), json!(record_args.api_auth));
+                    map.insert("encrypt_secrets".into(), json!(record_args.encrypt_secrets));
+                    map.insert("retention_days".into(), json!(record_args.retention_days));
                     // Only send counts for privacy-sensitive lists (not actual values)
                     map.insert(
                         "audio_device_count".into(),
@@ -899,7 +902,29 @@ async fn main() -> anyhow::Result<()> {
 
     // Initialize secret store for unified credential management
     {
-        let secret_store_result = screenpipe_secrets::SecretStore::new(db.pool.clone(), None).await;
+        // Read-only keychain access: pick up existing key without triggering modals.
+        // Use --encrypt-secrets to create a key if one doesn't exist.
+        let secret_key = if config.encrypt_secrets {
+            match screenpipe_secrets::keychain::get_or_create_key() {
+                Some(k) => {
+                    info!("keychain: encryption key ready (--encrypt-secrets)");
+                    Some(k)
+                }
+                None => {
+                    warn!("keychain: failed to create encryption key — secrets will be stored unencrypted");
+                    None
+                }
+            }
+        } else {
+            match screenpipe_secrets::keychain::get_key() {
+                screenpipe_secrets::keychain::KeyResult::Found(k) => {
+                    info!("keychain: using existing encryption key");
+                    Some(k)
+                }
+                _ => None,
+            }
+        };
+        let secret_store_result = screenpipe_secrets::SecretStore::new(db.pool.clone(), secret_key).await;
         match secret_store_result {
             Ok(store) => {
                 // Run startup permission sweep
@@ -1095,6 +1120,29 @@ async fn main() -> anyhow::Result<()> {
             "set (masked)"
         } else {
             "not set"
+        }
+    );
+    println!(
+        "│ api auth               │ {:<34} │",
+        if record_args.api_auth { "enabled" } else { "disabled" }
+    );
+    println!(
+        "│ encrypt secrets        │ {:<34} │",
+        if record_args.encrypt_secrets {
+            "enabled (--encrypt-secrets)"
+        } else {
+            match screenpipe_secrets::keychain::get_key() {
+                screenpipe_secrets::keychain::KeyResult::Found(_) => "enabled (existing key)",
+                _ => "disabled",
+            }
+        }
+    );
+    println!(
+        "│ retention days         │ {:<34} │",
+        if record_args.retention_days == 0 {
+            "forever".to_string()
+        } else {
+            format!("{}", record_args.retention_days)
         }
     );
 
@@ -1296,12 +1344,18 @@ async fn main() -> anyhow::Result<()> {
     let server_future = server.start();
     pin_mut!(server_future);
 
-    // Auto-enable local data retention (14 days) for CLI users.
+    // Auto-enable local data retention for CLI users.
     // The Tauri app does this via auto_start_retention(); for CLI we hit the
     // same HTTP endpoint after a short delay to let the server bind.
     {
         let port = config.port;
+        let retention_days = record_args.retention_days;
+        let retention_enabled = retention_days > 0;
         tokio::spawn(async move {
+            if !retention_enabled {
+                tracing::info!("local retention disabled (--retention-days 0)");
+                return;
+            }
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             let client = reqwest::Client::new();
             let url = format!("http://localhost:{}/retention/configure", port);
@@ -1309,13 +1363,13 @@ async fn main() -> anyhow::Result<()> {
                 .post(&url)
                 .json(&serde_json::json!({
                     "enabled": true,
-                    "retention_days": 14,
+                    "retention_days": retention_days,
                 }))
                 .send()
                 .await
             {
                 Ok(r) if r.status().is_success() => {
-                    tracing::info!("local retention auto-enabled (14 days)");
+                    tracing::info!("local retention auto-enabled ({} days)", retention_days);
                 }
                 Ok(r) => {
                     tracing::debug!("retention configure returned {}", r.status());

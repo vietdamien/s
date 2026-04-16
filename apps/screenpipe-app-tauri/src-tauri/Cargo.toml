@@ -1,6 +1,6 @@
 [package]
 name = "screenpipe-app"
-version = "2.3.89"
+version = "2.3.98"
 description = "24/7 memory for your desktop. 100% local."
 authors = ["you"]
 license = ""
@@ -108,7 +108,7 @@ urlencoding = "2"
 hostname = "0.4"
 
 # Screenpipe core (for sync)
-screenpipe-core = { path = "../../../crates/screenpipe-core", features = ["cloud-sync"] }
+screenpipe-core = { path = "../../../crates/screenpipe-core", features = ["cloud-sync", "secrets"] }
 
 # Embedded screenpipe server
 screenpipe-config = { path = "../../../crates/screenpipe-config", features = ["specta"] }

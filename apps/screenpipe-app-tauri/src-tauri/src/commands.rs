@@ -133,23 +133,29 @@ pub fn is_enterprise_build_cmd(app_handle: tauri::AppHandle) -> bool {
 }
 
 /// Get the local API auth key and port for the frontend to use.
-/// Returns immediately (no async, no disk I/O) — the key is already in memory.
-/// Returns { key: string | null, port: number, auth_enabled: bool }.
+/// Returns the local API config (key, port, auth flag).
+///
+/// IMPORTANT: This is `async` so it runs on the tokio thread pool, NOT the
+/// main thread. The webview calls this via IPC during early init — if it ran
+/// on the main thread it would deadlock with tray/window setup that also
+/// needs the main thread, causing a 5-second blank screen.
 #[tauri::command]
 #[specta::specta]
-pub fn get_local_api_config(
+pub async fn get_local_api_config(
     app_handle: tauri::AppHandle,
 ) -> serde_json::Value {
     use crate::recording::RecordingState;
     if let Some(state) = app_handle.try_state::<RecordingState>() {
-        if let Ok(guard) = state.server.try_lock() {
-            if let Some(ref core) = *guard {
-                return serde_json::json!({
-                    "key": core.local_api_key,
-                    "port": core.port,
-                    "auth_enabled": core.local_api_key.is_some(),
-                });
-            }
+        // Must await the lock: `try_lock` often failed while server_core held the mutex
+        // during startup, returning key:null to the webview. JS then cached "no API key" and
+        // opened WebSockets without ?token= → endless 403 / abnormal close (1006).
+        let guard = state.server.lock().await;
+        if let Some(ref core) = *guard {
+            return serde_json::json!({
+                "key": core.local_api_key,
+                "port": core.port,
+                "auth_enabled": core.local_api_key.is_some(),
+            });
         }
     }
     serde_json::json!({
@@ -1036,6 +1042,57 @@ pub async fn show_onboarding_window(app_handle: tauri::AppHandle) -> Result<(), 
     Ok(())
 }
 
+// Keychain / secure storage commands
+
+#[derive(serde::Serialize, specta::Type)]
+pub struct KeychainStatus {
+    pub state: String,
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn get_keychain_status() -> Result<KeychainStatus, String> {
+    let state = match crate::secrets::get_key() {
+        crate::secrets::KeyResult::Found(_) => "enabled",
+        crate::secrets::KeyResult::NotFound => "disabled",
+        crate::secrets::KeyResult::AccessDenied => "disabled",
+        crate::secrets::KeyResult::Unavailable => "unavailable",
+    };
+    Ok(KeychainStatus {
+        state: state.to_string(),
+    })
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn enable_keychain_encryption() -> Result<KeychainStatus, String> {
+    let key = crate::secrets::get_or_create_key().ok_or_else(|| {
+        "Keychain access denied or unavailable. Credentials will remain unencrypted.".to_string()
+    })?;
+
+    let data_dir = screenpipe_core::paths::default_screenpipe_data_dir();
+    let db_path = data_dir.join("db.sqlite");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
+
+    if let Ok(pool) = sqlx::SqlitePool::connect(&db_url).await {
+        if let Ok(store) = screenpipe_secrets::SecretStore::new(pool, Some(key)).await {
+            match store.reencrypt_unencrypted_secrets(&key).await {
+                Ok(count) if count > 0 => {
+                    tracing::info!("re-encrypted {} secrets after keychain opt-in", count);
+                }
+                Err(e) => {
+                    tracing::warn!("failed to re-encrypt secrets: {}", e);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    Ok(KeychainStatus {
+        state: "enabled".to_string(),
+    })
+}
+
 #[tauri::command]
 #[specta::specta]
 pub async fn set_window_size(
@@ -1085,7 +1142,78 @@ pub async fn show_shortcut_reminder(
 
         if native_shortcut_reminder::is_available() {
             info!("Using native SwiftUI shortcut reminder");
-            if native_shortcut_reminder::show(Some(&shortcut)) {
+            use crate::recording::RecordingState;
+            use std::time::Duration;
+
+            // Startup runs before the engine binds :3030. Without waiting, Swift gets no
+            // `metrics_ws_url` and retries /ws/metrics without ?token= when API auth is on.
+            // Wait for server **core** (not only API key): when auth is disabled, key may stay
+            // None and we must not spin until the 90s timeout.
+            {
+                const MAX_WAIT: Duration = Duration::from_secs(90);
+                const STEP: Duration = Duration::from_millis(250);
+                let mut waited = Duration::ZERO;
+                loop {
+                    let ready = if let Some(state) = app_handle.try_state::<RecordingState>() {
+                        let guard = state.server.lock().await;
+                        guard.is_some()
+                    } else {
+                        false
+                    };
+                    if ready {
+                        break;
+                    }
+                    if waited >= MAX_WAIT {
+                        warn!(
+                            "native shortcut reminder: server core not ready after {:?} — pass authenticated metrics URLs to Swift after overlay is reopened",
+                            MAX_WAIT
+                        );
+                        break;
+                    }
+                    tokio::time::sleep(STEP).await;
+                    waited += STEP;
+                }
+            }
+
+            let mut map: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+            match serde_json::from_str::<serde_json::Value>(&shortcut) {
+                Ok(serde_json::Value::Object(o)) => {
+                    for (k, v) in o {
+                        map.insert(k, v);
+                    }
+                }
+                _ => {
+                    map.insert(
+                        "overlay".to_string(),
+                        serde_json::Value::String(shortcut.clone()),
+                    );
+                }
+            }
+            if let Some(state) = app_handle.try_state::<RecordingState>() {
+                let guard = state.server.lock().await;
+                if let Some(ref core) = *guard {
+                    if let Some(ref key) = core.local_api_key {
+                        let enc = urlencoding::encode(key);
+                        let p = core.port;
+                        map.insert(
+                            "metrics_ws_url".to_string(),
+                            serde_json::json!(format!(
+                                "ws://127.0.0.1:{}/ws/metrics?token={}",
+                                p, enc
+                            )),
+                        );
+                        map.insert(
+                            "meetings_status_url".to_string(),
+                            serde_json::json!(format!(
+                                "http://127.0.0.1:{}/meetings/status?token={}",
+                                p, enc
+                            )),
+                        );
+                    }
+                }
+            }
+            let native_payload = serde_json::Value::Object(map).to_string();
+            if native_shortcut_reminder::show(Some(&native_payload)) {
                 return Ok(());
             }
             warn!("Native shortcut reminder failed, falling back to webview");

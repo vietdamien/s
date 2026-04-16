@@ -9,6 +9,7 @@
 //! The encryption key lives in the OS keychain.
 
 mod crypto;
+pub mod keychain;
 mod migration;
 mod store;
 

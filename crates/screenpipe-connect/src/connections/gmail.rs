@@ -6,6 +6,7 @@ use super::{Category, Integration, IntegrationDef, ProxyAuth, ProxyConfig};
 use crate::oauth::{self, OAuthConfig};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
+use screenpipe_secrets::SecretStore;
 use serde_json::{Map, Value};
 
 // To activate OAuth: register a Google OAuth 2.0 client at https://console.cloud.google.com/
@@ -64,8 +65,8 @@ impl Integration for Gmail {
         Some(&CFG)
     }
 
-    async fn test(&self, client: &reqwest::Client, _creds: &Map<String, Value>) -> Result<String> {
-        let token = oauth::get_valid_token(client, "gmail")
+    async fn test(&self, client: &reqwest::Client, _creds: &Map<String, Value>, secret_store: Option<&SecretStore>) -> Result<String> {
+        let token = oauth::get_valid_token_instance(secret_store, client, "gmail", None)
             .await
             .ok_or_else(|| anyhow!("not connected — use 'Connect with Gmail' button"))?;
 

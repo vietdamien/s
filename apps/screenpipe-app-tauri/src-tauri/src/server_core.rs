@@ -242,12 +242,14 @@ impl ServerCore {
         server.api_auth = config.api_auth;
         server.api_auth_key = config.api_auth_key.clone();
 
-        // Secret store
+        // Secret store — read-only keychain access on startup.
+        // Never create a key automatically (that triggers a macOS modal).
+        // Users opt in via onboarding or Settings > Privacy.
         {
-            let secret_key = match crate::secrets::get_or_create_key() {
-                Some(k) => Some(k),
-                None => {
-                    warn!("keychain unavailable — secret store will not encrypt");
+            let secret_key = match crate::secrets::get_key() {
+                crate::secrets::KeyResult::Found(k) => Some(k),
+                _ => {
+                    info!("keychain: no encryption key found — secrets stored unencrypted until user opts in");
                     None
                 }
             };

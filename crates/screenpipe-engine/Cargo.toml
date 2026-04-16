@@ -18,7 +18,7 @@ oasgen = { workspace = true }
 screenpipe-events = { path = "../screenpipe-events" }
 screenpipe-screen = { path = "../screenpipe-screen" }
 screenpipe-audio = { path = "../screenpipe-audio" }
-screenpipe-core = { path = "../screenpipe-core", features = ["security", "cloud-sync"] }
+screenpipe-core = { path = "../screenpipe-core", features = ["security", "cloud-sync", "secrets"] }
 screenpipe-db = { path = "../screenpipe-db" }
 screenpipe-a11y = { path = "../screenpipe-a11y", features = ["db"] }
 screenpipe-apple-intelligence = { path = "../screenpipe-apple-intelligence", optional = true }

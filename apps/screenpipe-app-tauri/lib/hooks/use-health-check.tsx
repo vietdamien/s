@@ -4,7 +4,12 @@
 
 import { useState, useEffect, useCallback, useRef } from "react";
 import { debounce } from "lodash";
-import { getApiBaseUrl } from "@/lib/api";
+import {
+  appendAuthToken,
+  ensureApiReady,
+  getApiBaseUrl,
+  redactApiUrlForLogs,
+} from "@/lib/api";
 
 interface AudioPipelineHealth {
   chunks_sent: number;
@@ -98,8 +103,10 @@ export function useHealthCheck() {
     }
 
     try {
+      await ensureApiReady();
       const wsBase = getApiBaseUrl().replace("http://", "ws://");
-      const ws = new WebSocket(`${wsBase}/ws/health`);
+      const wsUrl = appendAuthToken(`${wsBase}/ws/health`);
+      const ws = new WebSocket(wsUrl);
       wsRef.current = ws;
 
       ws.onopen = () => {
@@ -144,7 +151,10 @@ export function useHealthCheck() {
 
       ws.onerror = () => {
         if (!hasLoggedDisconnect.current) {
-          console.warn("health WebSocket: server unreachable, retrying silently...");
+          console.warn(
+            "health WebSocket onerror (browsers do not expose the underlying failure; use onclose code/reason and engine logs)",
+            { url: redactApiUrlForLogs(ws.url) },
+          );
           hasLoggedDisconnect.current = true;
         }
         const errorHealth: HealthCheckResponse = {
@@ -174,8 +184,18 @@ export function useHealthCheck() {
 
       ws.onclose = (event) => {
         if (!hasLoggedDisconnect.current) {
-          console.warn("health WebSocket closed:", event.code, event.reason || "(server down)");
           hasLoggedDisconnect.current = true;
+        }
+        const detail = {
+          code: event.code,
+          reason: event.reason || "",
+          wasClean: event.wasClean,
+          url: redactApiUrlForLogs(ws.url),
+        };
+        if (event.code === 1000 && event.wasClean) {
+          console.debug("[health WS] closed (clean)", detail);
+        } else {
+          console.warn("[health WS] closed", detail);
         }
         const errorHealth: HealthCheckResponse = {
           status: "error",

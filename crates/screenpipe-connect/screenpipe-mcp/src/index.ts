@@ -28,17 +28,60 @@ for (let i = 0; i < args.length; i++) {
 
 const SCREENPIPE_API = `http://localhost:${port}`;
 
-// Discover API key: env var > npx screenpipe auth token > bundled bun
+// Discover API key: env var > db.sqlite direct read > npx fallbacks
 function discoverApiKey(): string {
   const envKey = process.env.SCREENPIPE_LOCAL_API_KEY || process.env.SCREENPIPE_API_KEY;
   if (envKey) return envKey;
 
-  const { execSync } = require("child_process");
   const os = require("os");
-  const fs = require("fs");
   const path = require("path");
+  const fs = require("fs");
+  const { execFileSync, execSync } = require("child_process");
 
-  // Try npx first (works if user has Node installed)
+  // Read api_auth_key directly from ~/.screenpipe/db.sqlite.
+  // The key may be stored as plaintext base64 (nonce=zeros, keychain unavailable)
+  // or encrypted (non-zero nonce, keychain was available at write time).
+  // If plaintext: decode and return. If encrypted: skip, fall through to CLI.
+  try {
+    const dbPath = path.join(os.homedir(), ".screenpipe", "db.sqlite");
+    if (fs.existsSync(dbPath)) {
+      const sqliteBin = process.platform === "win32" ? "sqlite3.exe" : "sqlite3";
+      // Check nonce — all zeros means plaintext base64, non-zero means encrypted
+      const row = execFileSync(sqliteBin, [
+        dbPath,
+        "SELECT hex(nonce), value FROM secrets WHERE key = 'api_auth_key';",
+      ], {
+        timeout: 5000,
+        encoding: "utf-8",
+        stdio: ["pipe", "pipe", "pipe"],
+      }).trim();
+      if (row) {
+        const sepIdx = row.indexOf("|");
+        const nonceHex = sepIdx >= 0 ? row.substring(0, sepIdx) : "";
+        const value = sepIdx >= 0 ? row.substring(sepIdx + 1) : row;
+        const isPlaintext = !nonceHex || /^0+$/.test(nonceHex);
+        if (isPlaintext && value) {
+          const decoded = Buffer.from(value, "base64").toString("utf-8");
+          if (decoded && decoded.startsWith("sp-")) return decoded;
+          if (value.startsWith("sp-")) return value;
+        }
+        // Non-zero nonce = encrypted — fall through to CLI which can decrypt via keychain
+      }
+    }
+  } catch {}
+
+  // Fallback: use the current Node binary to find npx (no PATH dependency)
+  try {
+    const npxPath = path.join(path.dirname(process.execPath), "npx");
+    const token = execFileSync(npxPath, ["screenpipe@latest", "auth", "token"], {
+      timeout: 15000,
+      encoding: "utf-8",
+      stdio: ["pipe", "pipe", "pipe"],
+    }).trim();
+    if (token) return token;
+  } catch {}
+
+  // Last resort: npx on PATH
   try {
     const token = execSync("npx screenpipe@latest auth token", {
       timeout: 15000,
@@ -47,33 +90,6 @@ function discoverApiKey(): string {
     }).trim();
     if (token) return token;
   } catch {}
-
-  // Try bundled bun inside the screenpipe app
-  const bundledBunPaths: string[] = [];
-  const platform = os.platform();
-  if (platform === "darwin") {
-    bundledBunPaths.push("/Applications/screenpipe.app/Contents/MacOS/bun");
-  } else if (platform === "win32") {
-    bundledBunPaths.push(
-      path.join(process.env.LOCALAPPDATA || "", "screenpipe", "bun.exe"),
-      path.join(process.env.PROGRAMFILES || "", "screenpipe", "bun.exe"),
-    );
-  } else {
-    bundledBunPaths.push("/usr/lib/screenpipe/bun", "/opt/screenpipe/bun");
-  }
-
-  for (const bunPath of bundledBunPaths) {
-    try {
-      if (fs.existsSync(bunPath)) {
-        const token = execSync(`"${bunPath}" x screenpipe@latest auth token`, {
-          timeout: 15000,
-          encoding: "utf-8",
-          stdio: ["pipe", "pipe", "pipe"],
-        }).trim();
-        if (token) return token;
-      }
-    } catch {}
-  }
 
   return "";
 }
