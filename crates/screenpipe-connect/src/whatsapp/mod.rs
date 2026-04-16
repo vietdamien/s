@@ -195,7 +195,7 @@ impl WhatsAppGateway {
                         *status.lock().await = WhatsAppStatus::QrReady { qr: data };
                     }
                     Ok(GatewayEvent::Connected { name, phone }) => {
-                        info!("whatsapp: connected as {} ({})", name, phone);
+                        info!("whatsapp: connected as {}", name);
                         *status.lock().await = WhatsAppStatus::Connected { name, phone };
                     }
                     Ok(GatewayEvent::Disconnected { reason }) => {
@@ -381,7 +381,7 @@ impl WhatsAppGateway {
                                         *s.lock().await = WhatsAppStatus::QrReady { qr: data };
                                     }
                                     Ok(GatewayEvent::Connected { name, phone }) => {
-                                        info!("whatsapp: connected as {} ({})", name, phone);
+                                        info!("whatsapp: connected as {}", name);
                                         *s.lock().await = WhatsAppStatus::Connected { name, phone };
                                     }
                                     Ok(GatewayEvent::Disconnected { reason }) => {

@@ -57,7 +57,10 @@ async fn open_secret_store() -> Result<screenpipe_secrets::SecretStore, String> 
         .await
         .map_err(|e| format!("failed to open db: {}", e))?;
 
-    let secret_key = crate::secrets::get_or_create_key();
+    let secret_key = match crate::secrets::get_key() {
+        crate::secrets::KeyResult::Found(k) => Some(k),
+        _ => None,
+    };
 
     screenpipe_secrets::SecretStore::new(pool, secret_key)
         .await

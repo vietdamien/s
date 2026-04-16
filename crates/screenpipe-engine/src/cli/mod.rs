@@ -366,6 +366,17 @@ pub struct RecordArgs {
     /// Localhost requests are always allowed.
     #[arg(long, default_value_t = true)]
     pub api_auth: bool,
+
+    /// Encrypt secrets (API keys, OAuth tokens) at rest using the OS keychain.
+    /// Creates a keychain key if one doesn't exist. Without this flag, the CLI
+    /// will use an existing key (created by the desktop app) but won't create one.
+    #[arg(long, default_value_t = false)]
+    pub encrypt_secrets: bool,
+
+    /// Local data retention in days. Old screen/audio data is auto-deleted after this period.
+    /// Set to 0 to disable retention (keep data forever).
+    #[arg(long, default_value_t = 14)]
+    pub retention_days: u32,
 }
 
 impl RecordArgs {
@@ -471,6 +482,11 @@ impl RecordArgs {
                 if is_fresh {
                     screenpipe_config::apply_tier_defaults(&mut settings, tier);
 
+                    // Restore CLI audio engine — user's explicit -a/--audio-transcription-engine
+                    // must win over tier defaults
+                    settings.audio_transcription_engine =
+                        cli_engine_to_str(&self.audio_transcription_engine).to_string();
+
                     // Restore CLI monitor flags — user's explicit --use-all-monitors or -m
                     // must win over tier defaults (fixes #2897)
                     if cli_use_all_monitors {
@@ -549,6 +565,8 @@ impl RecordArgs {
                 tracing::info!("api auth enabled — key loaded");
             }
         }
+
+        config.encrypt_secrets = self.encrypt_secrets;
 
         config
     }

@@ -1002,10 +1002,10 @@ pub async fn start_permission_monitor(app: tauri::AppHandle) {
         }
 
         // Only trigger when we have REQUIRED_CONSECUTIVE_FAILURES in a row
-        let screen_confirmed_lost = screen_fail_count == REQUIRED_CONSECUTIVE_FAILURES;
-        let mic_confirmed_lost = mic_fail_count == REQUIRED_CONSECUTIVE_FAILURES;
+        let screen_confirmed_lost = screen_fail_count >= REQUIRED_CONSECUTIVE_FAILURES;
+        let mic_confirmed_lost = mic_fail_count >= REQUIRED_CONSECUTIVE_FAILURES;
         let accessibility_confirmed_lost =
-            accessibility_fail_count == REQUIRED_CONSECUTIVE_FAILURES;
+            accessibility_fail_count >= REQUIRED_CONSECUTIVE_FAILURES;
         // Browser automation is tracked but NOT used to trigger the recovery modal —
         // it's optional and shouldn't block the user (#2510).
         let _ = browser_fail_count; // keep tracking for payload, suppress unused warning

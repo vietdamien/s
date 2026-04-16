@@ -685,6 +685,177 @@ struct ResolvedPreset {
     prompt: Option<String>,
 }
 
+/// Read the ChatGPT OAuth access token, with auto-refresh if expired.
+///
+/// Primary source: secrets store (`oauth:chatgpt` key in encrypted SQLite DB).
+/// Fallback: legacy `chatgpt-oauth.json` file for pre-migration installs.
+fn read_chatgpt_oauth_token() -> Option<String> {
+    // Try secrets store first (current path)
+    #[cfg(feature = "secrets")]
+    {
+        if let Some(token) = read_chatgpt_token_from_secrets() {
+            return Some(token);
+        }
+    }
+
+    // Fallback: legacy file
+    read_chatgpt_token_from_legacy_file()
+}
+
+/// Read and refresh ChatGPT token from the legacy `chatgpt-oauth.json` file.
+fn read_chatgpt_token_from_legacy_file() -> Option<String> {
+    let path = crate::paths::default_screenpipe_data_dir().join("chatgpt-oauth.json");
+    let content = std::fs::read_to_string(&path).ok()?;
+    let mut token_data: serde_json::Value = serde_json::from_str(&content).ok()?;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let expires_at = token_data
+        .get("expires_at")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+
+    if now >= expires_at.saturating_sub(60) {
+        refresh_chatgpt_token(&mut token_data, now);
+        if let Ok(updated) = serde_json::to_string_pretty(&token_data) {
+            let _ = std::fs::write(&path, updated);
+        }
+    }
+
+    token_data
+        .get("access_token")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+/// Read and refresh ChatGPT token from the encrypted secrets store.
+#[cfg(feature = "secrets")]
+fn read_chatgpt_token_from_secrets() -> Option<String> {
+    use screenpipe_secrets::keychain::{get_key, KeyResult};
+
+    let data_dir = crate::paths::default_screenpipe_data_dir();
+    let db_path = data_dir.join("db.sqlite");
+    if !db_path.exists() {
+        return None;
+    }
+
+    let secret_key = match get_key() {
+        KeyResult::Found(k) => Some(k),
+        _ => None,
+    };
+
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
+
+    // We're in a sync context but need async for sqlx. Use block_in_place
+    // since the caller is always on a tokio runtime.
+    let result = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(async {
+            let pool = sqlx::SqlitePool::connect(&db_url).await.ok()?;
+            let store = screenpipe_secrets::SecretStore::new(pool, secret_key)
+                .await
+                .ok()?;
+            let bytes = store.get("oauth:chatgpt").await.ok()??;
+            let mut token_data: serde_json::Value =
+                serde_json::from_slice(&bytes).ok()?;
+
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let expires_at = token_data
+                .get("expires_at")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+
+            if now >= expires_at.saturating_sub(60) {
+                refresh_chatgpt_token(&mut token_data, now);
+                // Write refreshed token back to secrets store
+                if let Ok(updated_bytes) = serde_json::to_vec(&token_data) {
+                    if let Err(e) = store.set("oauth:chatgpt", &updated_bytes).await {
+                        tracing::warn!("failed to write refreshed ChatGPT token to secrets: {}", e);
+                    }
+                }
+            }
+
+            token_data
+                .get("access_token")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
+    });
+
+    if result.is_none() {
+        tracing::debug!("ChatGPT OAuth token not found in secrets store");
+    }
+
+    result
+}
+
+/// Refresh an expired ChatGPT OAuth token using the refresh_token grant.
+/// Mutates `token_data` in place with the new access_token, refresh_token, and expires_at.
+fn refresh_chatgpt_token(token_data: &mut serde_json::Value, now: u64) {
+    let refresh_token = match token_data
+        .get("refresh_token")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+    {
+        Some(t) => t,
+        None => return,
+    };
+
+    tracing::info!("ChatGPT OAuth token expired, refreshing...");
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+
+    let refresh_res = client
+        .post("https://auth.openai.com/oauth/token")
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "grant_type": "refresh_token",
+            "client_id": "app_EMoamEEZ73f0CkXaXp7hrann",
+            "refresh_token": refresh_token,
+            "scope": "openid profile email offline_access",
+        }))
+        .send();
+
+    match refresh_res {
+        Ok(resp) if resp.status().is_success() => {
+            if let Ok(v) = resp.json::<serde_json::Value>() {
+                if let Some(new_token) = v.get("access_token").and_then(|t| t.as_str()) {
+                    let new_refresh = v
+                        .get("refresh_token")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or(refresh_token.as_str());
+                    let new_expires_in = v
+                        .get("expires_in")
+                        .and_then(|t| t.as_u64())
+                        .unwrap_or(3600);
+
+                    token_data["access_token"] =
+                        serde_json::Value::String(new_token.to_string());
+                    token_data["refresh_token"] =
+                        serde_json::Value::String(new_refresh.to_string());
+                    token_data["expires_at"] = serde_json::json!(now + new_expires_in);
+                    tracing::info!("ChatGPT token refreshed successfully");
+                }
+            }
+        }
+        Ok(resp) => {
+            tracing::error!("ChatGPT token refresh failed ({})", resp.status());
+        }
+        Err(e) => {
+            tracing::error!("ChatGPT token refresh request failed: {}", e);
+        }
+    }
+}
+
 /// Read `~/.screenpipe/store.bin` and find the preset by id.
 /// Falls back to the default preset if `preset_id` is `"default"`.
 /// Creates store.bin with a default preset if it doesn't exist (CLI mode).
@@ -778,96 +949,10 @@ fn resolve_preset(pipes_dir: &Path, preset_id: &str) -> Option<ResolvedPreset> {
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
 
-    // ChatGPT OAuth: read token from stored file (no apiKey in preset),
+    // ChatGPT OAuth: read token from secrets store (primary) or legacy file (fallback),
     // auto-refreshing if expired.
     if provider.as_deref() == Some("openai-chatgpt") && api_key.is_none() {
-        let path = crate::paths::default_screenpipe_data_dir().join("chatgpt-oauth.json");
-        if let Ok(content) = std::fs::read_to_string(&path) {
-            if let Ok(mut token_data) = serde_json::from_str::<serde_json::Value>(&content) {
-                // Check if token is expired (with 60s buffer)
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                let expires_at = token_data
-                    .get("expires_at")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                let is_expired = now >= expires_at.saturating_sub(60);
-
-                if is_expired {
-                    let refresh_token_owned = token_data
-                        .get("refresh_token")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string());
-                    if let Some(ref refresh_token) = refresh_token_owned {
-                        tracing::info!("ChatGPT OAuth token expired, refreshing...");
-                        if let Ok(client) = reqwest::blocking::Client::builder()
-                            .timeout(std::time::Duration::from_secs(30))
-                            .build()
-                        {
-                            let refresh_res = client
-                                .post("https://auth.openai.com/oauth/token")
-                                .header("Content-Type", "application/json")
-                                .json(&serde_json::json!({
-                                    "grant_type": "refresh_token",
-                                    "client_id": "app_EMoamEEZ73f0CkXaXp7hrann",
-                                    "refresh_token": refresh_token,
-                                    "scope": "openid profile email offline_access",
-                                }))
-                                .send();
-
-                            match refresh_res {
-                                Ok(resp) if resp.status().is_success() => {
-                                    if let Ok(v) = resp.json::<serde_json::Value>() {
-                                        if let Some(new_token) =
-                                            v.get("access_token").and_then(|t| t.as_str())
-                                        {
-                                            let new_refresh = v
-                                                .get("refresh_token")
-                                                .and_then(|t| t.as_str())
-                                                .unwrap_or(refresh_token.as_str());
-                                            let new_expires_in = v
-                                                .get("expires_in")
-                                                .and_then(|t| t.as_u64())
-                                                .unwrap_or(3600);
-
-                                            token_data["access_token"] =
-                                                serde_json::Value::String(new_token.to_string());
-                                            token_data["refresh_token"] =
-                                                serde_json::Value::String(new_refresh.to_string());
-                                            token_data["expires_at"] =
-                                                serde_json::json!(now + new_expires_in);
-
-                                            if let Ok(updated) =
-                                                serde_json::to_string_pretty(&token_data)
-                                            {
-                                                let _ = std::fs::write(&path, updated);
-                                            }
-                                            tracing::info!("ChatGPT token refreshed successfully");
-                                        }
-                                    }
-                                }
-                                Ok(resp) => {
-                                    tracing::error!(
-                                        "ChatGPT token refresh failed ({})",
-                                        resp.status()
-                                    );
-                                }
-                                Err(e) => {
-                                    tracing::error!("ChatGPT token refresh request failed: {}", e);
-                                }
-                            }
-                        }
-                    }
-                }
-
-                api_key = token_data
-                    .get("access_token")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-            }
-        }
+        api_key = read_chatgpt_oauth_token();
     }
 
     let prompt = preset

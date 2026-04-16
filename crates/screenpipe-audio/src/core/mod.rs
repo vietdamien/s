@@ -72,6 +72,7 @@ pub async fn record_and_transcribe(
     is_running: Arc<AtomicBool>,
     metrics: Arc<crate::metrics::AudioPipelineMetrics>,
 ) -> Result<()> {
+    let mut consecutive_failures: u32 = 0;
     while is_running.load(Ordering::Relaxed) {
         match run_record_and_transcribe::run_record_and_transcribe(
             audio_stream.clone(),
@@ -87,11 +88,16 @@ pub async fn record_and_transcribe(
                 if is_normal_shutdown(&is_running) {
                     return Err(e);
                 }
-                // Use debug! — this fires on every successful auto-recovery
-                // (e.g., audio hijack → reconnect, or idle output device timeout),
-                // creating noise in logs. The error is expected & handled.
-                debug!("record_and_transcribe error, restarting: {}", e);
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                consecutive_failures += 1;
+                // Exponential backoff: 1s, 2s, 4s, 8s, ... capped at 30s.
+                // Prevents a hot loop when a device is persistently unavailable
+                // (e.g. MacBook Air mic reporting "disconnected" every attempt).
+                let backoff_secs = std::cmp::min(1u64 << (consecutive_failures - 1), 30);
+                debug!(
+                    "record_and_transcribe error (attempt {}), restarting in {}s: {}",
+                    consecutive_failures, backoff_secs, e
+                );
+                tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
             }
         }
     }

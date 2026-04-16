@@ -6,6 +6,7 @@ use super::{Category, Integration, IntegrationDef, ProxyAuth, ProxyConfig};
 use crate::oauth::{self, OAuthConfig};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
+use screenpipe_secrets::SecretStore;
 use serde_json::{Map, Value};
 
 const GITHUB_CLIENT_ID: &str = "Ov23li9IT9uV0S9ql2ne";
@@ -50,8 +51,8 @@ impl Integration for GithubIssues {
         Some(&CFG)
     }
 
-    async fn test(&self, client: &reqwest::Client, _creds: &Map<String, Value>) -> Result<String> {
-        let token = oauth::read_oauth_token("github")
+    async fn test(&self, client: &reqwest::Client, _creds: &Map<String, Value>, secret_store: Option<&SecretStore>) -> Result<String> {
+        let token = oauth::read_oauth_token_instance(secret_store, "github", None)
             .await
             .ok_or_else(|| anyhow!("not connected — use 'Connect with GitHub' button"))?;
         let resp: Value = client

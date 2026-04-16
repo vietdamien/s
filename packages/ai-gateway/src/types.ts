@@ -153,6 +153,8 @@ export interface Env {
 	AUTO_RELOAD_SECRET: string;
 	// OpenRouter (DeepSeek, Llama, Qwen, Mistral via single API)
 	OPENROUTER_API_KEY: string;
+	// Tinfoil — confidential inference in secure enclaves
+	TINFOIL_API_KEY: string;
 	// Admin API auth
 	ADMIN_SECRET: string;
 	// Transcription A/B/C test routing

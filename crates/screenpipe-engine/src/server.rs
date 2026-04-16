@@ -10,7 +10,7 @@ use screenpipe_db::DatabaseManager;
 
 use screenpipe_audio::audio_manager::AudioManager;
 use screenpipe_core::sync::SyncServiceHandle;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::{
     analytics,
@@ -497,6 +497,7 @@ impl SCServer {
                 origin.as_bytes().starts_with(b"http://localhost")
                     || origin.as_bytes().starts_with(b"https://localhost")
                     || origin.as_bytes().starts_with(b"tauri://localhost")
+                    || origin.as_bytes().starts_with(b"http://tauri.localhost") // Windows Tauri origin
                     || origin.as_bytes().starts_with(b"http://127.0.0.1")
                     || origin.as_bytes().starts_with(b"https://127.0.0.1")
             }))
@@ -700,6 +701,12 @@ impl SCServer {
                     axum::routing::post(crate::routes::pipe_store::pipe_store_review),
                 )
                 .with_state(pm.clone());
+            // Inject SecretStore as an Extension so pipe handlers can access it
+            let pipe_routes = if let Some(ref ss) = self.secret_store {
+                pipe_routes.layer(axum::Extension(ss.clone()))
+            } else {
+                pipe_routes
+            };
             router.nest("/pipes", pipe_routes)
         } else {
             router
@@ -707,7 +714,10 @@ impl SCServer {
 
         // Connections routes (pipe-facing integrations: Telegram, Slack, etc.)
         let cm: crate::connections_api::SharedConnectionManager = Arc::new(Mutex::new(
-            screenpipe_connect::connections::ConnectionManager::new(self.screenpipe_dir.clone()),
+            screenpipe_connect::connections::ConnectionManager::new(
+                self.screenpipe_dir.clone(),
+                self.secret_store.clone(),
+            ),
         ));
         let wa: crate::connections_api::SharedWhatsAppGateway = Arc::new(Mutex::new(
             screenpipe_connect::whatsapp::WhatsAppGateway::new(self.screenpipe_dir.clone()),
@@ -843,6 +853,7 @@ impl SCServer {
                             let path = req.uri().path();
                             if path == "/health"
                                 || path == "/ws/health"
+                                || path == "/audio/device/status"
                                 || path == "/connections/oauth/callback"
                                 || path.starts_with("/frames/")
                                 || path == "/notify"
@@ -889,6 +900,18 @@ impl SCServer {
                             if authorized {
                                 next.run(req).await
                             } else {
+                                let upgrade = req
+                                    .headers()
+                                    .get(axum::http::header::UPGRADE)
+                                    .and_then(|v| v.to_str().ok())
+                                    .map(|s| s.eq_ignore_ascii_case("websocket"))
+                                    .unwrap_or(false);
+                                if upgrade {
+                                    warn!(
+                                        path = %path,
+                                        "api auth: rejected WebSocket upgrade (missing/invalid token; use Cookie screenpipe_auth, Authorization Bearer, or ?token=)"
+                                    );
+                                }
                                 axum::response::Response::builder()
                                     .status(403)
                                     .header("Content-Type", "application/json")

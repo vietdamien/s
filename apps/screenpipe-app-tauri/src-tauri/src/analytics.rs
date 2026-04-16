@@ -122,6 +122,24 @@ impl AnalyticsManager {
         }
     }
 
+    /// Send a $create_alias event so PostHog merges the email-based identity
+    /// (used by the website download endpoint) with this app's analytics UUID.
+    pub async fn send_alias(&self, alias: &str) {
+        if !*self.enabled.lock().await || alias.is_empty() {
+            return;
+        }
+        let url = format!("{}/capture/", self.api_host);
+        let payload = json!({
+            "api_key": self.posthog_api_key,
+            "event": "$create_alias",
+            "properties": {
+                "distinct_id": self.distinct_id,
+                "alias": alias,
+            },
+        });
+        let _ = self.client.post(&url).json(&payload).send().await;
+    }
+
     pub async fn send_event(
         &self,
         event: &str,
@@ -457,6 +475,12 @@ pub fn start_analytics(
             // Try to fetch UTM attribution from website (IP-matched, 2hr window)
             // This must happen before app_started so the first event carries attribution
             analytics_manager.fetch_attribution().await;
+
+            // Link email identity (used by website) to analytics UUID (used by app)
+            // so PostHog can merge the person and build a real download→open funnel
+            if !analytics_manager.email.is_empty() {
+                analytics_manager.send_alias(&analytics_manager.email.clone()).await;
+            }
 
             // Include feature config in app_started event
             let feature_config = analytics_manager.read_feature_config();

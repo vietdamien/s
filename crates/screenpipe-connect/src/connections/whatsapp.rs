@@ -5,6 +5,7 @@
 use super::{require_str, Category, FieldDef, Integration, IntegrationDef, ProxyAuth, ProxyConfig};
 use anyhow::Result;
 use async_trait::async_trait;
+use screenpipe_secrets::SecretStore;
 use serde_json::{Map, Value};
 
 static DEF: IntegrationDef = IntegrationDef {
@@ -50,7 +51,7 @@ impl Integration for WhatsApp {
         Some(&CFG)
     }
 
-    async fn test(&self, client: &reqwest::Client, creds: &Map<String, Value>) -> Result<String> {
+    async fn test(&self, client: &reqwest::Client, creds: &Map<String, Value>, _secret_store: Option<&SecretStore>) -> Result<String> {
         let phone_number_id = require_str(creds, "phone_number_id")?;
         let access_token = require_str(creds, "access_token")?;
         let url = format!("https://graph.facebook.com/v21.0/{}", phone_number_id);

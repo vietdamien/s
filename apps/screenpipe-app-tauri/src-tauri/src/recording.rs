@@ -432,7 +432,10 @@ pub async fn spawn_screenpipe(
                 let db_path = data_dir.join("db.sqlite");
                 let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
                 if let Ok(pool) = sqlx::SqlitePool::connect(&db_url).await {
-                    let secret_key = crate::secrets::get_or_create_key();
+                    let secret_key = match crate::secrets::get_key() {
+                        crate::secrets::KeyResult::Found(k) => Some(k),
+                        _ => None,
+                    };
                     if let Ok(store) = screenpipe_secrets::SecretStore::new(pool, secret_key).await {
                         if let Err(e) = store.set("api_auth_key", key_clone.as_bytes()).await {
                             tracing::warn!("failed to persist API key to secret store: {}", e);

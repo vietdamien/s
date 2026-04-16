@@ -4,6 +4,7 @@
 
 import { useState, useEffect, useCallback } from "react";
 import { localFetch } from "@/lib/api";
+import { useSettings } from "@/lib/hooks/use-settings";
 
 export interface TemplatePipe {
   name: string;
@@ -37,6 +38,7 @@ export function usePipes() {
   const [promptPipes, setPromptPipes] = useState<TemplatePipe[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const { isSettingsLoaded } = useSettings();
 
   const fetchPipes = useCallback(async () => {
     try {
@@ -74,9 +76,12 @@ export function usePipes() {
     }
   }, []);
 
+  // Refetch when settings load — ensures API auth key is available.
+  // The initial fetch may 401 if the webview loads before the server
+  // provides the API key via IPC.
   useEffect(() => {
-    fetchPipes();
-  }, [fetchPipes]);
+    if (isSettingsLoaded) fetchPipes();
+  }, [isSettingsLoaded, fetchPipes]);
 
   return { pipes, templatePipes, promptPipes, loading, error, refetch: fetchPipes };
 }

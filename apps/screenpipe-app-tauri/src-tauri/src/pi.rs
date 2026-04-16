@@ -703,7 +703,7 @@ fn build_models_json(
         "api": "openai-completions",
         "apiKey": api_key_value,
         "authHeader": true,
-        "models": screenpipe_cloud_models()
+        "models": screenpipe_cloud_models(SCREENPIPE_API_URL, user_token)
     });
     providers_map.insert("screenpipe".to_string(), screenpipe_provider);
 

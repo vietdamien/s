@@ -51,44 +51,55 @@ const PATHS = [
 type PathId = (typeof PATHS)[number]["id"];
 type Phase = "choose" | "enabling" | "done";
 
-async function waitForServer(maxWaitMs = 10000): Promise<void> {
+async function waitForServer(maxWaitMs = 30000): Promise<void> {
   const start = Date.now();
   while (Date.now() - start < maxWaitMs) {
     try {
       const res = await localFetch("/health");
       if (res.ok) return;
     } catch {}
-    await new Promise((r) => setTimeout(r, 500));
+    await new Promise((r) => setTimeout(r, 1000));
   }
   throw new Error("server not ready");
 }
 
-async function installAndEnable(slug: string): Promise<void> {
-  // Wait for server to be ready before attempting install
+async function installAndEnable(slug: string, retries = 3): Promise<void> {
   await waitForServer();
 
-  const enableRes = await localFetch(
-    `/pipes/${slug}/enable`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ enabled: true }),
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      // Try enabling first (pipe might already be installed)
+      const enableRes = await localFetch(`/pipes/${slug}/enable`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled: true }),
+      });
+      if (enableRes.ok) return;
+
+      // Not installed — install from store
+      const installRes = await localFetch("/pipes/store/install", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ slug }),
+      });
+      if (!installRes.ok) {
+        const text = await installRes.text().catch(() => "");
+        throw new Error(`install ${slug}: ${installRes.status} ${text}`);
+      }
+
+      // Enable after install
+      const enable2 = await localFetch(`/pipes/${slug}/enable`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled: true }),
+      });
+      if (enable2.ok) return;
+      throw new Error(`enable ${slug} after install: ${enable2.status}`);
+    } catch (err) {
+      if (attempt === retries) throw err;
+      console.warn(`pipe ${slug} attempt ${attempt}/${retries} failed, retrying...`, err);
+      await new Promise((r) => setTimeout(r, 2000 * attempt));
     }
-  );
-
-  if (!enableRes.ok) {
-    const installRes = await localFetch("/pipes/store/install", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ slug }),
-    });
-    if (!installRes.ok) throw new Error(`failed to install ${slug}`);
-
-    await localFetch(`/pipes/${slug}/enable`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ enabled: true }),
-    });
   }
 }
 

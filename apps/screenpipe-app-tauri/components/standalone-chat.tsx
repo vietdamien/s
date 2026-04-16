@@ -112,6 +112,34 @@ function buildDailyLimitMessage(errorStr: string): string {
   }
 }
 
+function classifyQuotaError(errorStr: string): "daily" | "rate" | "none" {
+  const normalized = errorStr.toLowerCase();
+  const isDailyLimit =
+    normalized.includes("credits_exhausted") ||
+    normalized.includes("daily_limit_exceeded") ||
+    normalized.includes("daily_cost_limit_exceeded");
+  if (isDailyLimit) {
+    return "daily";
+  }
+
+  const isRateLimit =
+    normalized.includes("429") ||
+    normalized.includes("rate limit") ||
+    normalized.includes("rate_limit") ||
+    normalized.includes("requests per minute") ||
+    normalized.includes("too many requests");
+  return isRateLimit ? "rate" : "none";
+}
+
+function buildRateLimitMessage(errorStr: string): string {
+  const waitMatch = errorStr.match(/wait (\d+) seconds/i);
+  const waitTime = waitMatch ? waitMatch[1] : "a moment";
+  const isPerMinuteRate = /rate limit exceeded|requests per minute/i.test(errorStr);
+  return isPerMinuteRate
+    ? `Rate limited — please wait ${waitTime} seconds and try again.`
+    : "Rate limited — try again in a moment or switch to a different model.";
+}
+
 /** Extract the gateway-reported tier from an error string, if present. */
 // Helper to get timezone offset string (e.g., "+1" or "-5")
 function getTimezoneOffsetString(): string {
@@ -1072,6 +1100,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
   const [deletingConvId, setDeletingConvId] = useState<string | null>(null);
   const [activePreset, setActivePreset] = useState<AIPreset | undefined>();
   const [showMentionDropdown, setShowMentionDropdown] = useState(false);
+  const [isComposing, setIsComposing] = useState(false);
   const [mentionFilter, setMentionFilter] = useState("");
   const [selectedMentionIndex, setSelectedMentionIndex] = useState(0);
   const [speakerSuggestions, setSpeakerSuggestions] = useState<MentionSuggestion[]>([]);
@@ -1607,6 +1636,14 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
       e.stopPropagation();
     }
 
+    const nativeEvent = e.nativeEvent as KeyboardEvent & { isComposing?: boolean; keyCode?: number };
+    const nativeIsComposing = nativeEvent.isComposing || nativeEvent.keyCode === 229;
+
+    // Ignore Enter while an IME composition is active so confirmation does not submit the message.
+    if (isComposing || nativeIsComposing) {
+      return;
+    }
+
     // Enter without shift submits the form
     if (e.key === "Enter" && !e.shiftKey && !showMentionDropdown) {
       e.preventDefault();
@@ -1936,28 +1973,17 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
           console.error("[Pi] Auto-retry failed:", errorStr);
 
           // Detect rate limit or daily limit from the error
-          if (errorStr.includes("daily_limit_exceeded") || errorStr.includes("daily_cost_limit_exceeded") || errorStr.includes("429") || errorStr.includes("rate limit")) {
-            // Distinguish between daily limit and per-minute rate limit
-            const isDailyLimit = errorStr.includes("daily_limit_exceeded") || errorStr.includes("daily_cost_limit_exceeded");
-            const isPerMinuteRate = errorStr.includes("rate limit exceeded") || errorStr.includes("requests per minute");
-
-            if (isDailyLimit) {
+          const quotaErrorType = classifyQuotaError(errorStr);
+          if (quotaErrorType === "daily" || quotaErrorType === "rate") {
+            if (quotaErrorType === "daily") {
               posthog.capture("wall_hit", { reason: "daily_limit", source: "chat" });
             }
 
             if (piMessageIdRef.current) {
               const msgId = piMessageIdRef.current;
-              let content: string;
-              if (isDailyLimit) {
-                content = buildDailyLimitMessage(errorStr);
-              } else if (isPerMinuteRate) {
-                // Extract wait time from error
-                const waitMatch = errorStr.match(/wait (\d+) seconds/i);
-                const waitTime = waitMatch ? waitMatch[1] : "a moment";
-                content = `Rate limited — please wait ${waitTime} seconds and try again.`;
-              } else {
-                content = "Rate limited — try again in a moment or switch to a different model.";
-              }
+              const content = quotaErrorType === "daily"
+                ? buildDailyLimitMessage(errorStr)
+                : buildRateLimitMessage(errorStr);
               setMessages((prev) =>
                 prev.map((m) => m.id === msgId ? { ...m, content } : m)
               );
@@ -1981,10 +2007,9 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
             const msgId = piMessageIdRef.current;
             const fullError = `${reason} ${errorDetail}`.trim();
 
-            if (fullError.includes("daily_limit_exceeded") || fullError.includes("daily_cost_limit_exceeded") || fullError.includes("429") || fullError.includes("rate limit")) {
-              const isDailyLimit = fullError.includes("daily_limit_exceeded") || fullError.includes("daily_cost_limit_exceeded");
-              const isPerMinuteRate = fullError.includes("rate limit exceeded") || fullError.includes("requests per minute");
-              if (isDailyLimit) {
+            const quotaErrorType = classifyQuotaError(fullError);
+            if (quotaErrorType === "daily" || quotaErrorType === "rate") {
+              if (quotaErrorType === "daily") {
                 try {
                   const match = fullError.match(/"resets_at":\s*"([^"]+)"/);
                 } catch {}
@@ -1992,11 +2017,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
                   prev.map((m) => m.id === msgId ? { ...m, content: buildDailyLimitMessage(fullError) } : m)
                 );
               } else {
-                  const waitMatch = fullError.match(/wait (\d+) seconds/i);
-                const waitTime = waitMatch ? waitMatch[1] : "a moment";
-                const content = isPerMinuteRate
-                  ? `Rate limited — please wait ${waitTime} seconds and try again.`
-                  : "Rate limited — try again in a moment or switch to a different model.";
+                const content = buildRateLimitMessage(fullError);
                 setMessages((prev) =>
                   prev.map((m) => m.id === msgId ? { ...m, content } : m)
                 );
@@ -2024,7 +2045,8 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
           if (piMessageIdRef.current) {
             const msgId = piMessageIdRef.current;
 
-            if (errMsg.includes("credits_exhausted") || errMsg.includes("daily_limit_exceeded") || errMsg.includes("daily_cost_limit_exceeded") || errMsg.includes("429")) {
+            const quotaErrorType = classifyQuotaError(errMsg);
+            if (quotaErrorType === "daily") {
               try {
                 const resetsAtMatch = errMsg.match(/"resets_at":\s*"([^"]+)"/);
                 } catch {}
@@ -2032,9 +2054,9 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
               setMessages((prev) =>
                 prev.map((m) => m.id === msgId ? { ...m, content: buildDailyLimitMessage(errMsg) } : m)
               );
-            } else if (errMsg.includes("rate limit") || errMsg.includes("rate_limit")) {
+            } else if (quotaErrorType === "rate") {
               setMessages((prev) =>
-                prev.map((m) => m.id === msgId ? { ...m, content: "Rate limited — try again in a moment." } : m)
+                prev.map((m) => m.id === msgId ? { ...m, content: buildRateLimitMessage(errMsg) } : m)
               );
             } else {
               setMessages((prev) =>
@@ -2079,13 +2101,14 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
             // Surface credits_exhausted / rate limit errors from agent_end
             if (agentEndError && !content) {
               const errStr = agentEndError;
-              if (errStr.includes("credits_exhausted") || errStr.includes("daily_limit_exceeded") || errStr.includes("daily_cost_limit_exceeded") || errStr.includes("429")) {
+              const quotaErrorType = classifyQuotaError(errStr);
+              if (quotaErrorType === "daily") {
                 try {
                   const resetsAtMatch = errStr.match(/"resets_at":\s*"([^"]+)"/);
                     } catch {}
                                   content = buildDailyLimitMessage(errStr);
-              } else if (errStr.includes("rate limit")) {
-                  content = "Rate limited — try again in a moment.";
+              } else if (quotaErrorType === "rate") {
+                  content = buildRateLimitMessage(errStr);
               } else {
                 content = `Error: ${errStr}`;
               }
@@ -2173,10 +2196,9 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
           if (piMessageIdRef.current) {
             const msgId = piMessageIdRef.current;
 
-            if (errorStr.includes("daily_limit_exceeded") || errorStr.includes("daily_cost_limit_exceeded") || errorStr.includes("429") || errorStr.includes("rate limit")) {
-              const isDailyLimit = errorStr.includes("daily_limit_exceeded") || errorStr.includes("daily_cost_limit_exceeded");
-              const isPerMinuteRate = errorStr.includes("rate limit exceeded") || errorStr.includes("requests per minute");
-              if (isDailyLimit) {
+            const quotaErrorType = classifyQuotaError(errorStr);
+            if (quotaErrorType === "daily" || quotaErrorType === "rate") {
+              if (quotaErrorType === "daily") {
                 try {
                   const match = errorStr.match(/"resets_at":\s*"([^"]+)"/);
                 } catch {}
@@ -2184,11 +2206,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
                   prev.map((m) => m.id === msgId ? { ...m, content: buildDailyLimitMessage(errorStr) } : m)
                 );
               } else {
-                  const waitMatch = errorStr.match(/wait (\d+) seconds/i);
-                const waitTime = waitMatch ? waitMatch[1] : "a moment";
-                const content = isPerMinuteRate
-                  ? `Rate limited — please wait ${waitTime} seconds and try again.`
-                  : "Rate limited — try again in a moment or switch to a different model.";
+                const content = buildRateLimitMessage(errorStr);
                 setMessages((prev) =>
                   prev.map((m) => m.id === msgId ? { ...m, content } : m)
                 );
@@ -2221,8 +2239,9 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
               );
             }
           }
-          const errorCategory = errorStr.includes("daily_limit") ? "daily_limit"
-            : errorStr.includes("rate limit") || errorStr.includes("429") ? "rate_limit"
+          const quotaErrorType = classifyQuotaError(errorStr);
+          const errorCategory = quotaErrorType === "daily" ? "daily_limit"
+            : quotaErrorType === "rate" ? "rate_limit"
             : errorStr.includes("model_not_allowed") ? "model_not_allowed"
             : "other";
           posthog.capture("chat_response_error", {
@@ -3950,6 +3969,8 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
                 ref={inputRef}
                 value={input}
                 onChange={handleInputChange}
+                onCompositionStart={() => setIsComposing(true)}
+                onCompositionEnd={() => setIsComposing(false)}
                 onKeyDown={handleKeyDown}
                 placeholder={
                   disabledReason

@@ -54,10 +54,12 @@ pub mod zendesk;
 use crate::oauth;
 use anyhow::Result;
 use async_trait::async_trait;
+use screenpipe_secrets::SecretStore;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // Static definition types (used by UI + Pi context)
@@ -130,7 +132,12 @@ pub trait Integration: Send + Sync {
     fn def(&self) -> &'static IntegrationDef;
 
     /// Verify credentials work. Returns a human-readable success message.
-    async fn test(&self, client: &reqwest::Client, creds: &Map<String, Value>) -> Result<String>;
+    async fn test(
+        &self,
+        client: &reqwest::Client,
+        creds: &Map<String, Value>,
+        secret_store: Option<&SecretStore>,
+    ) -> Result<String>;
 
     /// Return OAuth config if this integration uses OAuth instead of manual fields.
     /// Default is `None` (manual credential entry).
@@ -227,6 +234,69 @@ pub fn save_store(screenpipe_dir: &Path, data: &HashMap<String, SavedConnection>
 }
 
 // ---------------------------------------------------------------------------
+// SecretStore credential helpers
+// ---------------------------------------------------------------------------
+
+/// Load a `SavedConnection` from SecretStore (if available), falling back to
+/// the legacy `connections.json` file on disk.
+pub async fn load_connection(
+    secret_store: Option<&SecretStore>,
+    screenpipe_dir: &Path,
+    key: &str,
+) -> Option<SavedConnection> {
+    // Try SecretStore first
+    if let Some(ss) = secret_store {
+        let store_key = format!("cred:{}", key);
+        if let Ok(Some(conn)) = ss.get_json::<SavedConnection>(&store_key).await {
+            return Some(conn);
+        }
+    }
+
+    // Fall back to legacy file
+    let file_store = load_store(screenpipe_dir);
+    file_store.get(key).cloned()
+}
+
+/// Write a `SavedConnection` to SecretStore. Falls back to the legacy
+/// `connections.json` file only when no SecretStore is available.
+async fn save_connection(
+    secret_store: Option<&SecretStore>,
+    screenpipe_dir: &Path,
+    key: &str,
+    conn: &SavedConnection,
+) -> Result<()> {
+    if let Some(ss) = secret_store {
+        let store_key = format!("cred:{}", key);
+        ss.set_json(&store_key, conn).await?;
+        return Ok(());
+    }
+
+    // No SecretStore (CLI without DB) — fall back to file
+    let mut file_store = load_store(screenpipe_dir);
+    file_store.insert(key.to_string(), conn.clone());
+    save_store(screenpipe_dir, &file_store)
+}
+
+/// Remove a connection from SecretStore. Falls back to the legacy file
+/// only when no SecretStore is available.
+async fn remove_connection(
+    secret_store: Option<&SecretStore>,
+    screenpipe_dir: &Path,
+    key: &str,
+) -> Result<()> {
+    if let Some(ss) = secret_store {
+        let store_key = format!("cred:{}", key);
+        ss.delete(&store_key).await?;
+        return Ok(());
+    }
+
+    // No SecretStore — fall back to file
+    let mut file_store = load_store(screenpipe_dir);
+    file_store.remove(key);
+    save_store(screenpipe_dir, &file_store)
+}
+
+// ---------------------------------------------------------------------------
 // Connection manager
 // ---------------------------------------------------------------------------
 
@@ -234,36 +304,38 @@ pub struct ConnectionManager {
     integrations: Vec<Box<dyn Integration>>,
     screenpipe_dir: PathBuf,
     client: reqwest::Client,
+    secret_store: Option<Arc<SecretStore>>,
 }
 
 impl ConnectionManager {
-    pub fn new(screenpipe_dir: PathBuf) -> Self {
+    pub fn new(screenpipe_dir: PathBuf, secret_store: Option<Arc<SecretStore>>) -> Self {
         Self {
             integrations: all_integrations(),
             screenpipe_dir,
             client: reqwest::Client::new(),
+            secret_store,
         }
     }
 
     pub async fn list(&self) -> Vec<ConnectionInfo> {
-        let store = load_store(&self.screenpipe_dir);
+        let ss = self.secret_store.as_deref();
         let mut result = Vec::new();
         for i in &self.integrations {
             let def = i.def();
             let is_oauth = i.oauth_config().is_some();
             let connected = if is_oauth {
-                let instances = oauth::list_oauth_instances(None, def.id).await;
+                let instances = oauth::list_oauth_instances(ss, def.id).await;
                 let mut any_connected = false;
                 for inst in &instances {
-                    if oauth::is_oauth_instance_connected(None, def.id, inst.as_deref()).await {
+                    if oauth::is_oauth_instance_connected(ss, def.id, inst.as_deref()).await {
                         any_connected = true;
                         break;
                     }
                 }
                 any_connected
             } else {
-                store
-                    .get(def.id)
+                load_connection(ss, &self.screenpipe_dir, def.id)
+                    .await
                     .map(|c| c.enabled && !c.credentials.is_empty())
                     .unwrap_or(false)
             };
@@ -276,23 +348,28 @@ impl ConnectionManager {
         result
     }
 
-    pub fn connect(&self, id: &str, creds: Map<String, Value>) -> Result<()> {
+    pub async fn connect(&self, id: &str, creds: Map<String, Value>) -> Result<()> {
         self.find(id)?;
-        let mut store = load_store(&self.screenpipe_dir);
-        store.insert(
-            id.to_string(),
-            SavedConnection {
-                enabled: true,
-                credentials: creds,
-            },
-        );
-        save_store(&self.screenpipe_dir, &store)
+        let conn = SavedConnection {
+            enabled: true,
+            credentials: creds,
+        };
+        save_connection(
+            self.secret_store.as_deref(),
+            &self.screenpipe_dir,
+            id,
+            &conn,
+        )
+        .await
     }
 
-    pub fn get_credentials(&self, id: &str) -> Result<Option<Map<String, Value>>> {
+    pub async fn get_credentials(&self, id: &str) -> Result<Option<Map<String, Value>>> {
         self.find(id)?;
-        let store = load_store(&self.screenpipe_dir);
-        Ok(store.get(id).map(|c| c.credentials.clone()))
+        Ok(
+            load_connection(self.secret_store.as_deref(), &self.screenpipe_dir, id)
+                .await
+                .map(|c| c.credentials),
+        )
     }
 
     /// Look up the proxy config for a connection by ID.
@@ -311,19 +388,19 @@ impl ConnectionManager {
             .map(|i| i.def())
     }
 
-    pub fn disconnect(&self, id: &str) -> Result<()> {
-        let mut store = load_store(&self.screenpipe_dir);
-        store.remove(id);
-        save_store(&self.screenpipe_dir, &store)
+    pub async fn disconnect(&self, id: &str) -> Result<()> {
+        remove_connection(self.secret_store.as_deref(), &self.screenpipe_dir, id).await
     }
 
     pub async fn test(&self, id: &str, creds: &Map<String, Value>) -> Result<String> {
         let integration = self.find(id)?;
-        integration.test(&self.client, creds).await
+        integration
+            .test(&self.client, creds, self.secret_store.as_deref())
+            .await
     }
 
     /// Store credentials under `id` or `id:instance`.
-    pub fn connect_instance(
+    pub async fn connect_instance(
         &self,
         id: &str,
         instance: Option<&str>,
@@ -331,15 +408,17 @@ impl ConnectionManager {
     ) -> Result<()> {
         self.find(id)?;
         let key = make_key(id, instance);
-        let mut store = load_store(&self.screenpipe_dir);
-        store.insert(
-            key,
-            SavedConnection {
-                enabled: true,
-                credentials: creds,
-            },
-        );
-        save_store(&self.screenpipe_dir, &store)
+        let conn = SavedConnection {
+            enabled: true,
+            credentials: creds,
+        };
+        save_connection(
+            self.secret_store.as_deref(),
+            &self.screenpipe_dir,
+            &key,
+            &conn,
+        )
+        .await
     }
 
     /// Return all saved instances for the given integration id.
@@ -347,27 +426,58 @@ impl ConnectionManager {
     /// Matches keys that are exactly `id` (the default instance) or start with
     /// `id:` (named instances).  Each entry is returned as
     /// `(instance_name_or_none, connection)`.
-    pub fn get_all_instances(&self, id: &str) -> Result<Vec<(Option<String>, SavedConnection)>> {
+    pub async fn get_all_instances(
+        &self,
+        id: &str,
+    ) -> Result<Vec<(Option<String>, SavedConnection)>> {
         self.find(id)?;
-        let store = load_store(&self.screenpipe_dir);
-        let prefix = format!("{}:", id);
         let mut results = Vec::new();
-        for (key, conn) in &store {
-            if key == id {
-                results.push((None, conn.clone()));
-            } else if let Some(inst) = key.strip_prefix(&prefix) {
-                results.push((Some(inst.to_string()), conn.clone()));
+        let mut seen = std::collections::HashSet::new();
+
+        // Check SecretStore first
+        if let Some(ss) = self.secret_store.as_deref() {
+            let prefix = format!("cred:{}", id);
+            if let Ok(keys) = ss.list(&prefix).await {
+                for key in keys {
+                    if key == prefix {
+                        if let Ok(Some(conn)) = ss.get_json::<SavedConnection>(&key).await {
+                            seen.insert(None::<String>);
+                            results.push((None, conn));
+                        }
+                    } else if let Some(inst) = key.strip_prefix(&format!("{}:", prefix)) {
+                        let inst = inst.to_string();
+                        if let Ok(Some(conn)) = ss.get_json::<SavedConnection>(&key).await {
+                            seen.insert(Some(inst.clone()));
+                            results.push((Some(inst), conn));
+                        }
+                    }
+                }
             }
         }
+
+        // Fall back to file for any not found in store
+        let file_store = load_store(&self.screenpipe_dir);
+        let prefix = format!("{}:", id);
+        for (key, conn) in &file_store {
+            if key == id {
+                if seen.insert(None::<String>) {
+                    results.push((None, conn.clone()));
+                }
+            } else if let Some(inst) = key.strip_prefix(&prefix) {
+                let inst = inst.to_string();
+                if seen.insert(Some(inst.clone())) {
+                    results.push((Some(inst), conn.clone()));
+                }
+            }
+        }
+
         Ok(results)
     }
 
     /// Remove a specific instance (or the default) for the given integration.
-    pub fn disconnect_instance(&self, id: &str, instance: Option<&str>) -> Result<()> {
+    pub async fn disconnect_instance(&self, id: &str, instance: Option<&str>) -> Result<()> {
         let key = make_key(id, instance);
-        let mut store = load_store(&self.screenpipe_dir);
-        store.remove(&key);
-        save_store(&self.screenpipe_dir, &store)
+        remove_connection(self.secret_store.as_deref(), &self.screenpipe_dir, &key).await
     }
 
     fn find(&self, id: &str) -> Result<&dyn Integration> {
@@ -392,28 +502,33 @@ pub struct ConnectionInfo {
 // Pi context rendering — uses proxy URLs instead of raw credentials
 // ---------------------------------------------------------------------------
 
-pub async fn render_context(screenpipe_dir: &Path, api_port: u16) -> String {
-    let store = load_store(screenpipe_dir);
+pub async fn render_context(
+    screenpipe_dir: &Path,
+    api_port: u16,
+    secret_store: Option<&SecretStore>,
+) -> String {
     let integrations = all_integrations();
 
     // Credential-based integrations
-    let cred_connected: Vec<_> = integrations
-        .iter()
-        .filter(|i| i.oauth_config().is_none())
-        .filter_map(|i| {
-            let def = i.def();
-            store
-                .get(def.id)
-                .filter(|c| c.enabled && !c.credentials.is_empty())
-                .map(|c| (i.as_ref(), def, &c.credentials))
-        })
-        .collect();
+    let mut cred_connected: Vec<(&dyn Integration, &'static IntegrationDef, Map<String, Value>)> =
+        Vec::new();
+    for i in integrations.iter().filter(|i| i.oauth_config().is_none()) {
+        let def = i.def();
+        if let Some(conn) = load_connection(secret_store, screenpipe_dir, def.id).await {
+            if conn.enabled && !conn.credentials.is_empty() {
+                cred_connected.push((i.as_ref(), def, conn.credentials));
+            }
+        }
+    }
 
     // OAuth integrations with a stored token
     let mut oauth_connected: Vec<(&dyn Integration, &'static IntegrationDef)> = Vec::new();
     for i in integrations.iter().filter(|i| i.oauth_config().is_some()) {
         let def = i.def();
-        if oauth::read_oauth_token(def.id).await.is_some() {
+        if oauth::read_oauth_token_instance(secret_store, def.id, None)
+            .await
+            .is_some()
+        {
             oauth_connected.push((i.as_ref(), def));
         }
     }
@@ -444,7 +559,7 @@ pub async fn render_context(screenpipe_dir: &Path, api_port: u16) -> String {
             ));
         } else {
             // No proxy config — fall back to raw credentials (webhook-style integrations)
-            for (key, value) in *creds {
+            for (key, value) in creds {
                 if let Some(s) = value.as_str() {
                     out.push_str(&format!("  {}: {}\n", key, s));
                 }

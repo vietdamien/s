@@ -374,6 +374,9 @@ class ShortcutReminderController: NSObject {
     private var meetingPollTimer: Timer?
     private var prevFramesCaptured: Int?
     private var prevOcrCompleted: Int?
+    /// Set from Rust `show_shortcut_reminder` when API auth is enabled (includes ?token=).
+    private var metricsWsUrl = "ws://127.0.0.1:3030/ws/metrics"
+    private var meetingsStatusUrl = "http://127.0.0.1:3030/meetings/status"
 
     func show(shortcuts: String?) {
         DispatchQueue.main.async { [self] in
@@ -412,7 +415,7 @@ class ShortcutReminderController: NSObject {
 
     private func connectWebSocket() {
         disconnectWebSocket()
-        guard let url = URL(string: "ws://127.0.0.1:3030/ws/metrics") else { return }
+        guard let url = URL(string: metricsWsUrl) else { return }
         let session = URLSession(configuration: .default)
         let task = session.webSocketTask(with: url)
         self.wsTask = task
@@ -486,7 +489,7 @@ class ShortcutReminderController: NSObject {
     }
 
     private func checkMeetingStatus() {
-        guard let url = URL(string: "http://localhost:3030/meetings/status") else { return }
+        guard let url = URL(string: meetingsStatusUrl) else { return }
         URLSession.shared.dataTask(with: url) { [weak self] data, _, _ in
             guard let self = self, let data = data,
                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
@@ -501,12 +504,33 @@ class ShortcutReminderController: NSObject {
     }
 
     private func parseShortcuts(_ json: String) {
-        // Simple parse — expects {"overlay":"⌘⌃S","chat":"⌘⌃L","search":"⌘⌃K"}
+        // Expects {"overlay":"…","chat":"…","search":"…"} plus optional URLs from Rust when API auth is on.
         guard let data = json.data(using: .utf8),
               let dict = try? JSONDecoder().decode([String: String].self, from: data) else { return }
-        if let s = dict["overlay"] { overlayShortcut = s }
-        if let s = dict["chat"] { chatShortcut = s }
-        if let s = dict["search"] { searchShortcut = s }
+        if let s = dict["overlay"] { overlayShortcut = prettifyShortcut(s) }
+        if let s = dict["chat"] { chatShortcut = prettifyShortcut(s) }
+        if let s = dict["search"] { searchShortcut = prettifyShortcut(s) }
+        if let s = dict["metrics_ws_url"] { metricsWsUrl = s }
+        if let s = dict["meetings_status_url"] { meetingsStatusUrl = s }
+    }
+
+    /// Convert "Super+Ctrl+S" → "⌘⌃S" for compact overlay display.
+    private func prettifyShortcut(_ raw: String) -> String {
+        // Already contains symbols — return as-is
+        if raw.contains("⌘") || raw.contains("⌃") || raw.contains("⌥") || raw.contains("⇧") { return raw }
+        let parts = raw.split(separator: "+").map(String.init)
+        var symbols = ""
+        var key = ""
+        for part in parts {
+            switch part.lowercased() {
+            case "super", "cmd", "command", "meta":  symbols += "⌘"
+            case "ctrl", "control":                   symbols += "⌃"
+            case "alt", "option", "opt":              symbols += "⌥"
+            case "shift":                             symbols += "⇧"
+            default:                                  key = part.uppercased()
+            }
+        }
+        return symbols + key
     }
 
     private func createPanel() {

@@ -31,6 +31,89 @@ use tracing::{debug, error, info};
 /// handler in main.rs knows this is an intentional quit (not just a window close).
 pub static QUIT_REQUESTED: AtomicBool = AtomicBool::new(false);
 
+/// Pre-fetched data for building the tray menu. All store reads, settings
+/// deserialization, and permission checks happen OFF the main thread; only
+/// the lightweight menu-item construction runs on the main thread.
+#[derive(Clone)]
+struct TrayMenuData {
+    onboarding_completed: bool,
+    show_shortcut: String,
+    search_shortcut: String,
+    chat_shortcut: String,
+    cloud_subscribed: bool,
+    has_permission_issue: bool,
+}
+
+/// Gather all data needed by `create_dynamic_menu` on the current (non-main)
+/// thread so the main-thread closure does zero I/O.
+fn prefetch_tray_menu_data(app: &AppHandle) -> TrayMenuData {
+    let onboarding_completed = OnboardingStore::get(app)
+        .ok()
+        .flatten()
+        .map(|o| o.is_completed)
+        .unwrap_or(false);
+
+    let (default_show, default_search, default_chat) = if cfg!(target_os = "windows") {
+        ("Alt+S", "Alt+K", "Alt+L")
+    } else {
+        ("Control+Super+S", "Control+Super+K", "Control+Super+L")
+    };
+
+    let (show_shortcut, search_shortcut, chat_shortcut) =
+        if let Ok(store) = get_store(app, None) {
+            (
+                store
+                    .get("showScreenpipeShortcut")
+                    .and_then(|v| v.as_str().map(String::from))
+                    .unwrap_or_else(|| default_show.to_string()),
+                store
+                    .get("searchShortcut")
+                    .and_then(|v| v.as_str().map(String::from))
+                    .unwrap_or_else(|| default_search.to_string()),
+                store
+                    .get("showChatShortcut")
+                    .and_then(|v| v.as_str().map(String::from))
+                    .unwrap_or_else(|| default_chat.to_string()),
+            )
+        } else {
+            (
+                default_show.to_string(),
+                default_search.to_string(),
+                default_chat.to_string(),
+            )
+        };
+
+    let cloud_subscribed = SettingsStore::get(app)
+        .unwrap_or_default()
+        .unwrap_or_default()
+        .user
+        .cloud_subscribed
+        == Some(true);
+
+    let has_permission_issue = if onboarding_completed {
+        #[cfg(target_os = "macos")]
+        {
+            let perms = crate::permissions::do_permissions_check(false);
+            !perms.screen_recording.permitted() || !perms.microphone.permitted()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            false
+        }
+    } else {
+        false
+    };
+
+    TrayMenuData {
+        onboarding_completed,
+        show_shortcut,
+        search_shortcut,
+        chat_shortcut,
+        cloud_subscribed,
+        has_permission_issue,
+    }
+}
+
 /// Global storage for the update menu item so we can recreate the tray
 /// without needing to pass the update_item through every call chain.
 static UPDATE_MENU_ITEM: Lazy<Mutex<Option<MenuItem<Wry>>>> = Lazy::new(|| Mutex::new(None));
@@ -69,7 +152,8 @@ fn force_tray_rebuild(app: &AppHandle) -> Result<()> {
     let mut new_state = state;
     new_state.recording_status = Some(effective);
 
-    let menu = create_dynamic_menu(app, &new_state, update_item.as_ref())?;
+    let data = prefetch_tray_menu_data(app);
+    let menu = create_dynamic_menu(app, &new_state, update_item.as_ref(), &data)?;
     if let Some(tray) = app.tray_by_id("screenpipe_main") {
         if let Ok(mut guard) = PREVIOUS_TRAY_MENU.lock() {
             *guard = Some(menu.clone());
@@ -142,7 +226,8 @@ pub fn setup_tray(app: &AppHandle, update_item: Option<&tauri::menu::MenuItem<Wr
 
     if let Some(main_tray) = app.tray_by_id("screenpipe_main") {
         // Initial menu setup with empty state
-        let menu = create_dynamic_menu(app, &MenuState::default(), update_item)?;
+        let data = prefetch_tray_menu_data(app);
+        let menu = create_dynamic_menu(app, &MenuState::default(), update_item, &data)?;
         // Keep a clone alive to prevent use-after-free (see PREVIOUS_TRAY_MENU doc).
         if let Ok(mut guard) = PREVIOUS_TRAY_MENU.lock() {
             *guard = Some(menu.clone());
@@ -251,8 +336,9 @@ pub fn recreate_tray(app: &AppHandle) {
                     Ok(new_tray) => {
                         debug!("recreate_tray: build succeeded, setting menu");
                         // Setup menu
+                        let data = prefetch_tray_menu_data(&app);
                         if let Ok(menu) =
-                            create_dynamic_menu(&app, &MenuState::default(), update_item.as_ref())
+                            create_dynamic_menu(&app, &MenuState::default(), update_item.as_ref(), &data)
                         {
                             // Keep a clone alive to prevent use-after-free (see PREVIOUS_TRAY_MENU doc).
                             if let Ok(mut guard) = PREVIOUS_TRAY_MENU.lock() {
@@ -308,19 +394,12 @@ fn create_dynamic_menu(
     app: &AppHandle,
     _state: &MenuState,
     update_item: Option<&tauri::menu::MenuItem<Wry>>,
+    data: &TrayMenuData,
 ) -> Result<tauri::menu::Menu<Wry>> {
-    let store = get_store(app, None)?;
     let mut menu_builder = MenuBuilder::new(app);
 
-    // Check if onboarding is completed
-    let onboarding_completed = OnboardingStore::get(app)
-        .ok()
-        .flatten()
-        .map(|o| o.is_completed)
-        .unwrap_or(false);
-
     // During onboarding: show minimal menu (version + skip + quit)
-    if !onboarding_completed {
+    if !data.onboarding_completed {
         menu_builder = menu_builder
             .item(
                 &MenuItemBuilder::with_id(
@@ -342,25 +421,9 @@ fn create_dynamic_menu(
         return menu_builder.build().map_err(Into::into);
     }
 
-    // Full menu after onboarding is complete
-    // Get shortcuts from store (must match frontend defaults in use-settings.tsx)
-    let (default_show, default_search, default_chat) = if cfg!(target_os = "windows") {
-        ("Alt+S", "Alt+K", "Alt+L")
-    } else {
-        ("Control+Super+S", "Control+Super+K", "Control+Super+L")
-    };
-    let show_shortcut = store
-        .get("showScreenpipeShortcut")
-        .and_then(|v| v.as_str().map(String::from))
-        .unwrap_or_else(|| default_show.to_string());
-    let search_shortcut = store
-        .get("searchShortcut")
-        .and_then(|v| v.as_str().map(String::from))
-        .unwrap_or_else(|| default_search.to_string());
-    let chat_shortcut = store
-        .get("showChatShortcut")
-        .and_then(|v| v.as_str().map(String::from))
-        .unwrap_or_else(|| default_chat.to_string());
+    let show_shortcut = &data.show_shortcut;
+    let search_shortcut = &data.search_shortcut;
+    let chat_shortcut = &data.chat_shortcut;
 
     // --- Open screenpipe ---
     menu_builder = menu_builder
@@ -473,23 +536,15 @@ fn create_dynamic_menu(
     }
 
     // Show "fix permissions" when recording is in error state
-    if effective_status == RecordingStatus::Error {
-        let perms = crate::permissions::do_permissions_check(false);
-        let has_permission_issue =
-            !perms.screen_recording.permitted() || !perms.microphone.permitted();
-        if has_permission_issue {
-            menu_builder = menu_builder.item(
-                &MenuItemBuilder::with_id("fix_permissions", "⚠ Fix permissions").build(app)?,
-            );
-        }
+    if effective_status == RecordingStatus::Error && data.has_permission_issue {
+        menu_builder = menu_builder.item(
+            &MenuItemBuilder::with_id("fix_permissions", "⚠ Fix permissions").build(app)?,
+        );
     }
 
     // --- Plan / usage info ---
     if !is_tray_item_hidden("tray_plan") {
-        let settings = SettingsStore::get(app)
-            .unwrap_or_default()
-            .unwrap_or_default();
-        let is_pro = settings.user.cloud_subscribed == Some(true);
+        let is_pro = data.cloud_subscribed;
         menu_builder = menu_builder.item(&PredefinedMenuItem::separator(app)?);
         if is_pro {
             menu_builder = menu_builder.item(
@@ -880,48 +935,29 @@ async fn update_menu_if_needed(
     app: &AppHandle,
     update_item: &tauri::menu::MenuItem<Wry>,
 ) -> Result<()> {
-    // Get current state including onboarding status
-    let onboarding_completed = OnboardingStore::get(app)
-        .ok()
-        .flatten()
-        .map(|o| o.is_completed)
-        .unwrap_or(false);
-
-    // Check permission status for tray tooltip
-    let has_permission_issue = if onboarding_completed {
-        #[cfg(target_os = "macos")]
-        {
-            let perms = crate::permissions::do_permissions_check(false);
-            !perms.screen_recording.permitted() || !perms.microphone.permitted()
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            false
-        }
-    } else {
-        false
-    };
-
-    let cloud_subscribed = SettingsStore::get(app)
-        .unwrap_or_default()
-        .unwrap_or_default()
-        .user
-        .cloud_subscribed
-        == Some(true);
+    // Pre-fetch all data on the tokio thread (off main thread) so the
+    // main-thread closure only does lightweight menu-item construction.
+    let data = prefetch_tray_menu_data(app);
 
     let recording_info = get_recording_info();
     let effective_status = get_effective_recording_status();
     let new_state = MenuState {
-        shortcuts: get_current_shortcuts(app)?,
+        shortcuts: {
+            let mut m = HashMap::new();
+            m.insert("show".to_string(), data.show_shortcut.clone());
+            m.insert("search".to_string(), data.search_shortcut.clone());
+            m.insert("chat".to_string(), data.chat_shortcut.clone());
+            m
+        },
         recording_status: Some(effective_status),
-        onboarding_completed,
-        has_permission_issue,
+        onboarding_completed: data.onboarding_completed,
+        has_permission_issue: data.has_permission_issue,
         devices: recording_info
             .devices
             .iter()
             .map(|d| (d.name.clone(), d.active))
             .collect(),
-        cloud_subscribed,
+        cloud_subscribed: data.cloud_subscribed,
     };
 
     // Compare with last state (poison-safe: run handler must not panic)
@@ -948,7 +984,7 @@ async fn update_menu_if_needed(
                 if let Some(tray) = app_for_thread.tray_by_id("screenpipe_main") {
                     debug!("tray_menu_update: setting menu");
                     if let Ok(menu) =
-                        create_dynamic_menu(&app_for_thread, &new_state, Some(&update_item))
+                        create_dynamic_menu(&app_for_thread, &new_state, Some(&update_item), &data)
                     {
                         // Keep a clone alive to prevent use-after-free (see PREVIOUS_TRAY_MENU doc).
                         if let Ok(mut guard) = PREVIOUS_TRAY_MENU.lock() {
@@ -984,31 +1020,6 @@ async fn update_menu_if_needed(
     Ok(())
 }
 
-fn get_current_shortcuts(app: &AppHandle) -> Result<HashMap<String, String>> {
-    let store = get_store(app, None)?;
-    let mut shortcuts = HashMap::new();
-
-    if let Some(s) = store
-        .get("showScreenpipeShortcut")
-        .and_then(|v| v.as_str().map(String::from))
-    {
-        shortcuts.insert("show".to_string(), s);
-    }
-    if let Some(s) = store
-        .get("searchShortcut")
-        .and_then(|v| v.as_str().map(String::from))
-    {
-        shortcuts.insert("search".to_string(), s);
-    }
-    if let Some(s) = store
-        .get("showChatShortcut")
-        .and_then(|v| v.as_str().map(String::from))
-    {
-        shortcuts.insert("chat".to_string(), s);
-    }
-
-    Ok(shortcuts)
-}
 
 pub fn setup_tray_menu_updater(app: AppHandle, update_item: &tauri::menu::MenuItem<Wry>) {
     let update_item = update_item.clone();

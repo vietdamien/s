@@ -94,14 +94,14 @@ pub async fn migrate_legacy_secrets(
                         if let Err(e) = store.set(&store_key, &contents).await {
                             report.errors.push(format!("{}: {}", filename, e));
                         } else {
-                            // Delete the legacy file — SecretStore handles refresh now
-                            if let Err(e) = std::fs::remove_file(&path) {
-                                warn!("migrated {} but failed to delete: {}", filename, e);
-                            }
+                            // Keep the legacy file — Phase 1 per module doc. Readers
+                            // (e.g. chatgpt_oauth::read_tokens) still consult the file;
+                            // deleting it here breaks OAuth restore across restarts.
+                            // Phase 2 (reader migration to SecretStore) can delete later.
                             report
                                 .migrated
                                 .push(format!("{} -> {}", filename, store_key));
-                            info!("migrated {} -> {} (file deleted)", filename, store_key);
+                            info!("migrated {} -> {} (file kept for legacy readers)", filename, store_key);
                         }
                     }
                     Err(e) => {
@@ -114,7 +114,8 @@ pub async fn migrate_legacy_secrets(
         }
     }
 
-    // Migrate connections.json tokens
+    // Migrate connections.json — store each full connection entry under `cred:{name}`
+    // so ConnectionManager can read credentials from SecretStore (encrypted).
     let connections_path = screenpipe_dir.join("connections.json");
     if connections_path.is_file() {
         match std::fs::read_to_string(&connections_path) {
@@ -123,62 +124,59 @@ pub async fn migrate_legacy_secrets(
                     Ok(json) => {
                         if let Some(obj) = json.as_object() {
                             for (name, value) in obj {
-                                // Extract token-like fields from each connection
-                                if let Some(conn_obj) = value.as_object() {
-                                    for (field, field_value) in conn_obj {
-                                        let field_lower = field.to_lowercase();
-                                        if field_lower.contains("token")
-                                            || field_lower.contains("secret")
-                                            || field_lower.contains("key")
-                                            || field_lower.contains("password")
-                                            || field_lower.contains("refresh")
-                                        {
-                                            if let Some(token_str) = field_value.as_str() {
-                                                if token_str.is_empty() {
-                                                    continue;
-                                                }
-                                                let store_key =
-                                                    format!("connection:{}:{}", name, field);
+                                // Migrate the full connection entry under cred:{name}
+                                let cred_key = format!("cred:{}", name);
+                                let value_bytes =
+                                    serde_json::to_vec(value).unwrap_or_default();
 
-                                                // Check if already migrated and readable
-                                                match store.get(&store_key).await {
-                                                    Ok(Some(_)) => {
-                                                        report.skipped.push(format!(
-                                                            "connections.json/{}/{} (already migrated)",
-                                                            name, field
-                                                        ));
-                                                        continue;
-                                                    }
-                                                    Ok(None) => {}
-                                                    Err(_) => {
-                                                        // Key change — re-migrate
-                                                        info!(
-                                                            "re-migrating connections.json/{}/{} (key change)",
-                                                            name, field
-                                                        );
-                                                    }
-                                                }
+                                let should_import = match store.get(&cred_key).await {
+                                    Ok(Some(_)) => {
+                                        // Check if file is newer
+                                        let file_mtime = std::fs::metadata(&connections_path)
+                                            .ok()
+                                            .and_then(|m| m.modified().ok());
+                                        let store_time = store
+                                            .get_updated_at(&cred_key)
+                                            .await
+                                            .ok()
+                                            .flatten()
+                                            .and_then(|t| {
+                                                chrono::DateTime::parse_from_rfc3339(&t).ok()
+                                            })
+                                            .map(std::time::SystemTime::from);
 
-                                                if let Err(e) = store
-                                                    .set(&store_key, token_str.as_bytes())
-                                                    .await
-                                                {
-                                                    report.errors.push(format!(
-                                                        "connections.json/{}/{}: {}",
-                                                        name, field, e
-                                                    ));
-                                                } else {
-                                                    report.migrated.push(format!(
-                                                        "connections.json/{}/{} -> {}",
-                                                        name, field, store_key
-                                                    ));
-                                                    info!(
-                                                        "migrated connections.json/{}/{} -> {}",
-                                                        name, field, store_key
-                                                    );
-                                                }
+                                        match (file_mtime, store_time) {
+                                            (Some(fm), Some(st)) if fm > st => true,
+                                            _ => {
+                                                report.skipped.push(format!(
+                                                    "connections.json/{} (already migrated)",
+                                                    name
+                                                ));
+                                                false
                                             }
                                         }
+                                    }
+                                    Ok(None) => true,
+                                    Err(_) => true,
+                                };
+
+                                if should_import && !value_bytes.is_empty() {
+                                    if let Err(e) =
+                                        store.set(&cred_key, &value_bytes).await
+                                    {
+                                        report.errors.push(format!(
+                                            "connections.json/{}: {}",
+                                            name, e
+                                        ));
+                                    } else {
+                                        report.migrated.push(format!(
+                                            "connections.json/{} -> {}",
+                                            name, cred_key
+                                        ));
+                                        info!(
+                                            "migrated connections.json/{} -> {}",
+                                            name, cred_key
+                                        );
                                     }
                                 }
                             }
@@ -337,25 +335,29 @@ mod tests {
 
         fs::write(
             dir_path.join("connections.json"),
-            r#"{"slack":{"token":"xoxb-123","name":"my-workspace"},"github":{"access_token":"ghp_abc","repo":"test"}}"#,
+            r#"{"slack":{"enabled":true,"credentials":{"token":"xoxb-123","name":"my-workspace"}},"github":{"enabled":true,"credentials":{"access_token":"ghp_abc","repo":"test"}}}"#,
         )
         .unwrap();
 
         let store = make_store().await;
         let report = migrate_legacy_secrets(&store, dir_path).await.unwrap();
 
-        // Should migrate token fields but not non-secret fields like "name" and "repo"
+        // Should migrate full connection entries under cred:{name}
         assert!(report
             .migrated
             .iter()
-            .any(|m| m.contains("slack") && m.contains("token")));
+            .any(|m| m.contains("slack") && m.contains("cred:")));
         assert!(report
             .migrated
             .iter()
-            .any(|m| m.contains("github") && m.contains("access_token")));
-        assert!(!report.migrated.iter().any(|m| m.contains("name")));
-        assert!(!report.migrated.iter().any(|m| m.contains("repo")));
+            .any(|m| m.contains("github") && m.contains("cred:")));
         assert!(report.errors.is_empty());
+
+        // Verify the values were stored
+        let slack_val = store.get("cred:slack").await.unwrap().unwrap();
+        let slack_json: serde_json::Value =
+            serde_json::from_slice(&slack_val).unwrap();
+        assert_eq!(slack_json["credentials"]["token"], "xoxb-123");
     }
 
     #[tokio::test]
@@ -371,14 +373,15 @@ mod tests {
 
         let store = make_store().await;
 
-        // First migration — file migrated and deleted
+        // First migration — file migrated (kept for legacy readers)
         let report1 = migrate_legacy_secrets(&store, dir_path).await.unwrap();
         assert_eq!(report1.migrated.len(), 1);
-        assert!(!dir_path.join("gmail-oauth.json").exists());
+        assert!(dir_path.join("gmail-oauth.json").exists()); // file kept
 
-        // Second migration — file gone, nothing to do
+        // Second migration — already in store, skipped
         let report2 = migrate_legacy_secrets(&store, dir_path).await.unwrap();
         assert_eq!(report2.migrated.len(), 0);
+        assert!(report2.skipped.iter().any(|s| s.contains("gmail")));
 
         // Value still in store
         assert!(store.get("oauth:gmail").await.unwrap().is_some());
