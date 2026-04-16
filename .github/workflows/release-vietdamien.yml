@@ -145,6 +145,10 @@ jobs:
           echo "ORT_LIB_LOCATION=${{ github.workspace }}/ort-system-lib" >> $GITHUB_ENV
           echo "OPENBLAS_PATH=${{ github.workspace }}/apps/screenpipe-app-tauri/src-tauri/openblas" >> $GITHUB_ENV
 
+      - name: Use enterprise config
+        shell: bash
+        run: cp apps/screenpipe-app-tauri/src-tauri/tauri.enterprise.conf.json apps/screenpipe-app-tauri/src-tauri/tauri.conf.json
+
       - name: Build (Windows x64)
         uses: tauri-apps/tauri-action@v0.5.17
         env:
