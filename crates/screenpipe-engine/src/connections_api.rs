@@ -238,7 +238,10 @@ async fn connect_instance(
     Json(body): Json<ConnectRequest>,
 ) -> (StatusCode, Json<Value>) {
     let mgr = state.cm.lock().await;
-    match mgr.connect_instance(&id, Some(&instance), body.credentials).await {
+    match mgr
+        .connect_instance(&id, Some(&instance), body.credentials)
+        .await
+    {
         Ok(()) => (StatusCode::OK, Json(json!({ "success": true }))),
         Err(e) => (
             StatusCode::BAD_REQUEST,

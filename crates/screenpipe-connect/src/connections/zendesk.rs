@@ -59,7 +59,12 @@ impl Integration for Zendesk {
         Some(&CFG)
     }
 
-    async fn test(&self, client: &reqwest::Client, creds: &Map<String, Value>, _secret_store: Option<&SecretStore>) -> Result<String> {
+    async fn test(
+        &self,
+        client: &reqwest::Client,
+        creds: &Map<String, Value>,
+        _secret_store: Option<&SecretStore>,
+    ) -> Result<String> {
         let subdomain = require_str(creds, "subdomain")?;
         let email = require_str(creds, "email")?;
         let api_token = require_str(creds, "api_token")?;

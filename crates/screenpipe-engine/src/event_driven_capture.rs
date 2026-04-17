@@ -23,7 +23,7 @@ use screenpipe_screen::snapshot_writer::SnapshotWriter;
 use screenpipe_screen::utils::capture_monitor_image;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, watch};
 use tracing::{debug, error, info, warn};
@@ -750,6 +750,7 @@ struct CaptureOutput {
 fn resolve_capture_metadata(
     tree_snapshot: Option<&screenpipe_a11y::tree::TreeSnapshot>,
     trigger: &CaptureTrigger,
+    lightweight_app_name: Option<&str>,
 ) -> (Option<String>, Option<String>, Option<String>) {
     let (mut app_name, mut window_name, browser_url) = match tree_snapshot {
         Some(snap) => (
@@ -759,6 +760,18 @@ fn resolve_capture_metadata(
         ),
         None => (None, None, None),
     };
+
+    // Fallback to the lightweight focused-app query when the tree walk returned
+    // nothing (focused_window AX query failed, e.g. Zoom during meetings).
+    // Without this, captures triggered by click/visual_change/idle would be
+    // stored with null app_name even though we know the focused app.
+    if app_name.is_none() {
+        if let Some(name) = lightweight_app_name {
+            if !name.is_empty() {
+                app_name = Some(name.to_string());
+            }
+        }
+    }
 
     match trigger {
         CaptureTrigger::AppSwitch {
@@ -787,6 +800,43 @@ fn resolve_capture_metadata(
     }
 
     (app_name, window_name, browser_url)
+}
+
+/// Rate-limit OCR-only apps (terminals). These apps bypass accessibility entirely
+/// and always run Vision OCR, which costs ~300ms per frame. Users typing in a
+/// terminal can fire typing-pause/visual-change triggers every few seconds; each
+/// one burns a full core. Cap captures to once per 30s per terminal app.
+///
+/// Returns `true` if this capture should be skipped (too recent).
+fn terminal_ocr_throttled(app_name: &str) -> bool {
+    const INTERVAL: Duration = Duration::from_secs(30);
+    let n = app_name.to_lowercase();
+    // Mirror the app_prefers_ocr list in paired_capture.rs: terminals whose
+    // AX tree is raw buffer / window chrome and OCR is the only useful source.
+    let is_ocr_only = n.contains("wezterm")
+        || n.contains("alacritty")
+        || n.contains("kitty")
+        || n.contains("hyper")
+        || n.contains("warp");
+    if !is_ocr_only {
+        return false;
+    }
+
+    static LAST_CAPTURE: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+    let map = LAST_CAPTURE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = match map.lock() {
+        Ok(g) => g,
+        // Poisoned mutex: don't block captures, just allow this one
+        Err(_) => return false,
+    };
+    let now = Instant::now();
+    match guard.get(&n) {
+        Some(&last) if now.duration_since(last) < INTERVAL => true,
+        _ => {
+            guard.insert(n, now);
+            false
+        }
+    }
 }
 
 /// Perform a single event-driven capture.
@@ -866,29 +916,49 @@ async fn do_capture(
         }
     };
 
+    // Terminal OCR rate-limit: wezterm/alacritty/kitty/hyper/warp all bypass AX
+    // and run full Vision OCR (~300ms) per capture. Typing-pause triggers fire
+    // every few seconds in an active terminal, so cap to 1 capture per 30s per app.
+    if let Some(ref app) = trigger_app {
+        if terminal_ocr_throttled(app) {
+            debug!(
+                "terminal OCR throttle: skipping {} capture (within 30s of previous)",
+                app
+            );
+            return Ok(CaptureOutput {
+                result: None,
+                image,
+                elements_deduped: false,
+            });
+        }
+    }
+
     use screenpipe_a11y::tree::TreeWalkResult;
-    let mut budget_skipped = false;
     if let Some(ref app) = trigger_app {
         let decision = walk_budget.should_walk(app);
         if !decision.walk {
             debug!(
-                "walk budget: throttling tree walk for {} (tier={:?})",
+                "walk budget: throttling tree walk for {} (tier={:?}) — skipping capture",
                 app, decision.tier
             );
-            budget_skipped = true;
-        } else {
-            config.max_nodes_override = Some(decision.max_nodes);
-            config.walk_timeout_override = Some(decision.timeout);
+            // Skip the entire capture. Previously this fell through to a
+            // TreeWalkResult::NotFound which triggered OCR fallback — but the
+            // fallback costs ~322ms of Vision CPU, more than the walk we just
+            // throttled to save CPU. The next trigger past the budget
+            // min_interval will produce a fresh walk with real AX text.
+            return Ok(CaptureOutput {
+                result: None,
+                image,
+                elements_deduped: false,
+            });
         }
+        config.max_nodes_override = Some(decision.max_nodes);
+        config.walk_timeout_override = Some(decision.timeout);
     }
 
-    let tree_walk_result = if budget_skipped {
-        // Budget says skip — don't walk the tree but still proceed with screenshot/OCR
-        TreeWalkResult::NotFound
-    } else {
+    let tree_walk_result =
         tokio::task::spawn_blocking(move || crate::paired_capture::walk_accessibility_tree(&config))
-            .await?
-    };
+            .await?;
 
     // If the window was skipped (incognito/private browsing or user filter),
     // bail out entirely — don't OCR the screenshot.
@@ -984,7 +1054,7 @@ async fn do_capture(
     // Use tree metadata by default, but for focus-change triggers prefer the
     // event payload when the tree lags or reports the wrong frontmost target.
     let (app_name_owned, window_name_owned, browser_url_owned) =
-        resolve_capture_metadata(tree_snapshot.as_ref(), trigger);
+        resolve_capture_metadata(tree_snapshot.as_ref(), trigger, trigger_app.as_deref());
 
     // Skip lock screen / screensaver — these waste disk and pollute timeline.
     // Also update the global SCREEN_IS_LOCKED flag so subsequent loop iterations

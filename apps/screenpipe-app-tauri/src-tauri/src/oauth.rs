@@ -43,7 +43,9 @@ async fn open_secret_store() -> Option<screenpipe_secrets::SecretStore> {
         crate::secrets::KeyResult::Found(k) => Some(k),
         _ => None,
     };
-    screenpipe_secrets::SecretStore::new(pool, secret_key).await.ok()
+    screenpipe_secrets::SecretStore::new(pool, secret_key)
+        .await
+        .ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -262,16 +264,15 @@ pub async fn oauth_list_instances(
     let mut result = Vec::new();
 
     for inst in instances {
-        let display_name =
-            oauth::load_oauth_json(store.as_ref(), &integration_id, inst.as_deref())
-                .await
-                .and_then(|v| {
-                    v["email"]
-                        .as_str()
-                        .or_else(|| v["workspace_name"].as_str())
-                        .or_else(|| v["name"].as_str())
-                        .map(String::from)
-                });
+        let display_name = oauth::load_oauth_json(store.as_ref(), &integration_id, inst.as_deref())
+            .await
+            .and_then(|v| {
+                v["email"]
+                    .as_str()
+                    .or_else(|| v["workspace_name"].as_str())
+                    .or_else(|| v["name"].as_str())
+                    .map(String::from)
+            });
 
         result.push(OAuthInstanceInfo {
             instance: inst,

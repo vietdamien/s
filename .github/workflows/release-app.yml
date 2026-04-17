@@ -981,6 +981,68 @@ jobs:
             fi
           done
 
+      - name: Staple .app and rebuild updater tarball (macOS)
+        if: matrix.os_type == 'macos'
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          TARGET="${{ matrix.target }}"
+          BUNDLE_DIR="${GITHUB_WORKSPACE}/apps/screenpipe-app-tauri/src-tauri/target/${TARGET}/release/bundle"
+          MACOS_DIR="${BUNDLE_DIR}/macos"
+
+          # Gatekeeper context:
+          # The DMG is notarized + stapled above, so fresh installs are fine.
+          # Tauri auto-updates ship the .app inside .app.tar.gz — and until now
+          # that .app was never stapled. Gatekeeper then fell back to an online
+          # notarization check on first launch, which intermittently fails and
+          # produces the "app is damaged" dialog after every update.
+          #
+          # Fix: submit the .app to notarytool directly (ticket is keyed to the
+          # code-signature hash, so this is idempotent with the DMG submission),
+          # staple the .app, then rebuild the updater tarball with the stapled
+          # bundle and re-sign it with the Tauri updater ed25519 key (the
+          # existing .sig is for the pre-staple tarball and becomes invalid).
+          shopt -s nullglob
+          apps=( "${MACOS_DIR}"/*.app )
+          if [ ${#apps[@]} -eq 0 ]; then
+            echo "no .app bundle in ${MACOS_DIR}, nothing to staple"
+            exit 0
+          fi
+
+          for app in "${apps[@]}"; do
+            [ -d "$app" ] || continue
+            APP_NAME="$(basename "$app")"
+            echo "=== Notarizing + stapling ${APP_NAME} ==="
+
+            # notarytool only accepts flat archives; zip the .app for submission.
+            APP_ZIP="${MACOS_DIR}/${APP_NAME}.notarize.zip"
+            /usr/bin/ditto -c -k --sequesterRsrc --keepParent "$app" "$APP_ZIP"
+            xcrun notarytool submit "$APP_ZIP" \
+              --apple-id "${{ secrets.APPLE_ID }}" \
+              --password "${{ secrets.APPLE_PASSWORD }}" \
+              --team-id "${{ secrets.APPLE_TEAM_ID }}" \
+              --wait --timeout 15m
+            rm -f "$APP_ZIP"
+
+            xcrun stapler staple "$app"
+            xcrun stapler validate "$app"
+            spctl --assess --type execute --verbose "$app" 2>&1 || true
+
+            # Rebuild updater tarball so Tauri updater ships the stapled .app.
+            TARBALL="${MACOS_DIR}/${APP_NAME}.tar.gz"
+            echo "Rebuilding ${APP_NAME}.tar.gz with stapled bundle"
+            ( cd "${MACOS_DIR}" && tar czf "${APP_NAME}.tar.gz" "${APP_NAME}" )
+
+            # Re-sign the tarball — old .sig is for the pre-staple bytes.
+            rm -f "${TARBALL}.sig"
+            echo "Re-signing ${APP_NAME}.tar.gz with Tauri updater key"
+            ( cd "${GITHUB_WORKSPACE}/apps/screenpipe-app-tauri" && bunx tauri signer sign "${TARBALL}" )
+
+            echo "✅ ${APP_NAME} stapled, tarball rebuilt and re-signed"
+          done
+
       - name: Upload to Cloudflare R2 (macOS)
         if: matrix.os_type == 'macos'
         shell: bash

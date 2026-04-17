@@ -51,7 +51,12 @@ impl Integration for Sentry {
         Some(&CFG)
     }
 
-    async fn test(&self, client: &reqwest::Client, creds: &Map<String, Value>, _secret_store: Option<&SecretStore>) -> Result<String> {
+    async fn test(
+        &self,
+        client: &reqwest::Client,
+        creds: &Map<String, Value>,
+        _secret_store: Option<&SecretStore>,
+    ) -> Result<String> {
         let auth_token = require_str(creds, "auth_token")?;
         let org = require_str(creds, "organization")?;
         let resp: Value = client

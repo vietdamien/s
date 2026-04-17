@@ -42,7 +42,12 @@ impl Integration for Granola {
         Some(&CFG)
     }
 
-    async fn test(&self, client: &reqwest::Client, creds: &Map<String, Value>, _secret_store: Option<&SecretStore>) -> Result<String> {
+    async fn test(
+        &self,
+        client: &reqwest::Client,
+        creds: &Map<String, Value>,
+        _secret_store: Option<&SecretStore>,
+    ) -> Result<String> {
         let api_key = require_str(creds, "api_key")?;
         let resp: Value = client
             .get("https://public-api.granola.ai/v1/notes")

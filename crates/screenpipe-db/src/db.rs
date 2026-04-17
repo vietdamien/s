@@ -43,6 +43,7 @@ const DEDUP_TIME_WINDOW_SECS: i64 = 45;
 /// Similarity threshold for cross-device deduplication (0.0 to 1.0).
 /// Higher = stricter matching, lower = more aggressive deduplication.
 const DEDUP_SIMILARITY_THRESHOLD: f64 = 0.85;
+const FRAMES_FTS_EXTERNAL_CONTENT_MIGRATION_VERSION: i64 = 20260415000000;
 
 pub struct DeleteTimeRangeResult {
     pub frames_deleted: u64,
@@ -268,6 +269,7 @@ impl DatabaseManager {
     async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         let mut migrator = sqlx::migrate!("./src/migrations");
         migrator.set_ignore_missing(true);
+        Self::log_pending_search_index_migration(pool, &migrator).await;
         match migrator.run(pool).await {
             Ok(_) => {}
             Err(e) => {
@@ -297,6 +299,63 @@ impl DatabaseManager {
         Self::ensure_event_driven_columns(pool).await?;
 
         Ok(())
+    }
+
+    async fn log_pending_search_index_migration(
+        pool: &SqlitePool,
+        migrator: &sqlx::migrate::Migrator,
+    ) {
+        if !migrator
+            .iter()
+            .any(|migration| migration.version == FRAMES_FTS_EXTERNAL_CONTENT_MIGRATION_VERSION)
+        {
+            return;
+        }
+
+        let migration_table_exists = match sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = '_sqlx_migrations'",
+        )
+        .fetch_one(pool)
+        .await
+        {
+            Ok(count) => count > 0,
+            Err(e) => {
+                debug!("could not inspect _sqlx_migrations before migrate: {}", e);
+                return;
+            }
+        };
+
+        let migration_pending = if migration_table_exists {
+            match sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM _sqlx_migrations WHERE version = ?",
+            )
+            .bind(FRAMES_FTS_EXTERNAL_CONTENT_MIGRATION_VERSION)
+            .fetch_one(pool)
+            .await
+            {
+                Ok(count) => count == 0,
+                Err(e) => {
+                    debug!("could not inspect applied migrations before migrate: {}", e);
+                    return;
+                }
+            }
+        } else {
+            match sqlx::query_scalar::<_, i64>("SELECT 1 FROM frames LIMIT 1")
+                .fetch_optional(pool)
+                .await
+            {
+                Ok(Some(_)) => true,
+                Ok(None) => false,
+                Err(e) => {
+                    debug!("could not inspect existing frames before migrate: {}", e);
+                    return;
+                }
+            }
+        };
+
+        if migration_pending {
+            info!("migrating frames_fts search index, this may take a few minutes on large databases...");
+        }
     }
 
     /// Fix checksum mismatches by updating stored checksums to match current migration files.
@@ -2788,7 +2847,7 @@ impl DatabaseManager {
         LIMIT ?10 OFFSET ?11
         "#,
             fts_join = if has_fts {
-                "JOIN frames_fts ON frames.id = frames_fts.id"
+                "JOIN frames_fts ON frames.id = frames_fts.rowid"
             } else {
                 ""
             },
@@ -3294,7 +3353,7 @@ impl DatabaseManager {
                        AND (?7 IS NULL OR frames.focused = ?7)
                        {a11y_filter}"#,
                 fts_join = if has_fts {
-                    "JOIN frames_fts ON frames.id = frames_fts.id"
+                    "JOIN frames_fts ON frames.id = frames_fts.rowid"
                 } else {
                     ""
                 },
@@ -3986,7 +4045,7 @@ impl DatabaseManager {
             LIMIT ?4 OFFSET ?5
             "#,
             fts_join = if has_fts {
-                "JOIN frames_fts ON f.id = frames_fts.id"
+                "JOIN frames_fts ON f.id = frames_fts.rowid"
             } else {
                 ""
             },
@@ -5495,7 +5554,7 @@ impl DatabaseManager {
                 crate::text_normalizer::sanitize_fts5_query(query)
             };
             conditions.push(
-                "f.id IN (SELECT id FROM frames_fts WHERE frames_fts MATCH ? ORDER BY rank LIMIT 5000)",
+                "f.id IN (SELECT rowid FROM frames_fts WHERE frames_fts MATCH ? ORDER BY rank LIMIT 5000)",
             );
             fts_match
         } else {
@@ -5847,7 +5906,7 @@ LIMIT ? OFFSET ?
                 crate::text_normalizer::sanitize_fts5_query(query)
             };
             conditions.push(
-                "f.id IN (SELECT id FROM frames_fts WHERE frames_fts MATCH ? ORDER BY rank LIMIT 5000)",
+                "f.id IN (SELECT rowid FROM frames_fts WHERE frames_fts MATCH ? ORDER BY rank LIMIT 5000)",
             );
             fts_match
         } else {

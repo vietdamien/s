@@ -101,7 +101,10 @@ pub async fn migrate_legacy_secrets(
                             report
                                 .migrated
                                 .push(format!("{} -> {}", filename, store_key));
-                            info!("migrated {} -> {} (file kept for legacy readers)", filename, store_key);
+                            info!(
+                                "migrated {} -> {} (file kept for legacy readers)",
+                                filename, store_key
+                            );
                         }
                     }
                     Err(e) => {
@@ -126,8 +129,7 @@ pub async fn migrate_legacy_secrets(
                             for (name, value) in obj {
                                 // Migrate the full connection entry under cred:{name}
                                 let cred_key = format!("cred:{}", name);
-                                let value_bytes =
-                                    serde_json::to_vec(value).unwrap_or_default();
+                                let value_bytes = serde_json::to_vec(value).unwrap_or_default();
 
                                 let should_import = match store.get(&cred_key).await {
                                     Ok(Some(_)) => {
@@ -161,22 +163,16 @@ pub async fn migrate_legacy_secrets(
                                 };
 
                                 if should_import && !value_bytes.is_empty() {
-                                    if let Err(e) =
-                                        store.set(&cred_key, &value_bytes).await
-                                    {
-                                        report.errors.push(format!(
-                                            "connections.json/{}: {}",
-                                            name, e
-                                        ));
+                                    if let Err(e) = store.set(&cred_key, &value_bytes).await {
+                                        report
+                                            .errors
+                                            .push(format!("connections.json/{}: {}", name, e));
                                     } else {
                                         report.migrated.push(format!(
                                             "connections.json/{} -> {}",
                                             name, cred_key
                                         ));
-                                        info!(
-                                            "migrated connections.json/{} -> {}",
-                                            name, cred_key
-                                        );
+                                        info!("migrated connections.json/{} -> {}", name, cred_key);
                                     }
                                 }
                             }
@@ -355,8 +351,7 @@ mod tests {
 
         // Verify the values were stored
         let slack_val = store.get("cred:slack").await.unwrap().unwrap();
-        let slack_json: serde_json::Value =
-            serde_json::from_slice(&slack_val).unwrap();
+        let slack_json: serde_json::Value = serde_json::from_slice(&slack_val).unwrap();
         assert_eq!(slack_json["credentials"]["token"], "xoxb-123");
     }
 

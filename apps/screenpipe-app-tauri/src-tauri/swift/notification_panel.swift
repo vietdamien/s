@@ -10,7 +10,13 @@ import SwiftUI
 
 struct NotificationAction: Codable {
     let label: String
-    let action: String
+    // `action` was a required legacy field; many current callers send `id` + `type`
+    // instead and omit it entirely, which was failing JSON decode and forcing
+    // every notification with actions to fall back to the webview panel.
+    // The field is never read by the Swift side — only `id`, `type`, `primary`,
+    // `url`, `label` are — so making it optional restores native rendering
+    // without breaking the legacy callers that still send it.
+    var action: String?
     var primary: Bool?
     var id: String?
     var type: String?

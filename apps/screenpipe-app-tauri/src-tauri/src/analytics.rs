@@ -41,6 +41,7 @@ pub struct AnalyticsManager {
     enabled: Arc<Mutex<bool>>,
     api_host: String,
     local_api_base_url: String,
+    local_api_key: Option<String>,
     screenpipe_dir_path: PathBuf,
     attribution: Mutex<Option<Attribution>>,
 }
@@ -52,6 +53,7 @@ impl AnalyticsManager {
         email: String,
         interval_hours: u64,
         local_api_base_url: String,
+        local_api_key: Option<String>,
         screenpipe_dir_path: PathBuf,
         analytics_enabled: bool,
     ) -> Self {
@@ -64,6 +66,7 @@ impl AnalyticsManager {
             enabled: Arc::new(Mutex::new(analytics_enabled)),
             api_host: "https://us.i.posthog.com".to_string(),
             local_api_base_url,
+            local_api_key,
             screenpipe_dir_path,
             attribution: Mutex::new(None),
         }
@@ -367,12 +370,11 @@ impl AnalyticsManager {
         &self,
     ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
         let health_url = format!("{}/health", self.local_api_base_url);
-        let response = self
-            .client
-            .get(&health_url)
-            .timeout(Duration::from_secs(5))
-            .send()
-            .await?;
+        let mut request = self.client.get(&health_url).timeout(Duration::from_secs(5));
+        if let Some(ref key) = self.local_api_key {
+            request = request.header("Authorization", format!("Bearer {}", key));
+        }
+        let response = request.send().await?;
 
         if !response.status().is_success() {
             return Ok(json!({
@@ -450,6 +452,7 @@ pub fn start_analytics(
     posthog_api_key: String,
     interval_hours: u64,
     local_api_base_url: String,
+    local_api_key: Option<String>,
     screenpipe_dir_path: PathBuf,
     analytics_enabled: bool,
 ) -> Result<Arc<AnalyticsManager>, Box<dyn std::error::Error>> {
@@ -464,6 +467,7 @@ pub fn start_analytics(
         email,
         interval_hours,
         local_api_base_url,
+        local_api_key,
         screenpipe_dir_path,
         should_enable_analytics,
     ));
@@ -479,7 +483,9 @@ pub fn start_analytics(
             // Link email identity (used by website) to analytics UUID (used by app)
             // so PostHog can merge the person and build a real download→open funnel
             if !analytics_manager.email.is_empty() {
-                analytics_manager.send_alias(&analytics_manager.email.clone()).await;
+                analytics_manager
+                    .send_alias(&analytics_manager.email.clone())
+                    .await;
             }
 
             // Include feature config in app_started event

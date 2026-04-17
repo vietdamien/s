@@ -31,7 +31,12 @@ impl Integration for Logseq {
         &DEF
     }
 
-    async fn test(&self, _client: &reqwest::Client, creds: &Map<String, Value>, _secret_store: Option<&SecretStore>) -> Result<String> {
+    async fn test(
+        &self,
+        _client: &reqwest::Client,
+        creds: &Map<String, Value>,
+        _secret_store: Option<&SecretStore>,
+    ) -> Result<String> {
         let graph_path = require_str(creds, "graph_path")?;
         let p = std::path::Path::new(graph_path);
         if !p.exists() {

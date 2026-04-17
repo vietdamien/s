@@ -11,6 +11,10 @@ import {
   DEFAULT_PROMPT,
   useSettings,
 } from "@/lib/hooks/use-settings";
+import {
+  buildChatTestBody,
+  shouldRetryWithMaxCompletionTokens,
+} from "@/lib/utils/chat-test-body";
 import { Label } from "../ui/label";
 import { Input } from "../ui/input";
 import { ValidatedInput } from "../ui/validated-input";
@@ -711,11 +715,14 @@ const AISection = ({
       chatUrl = `${settingsPreset?.url}/chat/completions`;
     }
 
-    const chatBody = isChatGpt
+    // For OpenAI-compatible endpoints, start with `max_tokens` (broadest
+    // compatibility) but retry with `max_completion_tokens` if the endpoint
+    // rejects it (GPT-5, o-series, Azure Foundry, etc.).
+    const chatBody: any = isChatGpt
       ? { model: settingsPreset?.model || "", instructions: "reply briefly", input: [{ role: "user", content: "say hi" }], store: false, stream: true }
       : isAnthropic
       ? { model: settingsPreset?.model || "", messages: [{ role: "user", content: "say hi" }], max_tokens: 50 }
-      : { model: settingsPreset?.model || "", messages: [{ role: "user", content: "say hi" }], max_tokens: 50 };
+      : buildChatTestBody(settingsPreset?.model || "", "say hi", 50, "max_tokens");
 
     // For ChatGPT Codex endpoint, extract account ID from JWT and add required headers
     const chatHeaders: Record<string, string> = {
@@ -739,12 +746,33 @@ const AISection = ({
 
     const chatStart = performance.now();
     try {
-      const chatResponse = await fetchFn(chatUrl, {
+      let chatResponse = await fetchFn(chatUrl, {
         method: "POST",
         headers: chatHeaders,
         body: JSON.stringify(chatBody),
         signal: abort.signal,
       });
+
+      // Retry with max_completion_tokens for newer OpenAI-compatible endpoints
+      // (GPT-5, o-series, Azure Foundry) that reject max_tokens. Only for the
+      // generic OpenAI-compatible path — Anthropic/ChatGPT use different params.
+      if (!chatResponse.ok && !isChatGpt && !isAnthropic) {
+        const errText = await chatResponse.clone().text().catch(() => "");
+        if (shouldRetryWithMaxCompletionTokens(errText)) {
+          const retryBody = buildChatTestBody(
+            settingsPreset?.model || "",
+            "say hi",
+            50,
+            "max_completion_tokens",
+          );
+          chatResponse = await fetchFn(chatUrl, {
+            method: "POST",
+            headers: chatHeaders,
+            body: JSON.stringify(retryBody),
+            signal: abort.signal,
+          });
+        }
+      }
 
       const latencyMs = Math.round(performance.now() - chatStart);
 

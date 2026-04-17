@@ -510,8 +510,11 @@ pub async fn render_context(
     let integrations = all_integrations();
 
     // Credential-based integrations
-    let mut cred_connected: Vec<(&dyn Integration, &'static IntegrationDef, Map<String, Value>)> =
-        Vec::new();
+    let mut cred_connected: Vec<(
+        &dyn Integration,
+        &'static IntegrationDef,
+        Map<String, Value>,
+    )> = Vec::new();
     for i in integrations.iter().filter(|i| i.oauth_config().is_none()) {
         let def = i.def();
         if let Some(conn) = load_connection(secret_store, screenpipe_dir, def.id).await {

@@ -204,6 +204,7 @@ impl AudioManager {
             let options_ref = self.options.clone();
             let seg_mgr = self.segmentation_manager.clone();
             let output_path_bg = self.options.read().await.output_path.clone();
+            let metrics_bg = self.metrics.clone();
             let handle = tokio::spawn(async move {
                 // Wait for model to load + initial recordings
                 tokio::time::sleep(Duration::from_secs(120)).await;
@@ -224,6 +225,7 @@ impl AudioManager {
                             Some(seg_mgr.clone()),
                             data_dir,
                             batch_max_dur,
+                            Some(metrics_bg.clone()),
                         )
                         .await;
                         if count > 0 {
@@ -733,6 +735,7 @@ impl AudioManager {
                                 Some(segmentation_manager.clone()),
                                 data_dir,
                                 batch_max_duration_secs,
+                                Some(metrics.clone()),
                             )
                             .await;
                             for _ in 0..count {

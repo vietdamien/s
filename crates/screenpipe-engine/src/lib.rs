@@ -20,6 +20,7 @@ pub mod meeting_detector;
 pub mod meeting_persister;
 pub mod meeting_watcher;
 pub mod paired_capture;
+pub mod permission_monitor;
 pub mod pipe_permissions_middleware;
 pub mod pipe_store;
 pub mod pipes_api;

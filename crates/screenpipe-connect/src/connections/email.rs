@@ -68,7 +68,12 @@ impl Integration for Email {
         &DEF
     }
 
-    async fn test(&self, _client: &reqwest::Client, creds: &Map<String, Value>, _secret_store: Option<&SecretStore>) -> Result<String> {
+    async fn test(
+        &self,
+        _client: &reqwest::Client,
+        creds: &Map<String, Value>,
+        _secret_store: Option<&SecretStore>,
+    ) -> Result<String> {
         use lettre::transport::smtp::authentication::Credentials;
         use lettre::{message::header::ContentType, Message, SmtpTransport, Transport};
 

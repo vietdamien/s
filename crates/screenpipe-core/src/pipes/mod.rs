@@ -757,8 +757,7 @@ fn read_chatgpt_token_from_secrets() -> Option<String> {
                 .await
                 .ok()?;
             let bytes = store.get("oauth:chatgpt").await.ok()??;
-            let mut token_data: serde_json::Value =
-                serde_json::from_slice(&bytes).ok()?;
+            let mut token_data: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
 
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -833,13 +832,10 @@ fn refresh_chatgpt_token(token_data: &mut serde_json::Value, now: u64) {
                         .get("refresh_token")
                         .and_then(|t| t.as_str())
                         .unwrap_or(refresh_token.as_str());
-                    let new_expires_in = v
-                        .get("expires_in")
-                        .and_then(|t| t.as_u64())
-                        .unwrap_or(3600);
+                    let new_expires_in =
+                        v.get("expires_in").and_then(|t| t.as_u64()).unwrap_or(3600);
 
-                    token_data["access_token"] =
-                        serde_json::Value::String(new_token.to_string());
+                    token_data["access_token"] = serde_json::Value::String(new_token.to_string());
                     token_data["refresh_token"] =
                         serde_json::Value::String(new_refresh.to_string());
                     token_data["expires_at"] = serde_json::json!(now + new_expires_in);
@@ -1851,7 +1847,9 @@ impl PipeManager {
                 run_provider.as_deref(),
                 Some(&run_model),
                 run_provider_url.as_deref(),
-            ) {
+            )
+            .await
+            {
                 warn!("failed to pre-configure pi provider: {}", e);
             }
 
@@ -2325,7 +2323,9 @@ impl PipeManager {
                     run_provider.as_deref(),
                     Some(&run_model),
                     run_provider_url.as_deref(),
-                ) {
+                )
+                .await
+                {
                     warn!("failed to pre-configure pi provider: {}", e);
                 }
 
@@ -3302,7 +3302,9 @@ impl PipeManager {
                             provider.as_deref(),
                             Some(&model),
                             provider_url.as_deref(),
-                        ) {
+                        )
+                        .await
+                        {
                             warn!("scheduler: failed to pre-configure pi provider: {}", e);
                         }
 

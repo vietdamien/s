@@ -202,10 +202,68 @@ jobs:
 
     - name: Normalize OpenBLAS paths for antirez-asr-sys
       run: |
+        set -euo pipefail
         sudo mkdir -p /usr/lib/x86_64-linux-gnu/openblas/lib
         sudo mkdir -p /usr/lib/x86_64-linux-gnu/openblas/include
-        sudo ln -sf /usr/lib/x86_64-linux-gnu/libopenblas.so /usr/lib/x86_64-linux-gnu/openblas/lib/liblibopenblas.so
-        sudo ln -sf /usr/lib/x86_64-linux-gnu/libopenblas.a /usr/lib/x86_64-linux-gnu/openblas/lib/liblibopenblas.a
+
+        # The apt cache action sometimes restores files onto disk without
+        # updating the dpkg database, so `dpkg -L libopenblas-dev` can come
+        # back empty. And the libopenblas layout differs across Ubuntu
+        # releases — 24.04 (noble) moved the real .so under /usr/lib/.../openblas-pthread/
+        # with update-alternatives managing the visible path. Find it by
+        # pattern across both layouts, and force a fresh install if nothing
+        # is on disk at all.
+        find_openblas_so() {
+          find /usr/lib /usr/local/lib /lib 2>/dev/null \
+            \( -name 'libopenblas.so' -o -name 'libopenblas.so.*' \) \
+            -print 2>/dev/null | head -1
+        }
+
+        REAL_SO="$(find_openblas_so)"
+        if [ -z "$REAL_SO" ]; then
+          echo "libopenblas not found on disk — forcing fresh install"
+          sudo apt-get update -qq
+          sudo apt-get install -y --reinstall libopenblas-dev
+          REAL_SO="$(find_openblas_so)"
+        fi
+        if [ -z "$REAL_SO" ]; then
+          echo "::error::libopenblas still not found after --reinstall"
+          dpkg -L libopenblas-dev 2>/dev/null | head -20 || true
+          find /usr/lib /usr/local/lib /lib -name 'libopenblas*' 2>/dev/null | head -20 || true
+          exit 1
+        fi
+        echo "libopenblas.so -> $REAL_SO"
+
+        REAL_A="$(find /usr/lib /usr/local/lib /lib -name 'libopenblas.a' 2>/dev/null | head -1 || true)"
+        [ -n "$REAL_A" ] && echo "libopenblas.a  -> $REAL_A"
+
+        sudo ln -sf "$REAL_SO" /usr/lib/x86_64-linux-gnu/openblas/lib/liblibopenblas.so
+        [ -n "$REAL_A" ] && sudo ln -sf "$REAL_A" /usr/lib/x86_64-linux-gnu/openblas/lib/liblibopenblas.a
+
+        # antirez-asr-sys emits `-l libopenblas` (double-lib) to match the Windows
+        # naming, but its build.rs doesn't add OPENBLAS_PATH/lib to the linker
+        # search path. Drop the symlink into /usr/lib/x86_64-linux-gnu/ — a
+        # standard search path — so mold resolves -llibopenblas.
+        sudo ln -sf "$REAL_SO" /usr/lib/x86_64-linux-gnu/liblibopenblas.so
+        [ -n "$REAL_A" ] && sudo ln -sf "$REAL_A" /usr/lib/x86_64-linux-gnu/liblibopenblas.a
+
+        # Runtime loader (ld.so) looks up the SONAME (`libopenblas.so.0`) in the
+        # default search path. The apt cache action restores the .so into the
+        # openblas-pthread/ subdir but may not install the ld.so.conf.d fragment
+        # or run ldconfig, so the binary exits 127 at startup with
+        # "error while loading shared libraries: libopenblas.so.0". Symlink the
+        # SONAME and the unsuffixed name into the default path.
+        SONAME="$(basename "$REAL_SO")"  # e.g. libopenblas.so.0
+        sudo ln -sf "$REAL_SO" "/usr/lib/x86_64-linux-gnu/${SONAME}"
+        sudo ln -sf "$REAL_SO" /usr/lib/x86_64-linux-gnu/libopenblas.so
+        sudo ldconfig
+
+        # Sanity check: the symlinks must be non-dangling (-e follows links).
+        test -e /usr/lib/x86_64-linux-gnu/liblibopenblas.so
+        test -e /usr/lib/x86_64-linux-gnu/openblas/lib/liblibopenblas.so
+        test -e "/usr/lib/x86_64-linux-gnu/${SONAME}"
+        ldconfig -p | grep libopenblas || true
+        ls -la /usr/lib/x86_64-linux-gnu/liblibopenblas.* /usr/lib/x86_64-linux-gnu/libopenblas.* /usr/lib/x86_64-linux-gnu/openblas/lib/liblibopenblas.*
         CBLAS_HEADER="$(find /usr/include /usr/lib -name cblas.h 2>/dev/null | head -n1 || true)"
         if [ -z "$CBLAS_HEADER" ]; then
           CBLAS_HEADER="$(dpkg -L libopenblas-dev | grep -m1 '/cblas\.h$' || true)"

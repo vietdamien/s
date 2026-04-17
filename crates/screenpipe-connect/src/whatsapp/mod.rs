@@ -16,7 +16,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 const GATEWAY_JS: &str = include_str!("gateway.mjs");
 
@@ -189,7 +189,15 @@ impl WhatsAppGateway {
             let reader = BufReader::new(stdout);
             let mut lines = reader.lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                match serde_json::from_str::<GatewayEvent>(&line) {
+                // Skip non-JSON lines silently (Bun console.log debug output,
+                // multi-line pretty-printed objects, etc.) — only try to parse
+                // lines that look like JSON events.
+                let trimmed = line.trim_start();
+                if !trimmed.starts_with('{') {
+                    debug!("whatsapp gateway stdout: {}", line);
+                    continue;
+                }
+                match serde_json::from_str::<GatewayEvent>(trimmed) {
                     Ok(GatewayEvent::Qr { data }) => {
                         info!("whatsapp: qr code received");
                         *status.lock().await = WhatsAppStatus::QrReady { qr: data };
@@ -218,7 +226,7 @@ impl WhatsAppGateway {
                         // send results are logged but not tracked in status
                     }
                     Err(e) => {
-                        warn!("whatsapp gateway unparseable line: {} ({})", line, e);
+                        debug!("whatsapp gateway unparseable line: {} ({})", line, e);
                     }
                 }
             }
@@ -243,7 +251,15 @@ impl WhatsAppGateway {
             let reader = BufReader::new(stderr);
             let mut lines = reader.lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                warn!("whatsapp gateway stderr: {}", line);
+                // Only WARN for actual errors. Bun prints noisy warnings
+                // (e.g. "ws.WebSocket 'upgrade' event is not implemented")
+                // and info messages to stderr that aren't actionable.
+                let lower = line.to_lowercase();
+                if lower.contains("error") || lower.contains("fatal") || lower.contains("panic") {
+                    warn!("whatsapp gateway stderr: {}", line);
+                } else {
+                    debug!("whatsapp gateway stderr: {}", line);
+                }
             }
         });
 
@@ -375,7 +391,13 @@ impl WhatsAppGateway {
                             let reader = BufReader::new(stdout);
                             let mut lines = reader.lines();
                             while let Ok(Some(line)) = lines.next_line().await {
-                                match serde_json::from_str::<GatewayEvent>(&line) {
+                                // Skip non-JSON lines silently (see comment above).
+                                let trimmed = line.trim_start();
+                                if !trimmed.starts_with('{') {
+                                    debug!("whatsapp gateway stdout: {}", line);
+                                    continue;
+                                }
+                                match serde_json::from_str::<GatewayEvent>(trimmed) {
                                     Ok(GatewayEvent::Qr { data }) => {
                                         info!("whatsapp: qr code received");
                                         *s.lock().await = WhatsAppStatus::QrReady { qr: data };
@@ -401,7 +423,7 @@ impl WhatsAppGateway {
                                     }
                                     Ok(GatewayEvent::SendResult { .. }) => {}
                                     Err(e) => {
-                                        warn!(
+                                        debug!(
                                             "whatsapp gateway unparseable line: {} ({})",
                                             line, e
                                         );
@@ -425,7 +447,18 @@ impl WhatsAppGateway {
                             let reader = BufReader::new(stderr);
                             let mut lines = reader.lines();
                             while let Ok(Some(line)) = lines.next_line().await {
-                                warn!("whatsapp gateway stderr: {}", line);
+                                // Only WARN for actual errors. Bun prints noisy warnings
+                                // (e.g. "ws.WebSocket 'upgrade' event is not implemented")
+                                // and info messages to stderr that aren't actionable.
+                                let lower = line.to_lowercase();
+                                if lower.contains("error")
+                                    || lower.contains("fatal")
+                                    || lower.contains("panic")
+                                {
+                                    warn!("whatsapp gateway stderr: {}", line);
+                                } else {
+                                    debug!("whatsapp gateway stderr: {}", line);
+                                }
                             }
                         });
 

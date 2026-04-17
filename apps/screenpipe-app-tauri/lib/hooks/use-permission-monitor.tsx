@@ -40,23 +40,8 @@ export function usePermissionMonitor() {
 
       console.log("Permission lost event received:", { screen_recording, microphone, accessibility, browser_automation });
 
-      // Double-check CRITICAL permissions before showing modal
-      // Browser automation is intentionally excluded — it's optional (#2510)
-      try {
-        const currentPerms = await commands.doPermissionsCheck(false);
-        const screenOk = currentPerms.screenRecording === "granted" || currentPerms.screenRecording === "notNeeded";
-        const micOk = currentPerms.microphone === "granted" || currentPerms.microphone === "notNeeded";
-        const accessibilityOk = currentPerms.accessibility === "granted" || currentPerms.accessibility === "notNeeded";
-
-        if (screenOk && micOk && accessibilityOk) {
-          console.log("Critical permissions OK on frontend verification, skipping modal");
-          return;
-        }
-
-        console.log("Permission loss confirmed:", { screenOk, micOk, accessibilityOk });
-      } catch (error) {
-        console.error("Failed to verify permissions:", error);
-      }
+      // Browser automation is optional — never trigger the modal for it (#2510)
+      if (!screen_recording && !microphone && !accessibility) return;
 
       hasShownRef.current = true;
 

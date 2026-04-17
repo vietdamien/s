@@ -22,12 +22,8 @@ use screenpipe_audio::transcription::stt::{
 };
 use screenpipe_db::DatabaseManager;
 use screenpipe_engine::{
-    analytics,
-    hot_frame_cache::HotFrameCache,
-    power::PowerManagerHandle,
-    server::bind_listener,
-    start_power_manager_with_pref, start_sleep_monitor,
-    RecordingConfig, ResourceMonitor, SCServer,
+    analytics, hot_frame_cache::HotFrameCache, power::PowerManagerHandle, server::bind_listener,
+    start_power_manager_with_pref, start_sleep_monitor, RecordingConfig, ResourceMonitor, SCServer,
 };
 use tracing::{error, info, warn};
 
@@ -281,8 +277,7 @@ impl ServerCore {
         std::fs::create_dir_all(&pipes_dir).ok();
 
         let user_token = config.user_id.clone();
-        let pi_executor =
-            Arc::new(screenpipe_core::agents::pi::PiExecutor::new(user_token));
+        let pi_executor = Arc::new(screenpipe_core::agents::pi::PiExecutor::new(user_token));
         let mut agent_executors: std::collections::HashMap<
             String,
             Arc<dyn screenpipe_core::agents::AgentExecutor>,

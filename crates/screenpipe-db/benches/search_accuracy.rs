@@ -81,7 +81,7 @@ async fn get_test_words(pool: &sqlx::SqlitePool) -> Vec<String> {
 
 async fn fts_search(pool: &sqlx::SqlitePool, query: &str) -> HashSet<i64> {
     let escaped = format!("\"{}\"", query.replace('"', "\"\""));
-    let rows = sqlx::query("SELECT id FROM frames_fts WHERE frames_fts MATCH ?")
+    let rows = sqlx::query("SELECT rowid AS id FROM frames_fts WHERE frames_fts MATCH ?")
         .bind(&escaped)
         .fetch_all(pool)
         .await
@@ -92,7 +92,7 @@ async fn fts_search(pool: &sqlx::SqlitePool, query: &str) -> HashSet<i64> {
 
 async fn fts_prefix_search(pool: &sqlx::SqlitePool, query: &str) -> HashSet<i64> {
     let prefix_query = format!("{}*", query);
-    let rows = sqlx::query("SELECT id FROM frames_fts WHERE frames_fts MATCH ?")
+    let rows = sqlx::query("SELECT rowid AS id FROM frames_fts WHERE frames_fts MATCH ?")
         .bind(&prefix_query)
         .fetch_all(pool)
         .await

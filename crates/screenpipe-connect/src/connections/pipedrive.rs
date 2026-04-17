@@ -51,7 +51,12 @@ impl Integration for Pipedrive {
         Some(&CFG)
     }
 
-    async fn test(&self, client: &reqwest::Client, creds: &Map<String, Value>, _secret_store: Option<&SecretStore>) -> Result<String> {
+    async fn test(
+        &self,
+        client: &reqwest::Client,
+        creds: &Map<String, Value>,
+        _secret_store: Option<&SecretStore>,
+    ) -> Result<String> {
         let api_token = require_str(creds, "api_token")?;
         let domain = require_str(creds, "domain")?;
         let resp: Value = client

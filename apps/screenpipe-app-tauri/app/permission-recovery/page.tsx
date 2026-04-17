@@ -5,7 +5,7 @@
 "use client";
 
 import React, { useState, useEffect, useCallback, useRef } from "react";
-import { Monitor, Mic, Keyboard, Check, RefreshCw } from "lucide-react";
+import { Monitor, Mic, Keyboard, Lock, Check, RefreshCw } from "lucide-react";
 import { commands } from "@/lib/utils/tauri";
 import { usePlatform } from "@/lib/hooks/use-platform";
 import posthog from "posthog-js";
@@ -72,6 +72,9 @@ function PermissionRow({
 
 export default function PermissionRecoveryPage() {
   const [permissions, setPermissions] = useState<Record<string, string> | null>(null);
+  // Keychain: "granted" if enabled or unavailable (no keychain on this OS),
+  // "denied" only if the user previously opted in but access is now refused.
+  const [keychainStatus, setKeychainStatus] = useState<"granted" | "denied" | "checking">("checking");
   const { isMac: isMacOS } = usePlatform();
   const restartTriggeredRef = useRef(false);
 
@@ -86,14 +89,35 @@ export default function PermissionRecoveryPage() {
     }
   }, []);
 
+  const checkKeychain = useCallback(async () => {
+    try {
+      const res = await commands.getKeychainStatus();
+      if (res.status === "ok") {
+        // "enabled" = user opted in and key accessible
+        // "unavailable" = OS keychain missing (Linux without libsecret, etc.) — treat as ok
+        // "disabled" = user never opted in OR access denied — only treat as denied on mac
+        //   where access-denied is actionable via re-enable.
+        if (res.data.state === "enabled" || res.data.state === "unavailable") {
+          setKeychainStatus("granted");
+        } else {
+          setKeychainStatus("denied");
+        }
+      }
+    } catch {
+      // keep previous status on error
+    }
+  }, []);
+
   useEffect(() => {
     checkPermissions();
+    if (isMacOS) checkKeychain();
     const interval = setInterval(() => {
       if (restartTriggeredRef.current) return;
       checkPermissions();
+      if (isMacOS) checkKeychain();
     }, 3000);
     return () => clearInterval(interval);
-  }, [checkPermissions]);
+  }, [checkPermissions, checkKeychain, isMacOS]);
 
   // Auto-close and restart when critical permissions are restored
   useEffect(() => {
@@ -120,6 +144,12 @@ export default function PermissionRecoveryPage() {
     posthog.capture("permission_recovery_manual_fix", { permission });
     try { await commands.requestPermission(permission); } catch {}
     await checkPermissions();
+  };
+
+  const handleFixKeychain = async () => {
+    posthog.capture("permission_recovery_manual_fix", { permission: "keychain" });
+    try { await commands.enableKeychainEncryption(); } catch {}
+    await checkKeychain();
   };
 
   const screenStatus = permissions?.screenRecording === "granted" || permissions?.screenRecording === "notNeeded"
@@ -172,6 +202,15 @@ export default function PermissionRecoveryPage() {
                   description="read text from apps"
                   status={accessibilityStatus}
                   onFix={() => handleFix("accessibility")}
+                />
+              )}
+              {isMacOS && keychainStatus === "denied" && (
+                <PermissionRow
+                  icon={<Lock className="w-4 h-4" strokeWidth={1.5} />}
+                  label="secure storage"
+                  description="encrypt api keys & credentials"
+                  status={keychainStatus}
+                  onFix={handleFixKeychain}
                 />
               )}
             </div>

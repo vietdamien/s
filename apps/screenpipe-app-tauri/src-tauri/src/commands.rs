@@ -95,23 +95,30 @@ extern "C" fn native_shortcut_action_callback(action_ptr: *const std::os::raw::c
                 "toggle_meeting" => {
                     // Directly call the meetings API instead of relying on JS
                     // (the Main window may not be loaded when using the Swift overlay)
-                    let status: Option<bool> =
-                        reqwest::blocking::get("http://localhost:3030/meetings/status")
-                            .ok()
-                            .and_then(|r| r.json::<serde_json::Value>().ok())
-                            .and_then(|v| v["active"].as_bool());
+                    use crate::recording::local_api_context_from_app;
+                    let api = local_api_context_from_app(&app_clone);
+                    let client = reqwest::blocking::Client::new();
+                    let status_req =
+                        api.apply_auth_blocking(client.get(api.url("/meetings/status")));
+                    let status: Option<bool> = status_req
+                        .send()
+                        .ok()
+                        .and_then(|r| r.json::<serde_json::Value>().ok())
+                        .and_then(|v| v["active"].as_bool());
                     match status {
                         Some(true) => {
-                            let _ = reqwest::blocking::Client::new()
-                                .post("http://localhost:3030/meetings/stop")
-                                .send();
+                            let req =
+                                api.apply_auth_blocking(client.post(api.url("/meetings/stop")));
+                            let _ = req.send();
                         }
                         Some(false) => {
-                            let _ = reqwest::blocking::Client::new()
-                                .post("http://localhost:3030/meetings/start")
-                                .header("Content-Type", "application/json")
-                                .body(r#"{"app":"manual"}"#)
-                                .send();
+                            let req = api.apply_auth_blocking(
+                                client
+                                    .post(api.url("/meetings/start"))
+                                    .header("Content-Type", "application/json")
+                                    .body(r#"{"app":"manual"}"#),
+                            );
+                            let _ = req.send();
                         }
                         None => {
                             warn!("failed to check meeting status");
@@ -141,9 +148,7 @@ pub fn is_enterprise_build_cmd(app_handle: tauri::AppHandle) -> bool {
 /// needs the main thread, causing a 5-second blank screen.
 #[tauri::command]
 #[specta::specta]
-pub async fn get_local_api_config(
-    app_handle: tauri::AppHandle,
-) -> serde_json::Value {
+pub async fn get_local_api_config(app_handle: tauri::AppHandle) -> serde_json::Value {
     use crate::recording::RecordingState;
     if let Some(state) = app_handle.try_state::<RecordingState>() {
         // Must await the lock: `try_lock` often failed while server_core held the mutex
@@ -1192,24 +1197,22 @@ pub async fn show_shortcut_reminder(
             if let Some(state) = app_handle.try_state::<RecordingState>() {
                 let guard = state.server.lock().await;
                 if let Some(ref core) = *guard {
+                    let mut metrics_ws_url = format!("ws://127.0.0.1:{}/ws/metrics", core.port);
+                    let mut meetings_status_url =
+                        format!("http://127.0.0.1:{}/meetings/status", core.port);
                     if let Some(ref key) = core.local_api_key {
                         let enc = urlencoding::encode(key);
-                        let p = core.port;
-                        map.insert(
-                            "metrics_ws_url".to_string(),
-                            serde_json::json!(format!(
-                                "ws://127.0.0.1:{}/ws/metrics?token={}",
-                                p, enc
-                            )),
-                        );
-                        map.insert(
-                            "meetings_status_url".to_string(),
-                            serde_json::json!(format!(
-                                "http://127.0.0.1:{}/meetings/status?token={}",
-                                p, enc
-                            )),
-                        );
+                        metrics_ws_url = format!("{}?token={}", metrics_ws_url, enc);
+                        meetings_status_url = format!("{}?token={}", meetings_status_url, enc);
                     }
+                    map.insert(
+                        "metrics_ws_url".to_string(),
+                        serde_json::json!(metrics_ws_url),
+                    );
+                    map.insert(
+                        "meetings_status_url".to_string(),
+                        serde_json::json!(meetings_status_url),
+                    );
                 }
             }
             let native_payload = serde_json::Value::Object(map).to_string();
@@ -1900,9 +1903,14 @@ pub async fn perform_ocr_on_image(
 /// Fetches the frame from the local server and uses arboard for clipboard access.
 #[tauri::command]
 #[specta::specta]
-pub async fn copy_frame_to_clipboard(frame_id: i64) -> Result<(), String> {
-    let url = format!("http://127.0.0.1:3030/frames/{}", frame_id);
-    let bytes = reqwest::get(&url)
+pub async fn copy_frame_to_clipboard(app: tauri::AppHandle, frame_id: i64) -> Result<(), String> {
+    use crate::recording::local_api_context_from_app;
+
+    let api = local_api_context_from_app(&app);
+    let client = reqwest::Client::new();
+    let bytes = api
+        .apply_auth(client.get(api.url(&format!("/frames/{}", frame_id))))
+        .send()
         .await
         .map_err(|e| format!("failed to fetch frame: {}", e))?
         .bytes()

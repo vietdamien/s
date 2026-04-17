@@ -478,7 +478,7 @@ mod tests {
         println!("Raw frames in DB: {:?}", raw_frames);
         // Check if frames are properly indexed in FTS (ocr_text_fts was dropped)
         let ocr_fts_data: Vec<(i64, String)> =
-            sqlx::query_as("SELECT id, full_text FROM frames_fts")
+            sqlx::query_as("SELECT rowid, full_text FROM frames_fts")
                 .fetch_all(&db.pool)
                 .await
                 .unwrap();
@@ -486,7 +486,7 @@ mod tests {
 
         // check if frames_fts is properly indexed
         let frame_fts_data: Vec<(i64, String, String, String)> =
-            sqlx::query_as("SELECT id, browser_url, app_name, window_name FROM frames_fts")
+            sqlx::query_as("SELECT rowid, browser_url, app_name, window_name FROM frames_fts")
                 .fetch_all(&db.pool)
                 .await
                 .unwrap();

@@ -22,6 +22,7 @@ const BACKFILL_MIN_INTERVAL: Duration = Duration::from_secs(30);
 const BACKFILL_MAX_CHUNKS_PER_PASS: usize = 12;
 
 use crate::core::engine::AudioTranscriptionEngine;
+use crate::metrics::AudioPipelineMetrics;
 use crate::segmentation::segmentation_manager::SegmentationManager;
 use crate::speaker::segment::get_segments;
 use crate::transcription::engine::{TranscriptionEngine, TranscriptionSession};
@@ -86,6 +87,7 @@ pub async fn reconcile_untranscribed(
     segmentation_manager: Option<Arc<SegmentationManager>>,
     data_dir: Option<&Path>,
     batch_max_duration_secs: Option<u64>,
+    metrics: Option<Arc<AudioPipelineMetrics>>,
 ) -> usize {
     // Nothing to reconcile when transcription is disabled — skip entirely
     // to avoid the silent-audio deletion path nuking audio files.
@@ -112,7 +114,7 @@ pub async fn reconcile_untranscribed(
 
     // Retry any previously failed transcriptions before processing new chunks
     if let Some(dir) = data_dir {
-        retry_pending_transcriptions(db, dir, on_insert).await;
+        retry_pending_transcriptions(db, dir, on_insert, metrics.as_ref()).await;
     }
 
     let since = chrono::Utc::now() - chrono::Duration::hours(24);
@@ -383,7 +385,16 @@ pub async fn reconcile_untranscribed(
             .iter()
             .map(|c| c.file_path.clone())
             .collect();
-        match finalize_batch(db, &pending, on_insert, data_dir, &secondary_paths).await {
+        match finalize_batch(
+            db,
+            &pending,
+            on_insert,
+            data_dir,
+            &secondary_paths,
+            metrics.as_ref(),
+        )
+        .await
+        {
             Ok(count) => {
                 consecutive_db_errors = 0;
                 success_count += count;
@@ -453,6 +464,7 @@ async fn finalize_batch(
     on_insert: Option<&AudioInsertCallback>,
     data_dir: Option<&Path>,
     secondary_file_paths: &[String],
+    metrics: Option<&Arc<AudioPipelineMetrics>>,
 ) -> Result<usize, String> {
     db.replace_audio_transcription(
         pending.audio_chunk_id,
@@ -466,6 +478,15 @@ async fn finalize_batch(
     )
     .await
     .map_err(|e| e.to_string())?;
+
+    // Record the DB write so health-check doesn't flag a false "stalled" alarm.
+    // Without this, sessions where reconciliation does most of the writes (batch
+    // mode, retry path) leave `last_db_write_ts` stale and the health endpoint
+    // reports "audio DB writes stalled — restart recommended" to a healthy system.
+    if let Some(m) = metrics {
+        let word_count = pending.transcription.split_whitespace().count() as u64;
+        m.record_db_insert(word_count);
+    }
 
     // Success — remove the pending file
     if let Some(dir) = data_dir {
@@ -517,6 +538,7 @@ async fn retry_pending_transcriptions(
     db: &DatabaseManager,
     data_dir: &Path,
     on_insert: Option<&AudioInsertCallback>,
+    metrics: Option<&Arc<AudioPipelineMetrics>>,
 ) {
     let dir = pending_dir(data_dir);
     let entries = match std::fs::read_dir(&dir) {
@@ -576,7 +598,7 @@ async fn retry_pending_transcriptions(
         // We don't have secondary file paths from the pending file, but they
         // may already have been cleaned up. Pass empty slice — the DB deletion
         // of secondary chunk IDs still happens.
-        match finalize_batch(db, &pending, on_insert, Some(data_dir), &[]).await {
+        match finalize_batch(db, &pending, on_insert, Some(data_dir), &[], metrics).await {
             Ok(_) => {
                 retried += 1;
                 debug!(

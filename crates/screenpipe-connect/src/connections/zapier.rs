@@ -32,7 +32,12 @@ impl Integration for Zapier {
         &DEF
     }
 
-    async fn test(&self, client: &reqwest::Client, creds: &Map<String, Value>, _secret_store: Option<&SecretStore>) -> Result<String> {
+    async fn test(
+        &self,
+        client: &reqwest::Client,
+        creds: &Map<String, Value>,
+        _secret_store: Option<&SecretStore>,
+    ) -> Result<String> {
         let url = require_str(creds, "webhook_url")?;
         client
             .post(url)

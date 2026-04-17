@@ -190,6 +190,7 @@ const DEFAULT_TIER_CONFIG: Record<UserTier, TierLimits> = {
       'qwen/qwen3.5-397b',
       'meta-llama/llama-4-scout',
       'meta-llama/llama-4-maverick',
+      'gemma4-31b',
     ],
   },
   subscribed: {

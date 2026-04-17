@@ -51,7 +51,12 @@ impl Integration for GithubIssues {
         Some(&CFG)
     }
 
-    async fn test(&self, client: &reqwest::Client, _creds: &Map<String, Value>, secret_store: Option<&SecretStore>) -> Result<String> {
+    async fn test(
+        &self,
+        client: &reqwest::Client,
+        _creds: &Map<String, Value>,
+        secret_store: Option<&SecretStore>,
+    ) -> Result<String> {
         let token = oauth::read_oauth_token_instance(secret_store, "github", None)
             .await
             .ok_or_else(|| anyhow!("not connected — use 'Connect with GitHub' button"))?;

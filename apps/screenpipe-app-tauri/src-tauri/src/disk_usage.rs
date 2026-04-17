@@ -49,11 +49,28 @@ pub struct DiskUsedByOther {
 pub struct CachedDiskUsage {
     pub timestamp: i64,
     pub usage: DiskUsage,
+    /// The screenpipe data directory this entry was computed for. Used to
+    /// invalidate the cache when the user switches data dirs in Settings —
+    /// otherwise we'd return stale sizes from the previous location for up
+    /// to an hour (see #2987).
+    #[serde(default)]
+    pub screenpipe_dir: String,
 }
 
 pub fn get_cache_dir() -> Result<Option<PathBuf>, String> {
     let proj_dirs = dirs::cache_dir().ok_or_else(|| "failed to get cache dir".to_string())?;
     Ok(Some(proj_dirs.join("screenpipe")))
+}
+
+/// Stable string key for a data directory, used to tag and compare cache
+/// entries across data-dir switches. We want `/foo`, `/foo/`, and a
+/// resolved symlink pointing at `/foo` to all match. `fs::canonicalize`
+/// handles symlinks + `..` but requires the path to exist, so on failure
+/// we fall back to the lossy string with trailing slashes trimmed.
+fn canonical_dir_key(p: &Path) -> String {
+    let resolved = fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let s = resolved.to_string_lossy();
+    s.trim_end_matches('/').trim_end_matches('\\').to_string()
 }
 
 pub fn directory_size(path: &Path) -> io::Result<Option<u64>> {
@@ -115,6 +132,8 @@ pub async fn disk_usage(
     fs::create_dir_all(&cache_dir).map_err(|e| e.to_string())?;
     let cache_file = cache_dir.join("disk_usage.json");
 
+    let current_dir_key = canonical_dir_key(screenpipe_dir);
+
     // Skip cache if force_refresh is requested
     if !force_refresh {
         if let Ok(content) = fs::read_to_string(&cache_file) {
@@ -123,12 +142,28 @@ pub async fn disk_usage(
             } else if let Ok(cached) = serde_json::from_str::<CachedDiskUsage>(&content) {
                 let now = chrono::Local::now().timestamp();
                 let one_hour = 60 * 60; // 1 hour cache (reduced from 2 days)
-                if now - cached.timestamp < one_hour {
+                // Invalidate cache if it was computed for a different data dir.
+                // `screenpipe_dir` defaults to "" on older cache entries — those
+                // predate the user switching dirs, so always invalidate them.
+                // Normalize the cached key too: old entries were written with
+                // raw `to_string_lossy()`, may differ from canonical form for
+                // the same directory.
+                let cached_key_normalized =
+                    canonical_dir_key(Path::new(&cached.screenpipe_dir));
+                let dir_matches = !cached.screenpipe_dir.is_empty()
+                    && cached_key_normalized == current_dir_key;
+                if dir_matches && now - cached.timestamp < one_hour {
                     info!(
                         "Using cached disk usage data (age: {}s)",
                         now - cached.timestamp
                     );
                     return Ok(Some(cached.usage));
+                }
+                if !dir_matches {
+                    info!(
+                        "Cache dir mismatch (cached={}, current={}), recalculating",
+                        cached.screenpipe_dir, current_dir_key
+                    );
                 }
             }
         }
@@ -292,7 +327,9 @@ pub async fn disk_usage(
     let pipes_size: u64 = {
         let pipes_dir = screenpipe_dir.join("pipes");
         if pipes_dir.exists() {
-            directory_size(&pipes_dir).map_err(|e| e.to_string())?.unwrap_or(0)
+            directory_size(&pipes_dir)
+                .map_err(|e| e.to_string())?
+                .unwrap_or(0)
         } else {
             0
         }
@@ -302,7 +339,10 @@ pub async fn disk_usage(
     // Calculate "other" — everything not accounted for above
     let accounted = total_media_size_calculated + database_size + logs_size + pipes_size;
     let other_size: u64 = total_data_size_bytes.saturating_sub(accounted);
-    info!("Other size: {} bytes (total {} - accounted {})", other_size, total_data_size_bytes, accounted);
+    info!(
+        "Other size: {} bytes (total {} - accounted {})",
+        other_size, total_data_size_bytes, accounted
+    );
 
     // Calculate available space
     info!("Calculating available disk space");
@@ -376,10 +416,11 @@ pub async fn disk_usage(
 
     info!("Disk usage calculation completed: {:?}", disk_usage);
 
-    // Cache the result
+    // Cache the result — keyed by data dir so switching dirs invalidates it
     let cached = CachedDiskUsage {
         timestamp: chrono::Local::now().timestamp(),
         usage: disk_usage.clone(),
+        screenpipe_dir: current_dir_key,
     };
 
     info!(

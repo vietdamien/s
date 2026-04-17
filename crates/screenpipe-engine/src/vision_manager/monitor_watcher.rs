@@ -12,10 +12,12 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
+use screenpipe_events::PermissionKind;
 use screenpipe_screen::monitor::{list_monitors_detailed, MonitorListError};
 
 use super::manager::{VisionManager, VisionManagerStatus};
 use crate::drm_detector;
+use crate::permission_monitor;
 
 static MONITOR_WATCHER: Lazy<Mutex<Option<JoinHandle<()>>>> = Lazy::new(|| Mutex::new(None));
 
@@ -52,6 +54,11 @@ pub async fn start_monitor_watcher(
             Err(MonitorListError::PermissionDenied) => {
                 error!("Screen recording permission denied. Vision capture is disabled. Grant access in System Settings > Privacy & Security > Screen Recording");
                 permission_denied_logged = true;
+                permission_monitor::report_state(
+                    PermissionKind::ScreenRecording,
+                    false,
+                    Some("list_monitors PermissionDenied (startup)".to_string()),
+                );
             }
             Err(e) => {
                 warn!("Failed to list monitors on startup: {}", e);
@@ -166,6 +173,11 @@ pub async fn start_monitor_watcher(
                     if permission_denied_logged {
                         info!("Screen recording permission granted! Starting vision capture.");
                         permission_denied_logged = false;
+                        permission_monitor::report_state(
+                            PermissionKind::ScreenRecording,
+                            true,
+                            None,
+                        );
                     }
                     monitors
                 }
@@ -173,6 +185,11 @@ pub async fn start_monitor_watcher(
                     if !permission_denied_logged {
                         error!("Screen recording permission denied. Vision capture is disabled. Grant access in System Settings > Privacy & Security > Screen Recording");
                         permission_denied_logged = true;
+                        permission_monitor::report_state(
+                            PermissionKind::ScreenRecording,
+                            false,
+                            Some("list_monitors PermissionDenied (runtime)".to_string()),
+                        );
                     }
                     // Back off to 30s when permission is denied instead of 2s
                     tokio::time::sleep(Duration::from_secs(30)).await;

@@ -98,7 +98,7 @@ mod fts_contention_tests {
             let t0 = Instant::now();
             for (frame_id, text, app_name, window_name) in chunk {
                 sqlx::query(
-                    "INSERT OR IGNORE INTO frames_fts(id, full_text, app_name, window_name, browser_url) \
+                    "INSERT OR IGNORE INTO frames_fts(rowid, full_text, app_name, window_name, browser_url) \
                      VALUES (?1, ?2, ?3, ?4, '')",
                 )
                 .bind(frame_id)
@@ -192,7 +192,7 @@ mod fts_contention_tests {
                 let mut tx = db_for_fts.begin_immediate_with_retry().await.unwrap();
                 for (frame_id, text, app_name, window_name) in chunk {
                     sqlx::query(
-                        "INSERT OR IGNORE INTO frames_fts(id, full_text, app_name, window_name, browser_url) \
+                        "INSERT OR IGNORE INTO frames_fts(rowid, full_text, app_name, window_name, browser_url) \
                          VALUES (?1, ?2, ?3, ?4, '')",
                     )
                     .bind(frame_id)

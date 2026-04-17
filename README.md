@@ -48,6 +48,9 @@ screenpipe turns your computer into a personal AI that knows everything you've d
 
 - **remember everything** - never forget what you saw, heard, or did
 - **run agents that work based on what you do** - pipes are agents triggered by your work activity
+
+<img width="360" height="311" alt="image" src="https://github.com/user-attachments/assets/cfbf0fd3-84ef-4feb-8c6d-2779d67058a7" />
+
 - **search with ai** - find anything using natural language
 - **100% local** - your data never leaves your machine
 - **open source** - inspect, modify, own

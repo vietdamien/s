@@ -4,6 +4,7 @@
 
 //! Tauri commands for cloud sync operations.
 
+use crate::recording::{local_api_context_from_app, LocalApiContext};
 use crate::store::{CloudArchiveSettingsStore, CloudSyncSettingsStore, SettingsStore};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use chrono::Utc;
@@ -13,6 +14,13 @@ use std::sync::Arc;
 use tauri::{AppHandle, State};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
+
+fn apply_local_api_auth(
+    api: &LocalApiContext,
+    request: reqwest::RequestBuilder,
+) -> reqwest::RequestBuilder {
+    api.apply_auth(request)
+}
 
 /// Sync state managed by Tauri.
 pub struct SyncState {
@@ -172,7 +180,7 @@ pub async fn set_sync_enabled(state: State<'_, SyncState>, enabled: bool) -> Res
 /// Trigger an immediate sync via the screenpipe server.
 #[tauri::command]
 #[specta::specta]
-pub async fn trigger_sync(state: State<'_, SyncState>) -> Result<(), String> {
+pub async fn trigger_sync(app: AppHandle, state: State<'_, SyncState>) -> Result<(), String> {
     let enabled = *state.enabled.read().await;
     if !enabled {
         return Err("sync is not enabled".to_string());
@@ -195,11 +203,11 @@ pub async fn trigger_sync(state: State<'_, SyncState>) -> Result<(), String> {
     let is_syncing_clone = state.is_syncing.clone();
     let last_sync_clone = state.last_sync.clone();
     let last_error_clone = state.last_error.clone();
+    let api = local_api_context_from_app(&app);
 
     tokio::spawn(async move {
         let client = reqwest::Client::new();
-        let result = client
-            .post("http://localhost:3030/sync/trigger")
+        let result = apply_local_api_auth(&api, client.post(api.url("/sync/trigger")))
             .send()
             .await;
 
@@ -307,6 +315,7 @@ pub async fn remove_sync_device(
 #[tauri::command]
 #[specta::specta]
 pub async fn delete_device_local_data(
+    app: AppHandle,
     state: State<'_, SyncState>,
     machine_id: String,
 ) -> Result<String, String> {
@@ -315,8 +324,8 @@ pub async fn delete_device_local_data(
     }
 
     let client = reqwest::Client::new();
-    let resp = client
-        .post("http://localhost:3030/data/delete-device")
+    let api = local_api_context_from_app(&app);
+    let resp = apply_local_api_auth(&api, client.post(api.url("/data/delete-device")))
         .json(&serde_json::json!({ "machine_id": machine_id }))
         .send()
         .await
@@ -399,6 +408,7 @@ pub async fn init_sync(
 
     // Now initialize the server's sync service
     let client = reqwest::Client::new();
+    let api = local_api_context_from_app(&app);
     let init_request = serde_json::json!({
         "token": token,
         "password": password,
@@ -406,8 +416,7 @@ pub async fn init_sync(
         "sync_interval_secs": 300
     });
 
-    match client
-        .post("http://localhost:3030/sync/init")
+    match apply_local_api_auth(&api, client.post(api.url("/sync/init")))
         .json(&init_request)
         .send()
         .await
@@ -458,7 +467,11 @@ pub async fn lock_sync(app: AppHandle, state: State<'_, SyncState>) -> Result<()
 
     // Lock server sync service
     let client = reqwest::Client::new();
-    match client.post("http://localhost:3030/sync/lock").send().await {
+    let api = local_api_context_from_app(&app);
+    match apply_local_api_auth(&api, client.post(api.url("/sync/lock")))
+        .send()
+        .await
+    {
         Ok(response) if response.status().is_success() => {
             info!("server sync service locked");
         }
@@ -550,6 +563,7 @@ pub async fn auto_start_sync(app: &AppHandle, state: &SyncState) {
 
     // Initialize the server's sync service
     let client = reqwest::Client::new();
+    let api = local_api_context_from_app(app);
     let init_request = serde_json::json!({
         "token": token,
         "password": password,
@@ -557,8 +571,7 @@ pub async fn auto_start_sync(app: &AppHandle, state: &SyncState) {
         "sync_interval_secs": 300
     });
 
-    match client
-        .post("http://localhost:3030/sync/init")
+    match apply_local_api_auth(&api, client.post(api.url("/sync/init")))
         .json(&init_request)
         .send()
         .await
@@ -640,6 +653,7 @@ pub async fn auto_start_archive(app: &AppHandle) {
     };
 
     let client = reqwest::Client::new();
+    let api = local_api_context_from_app(app);
     let init_request = serde_json::json!({
         "token": token,
         "retention_days": archive_settings.retention_days,
@@ -653,8 +667,7 @@ pub async fn auto_start_archive(app: &AppHandle) {
             tokio::time::sleep(tokio::time::Duration::from_secs(*delay)).await;
         }
 
-        match client
-            .post("http://localhost:3030/archive/init")
+        match apply_local_api_auth(&api, client.post(api.url("/archive/init")))
             .json(&init_request)
             .send()
             .await
@@ -670,11 +683,11 @@ pub async fn auto_start_archive(app: &AppHandle) {
                 info!("cloud archive: already initialized, re-enabling");
                 // Already initialized — make sure it's enabled
                 let enable_req = serde_json::json!({ "enabled": true });
-                if let Err(e) = client
-                    .post("http://localhost:3030/archive/configure")
-                    .json(&enable_req)
-                    .send()
-                    .await
+                if let Err(e) =
+                    apply_local_api_auth(&api, client.post(api.url("/archive/configure")))
+                        .json(&enable_req)
+                        .send()
+                        .await
                 {
                     warn!("cloud archive: failed to re-enable: {}", e);
                 }
@@ -735,13 +748,13 @@ pub async fn auto_start_retention(app: &AppHandle) {
         .unwrap_or(14) as u32;
 
     let client = reqwest::Client::new();
+    let api = local_api_context_from_app(app);
     let configure_req = serde_json::json!({
         "enabled": true,
         "retention_days": days,
     });
 
-    match client
-        .post("http://localhost:3030/retention/configure")
+    match apply_local_api_auth(&api, client.post(api.url("/retention/configure")))
         .json(&configure_req)
         .send()
         .await

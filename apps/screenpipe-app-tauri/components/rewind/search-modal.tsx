@@ -532,7 +532,7 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
     fetchFacet(
       `SELECT f.browser_url as url, COUNT(*) as cnt
        FROM frames_fts
-       JOIN frames f ON f.id = frames_fts.id
+       JOIN frames f ON f.id = frames_fts.rowid
        WHERE frames_fts MATCH '${escaped}'
        AND f.browser_url IS NOT NULL AND f.browser_url != ''
        GROUP BY f.browser_url ORDER BY cnt DESC LIMIT 200`
@@ -553,7 +553,7 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
     fetchFacet(
       `SELECT DATE(f.timestamp) as d, MIN(f.timestamp) as ts, COUNT(*) as cnt
        FROM frames_fts
-       JOIN frames f ON f.id = frames_fts.id
+       JOIN frames f ON f.id = frames_fts.rowid
        WHERE frames_fts MATCH '${escaped}'
        GROUP BY DATE(f.timestamp)
        ORDER BY d DESC LIMIT 30`

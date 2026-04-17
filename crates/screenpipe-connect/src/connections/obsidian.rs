@@ -40,7 +40,12 @@ impl Integration for Obsidian {
         &DEF
     }
 
-    async fn test(&self, _client: &reqwest::Client, creds: &Map<String, Value>, _secret_store: Option<&SecretStore>) -> Result<String> {
+    async fn test(
+        &self,
+        _client: &reqwest::Client,
+        creds: &Map<String, Value>,
+        _secret_store: Option<&SecretStore>,
+    ) -> Result<String> {
         let vault_path = require_str(creds, "vault_path")?;
         let path = std::path::Path::new(vault_path);
 

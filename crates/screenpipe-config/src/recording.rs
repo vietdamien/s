@@ -295,10 +295,8 @@ impl Default for RecordingSettings {
     fn default() -> Self {
         Self {
             disable_audio: false,
-            audio_transcription_engine: crate::best_engine_for_platform(
-                crate::detect_tier(),
-            )
-            .to_string(),
+            audio_transcription_engine: crate::best_engine_for_platform(crate::detect_tier())
+                .to_string(),
             transcription_mode: "batch".to_string(),
             audio_devices: vec![],
             use_system_default_audio: true,

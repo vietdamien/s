@@ -337,7 +337,10 @@ mod tests {
 
         // Re-encrypt with a key
         let key = [99u8; 32];
-        let count = plain_store.reencrypt_unencrypted_secrets(&key).await.unwrap();
+        let count = plain_store
+            .reencrypt_unencrypted_secrets(&key)
+            .await
+            .unwrap();
         assert_eq!(count, 3);
 
         // Verify the encrypted store can read them back
@@ -351,7 +354,10 @@ mod tests {
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert!(!row.0.iter().all(|&b| b == 0), "nonce should be non-zero after re-encryption");
+        assert!(
+            !row.0.iter().all(|&b| b == 0),
+            "nonce should be non-zero after re-encryption"
+        );
 
         // Re-encrypt again should be a no-op (already encrypted)
         let count2 = enc_store.reencrypt_unencrypted_secrets(&key).await.unwrap();

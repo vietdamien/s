@@ -60,6 +60,10 @@ fn mark_recently_woke(platform: &'static str) {
     let seq = RECENTLY_WOKE_SEQ.fetch_add(1, Ordering::SeqCst) + 1;
     tracing::info!("Detected system wake on {}", platform);
 
+    // Suppress permission-change emissions briefly — TCC / preflight APIs
+    // can return stale denied while the OS re-registers the process.
+    crate::permission_monitor::notify_wake();
+
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_secs(30));
         if RECENTLY_WOKE_SEQ.load(Ordering::SeqCst) == seq {
@@ -717,8 +721,14 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
 
-        assert!(saw_locked, "Screen lock was NOT detected — did you lock the screen?");
-        assert!(saw_unlocked_after_lock, "Screen unlock was NOT detected after lock");
+        assert!(
+            saw_locked,
+            "Screen lock was NOT detected — did you lock the screen?"
+        );
+        assert!(
+            saw_unlocked_after_lock,
+            "Screen unlock was NOT detected after lock"
+        );
 
         eprintln!("============================================");
         eprintln!("  LOCK/UNLOCK DETECTION PASSED");

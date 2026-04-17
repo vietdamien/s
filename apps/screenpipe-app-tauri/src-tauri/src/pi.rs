@@ -8,11 +8,11 @@
 
 use screenpipe_core::agents::pi::screenpipe_cloud_models;
 use serde::{Deserialize, Serialize};
-use tauri::Manager;
 use serde_json::{json, Value};
 use specta::Type;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
+use tauri::Manager;
 use tokio::sync::oneshot;
 
 /// Read lines from a byte stream using lossy UTF-8 conversion.
@@ -690,7 +690,7 @@ fn default_max_tokens() -> i32 {
 /// Returns a map of provider entries to merge into the existing models.json.
 /// We merge instead of rebuilding from scratch to avoid a race condition where
 /// concurrent pipes overwrite each other's providers.
-fn build_models_json(
+async fn build_models_json(
     user_token: Option<&str>,
     provider_config: Option<&PiProviderConfig>,
 ) -> serde_json::Value {
@@ -698,12 +698,13 @@ fn build_models_json(
 
     // Always add screenpipe cloud provider
     let api_key_value = user_token.unwrap_or("SCREENPIPE_API_KEY");
+    let models = screenpipe_cloud_models(SCREENPIPE_API_URL, user_token).await;
     let screenpipe_provider = json!({
         "baseUrl": SCREENPIPE_API_URL,
         "api": "openai-completions",
         "apiKey": api_key_value,
         "authHeader": true,
-        "models": screenpipe_cloud_models(SCREENPIPE_API_URL, user_token)
+        "models": models
     });
     providers_map.insert("screenpipe".to_string(), screenpipe_provider);
 
@@ -754,19 +755,39 @@ fn build_models_json(
                     "openai-completions"
                 };
 
+                // Detect endpoints that require `max_completion_tokens` instead
+                // of `max_tokens`. Azure Foundry, Azure OpenAI (newer deployments),
+                // and GPT-5 / o-series models all reject `max_tokens`.
+                let requires_max_completion_tokens = base_url.contains("azure.com")
+                    || base_url.contains("openai.azure.com")
+                    || base_url.contains("services.ai.azure.com")
+                    || base_url.contains("cognitiveservices.azure.com")
+                    || config.model.starts_with("gpt-5")
+                    || config.model.starts_with("o1")
+                    || config.model.starts_with("o3")
+                    || config.model.starts_with("o4");
+
+                let mut model_def = serde_json::Map::new();
+                model_def.insert("id".into(), json!(config.model));
+                model_def.insert("name".into(), json!(config.model));
+                model_def.insert("input".into(), json!(["text", "image"]));
+                model_def.insert("maxTokens".into(), json!(config.max_tokens));
+                model_def.insert(
+                    "cost".into(),
+                    json!({"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}),
+                );
+                if requires_max_completion_tokens && wire_api == "openai-completions" {
+                    model_def.insert(
+                        "compat".into(),
+                        json!({"maxTokensField": "max_completion_tokens"}),
+                    );
+                }
+
                 let user_provider = json!({
                     "baseUrl": base_url,
                     "api": wire_api,
                     "apiKey": api_key,
-                    "models": [
-                        {
-                            "id": config.model,
-                            "name": config.model,
-                            "input": ["text", "image"],
-                            "maxTokens": config.max_tokens,
-                            "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}
-                        }
-                    ]
+                    "models": [ serde_json::Value::Object(model_def) ]
                 });
 
                 providers_map.insert(provider_name.to_string(), user_provider);
@@ -778,7 +799,7 @@ fn build_models_json(
 }
 
 /// Write pi's provider config (models.json + auth.json).
-fn ensure_pi_config(
+async fn ensure_pi_config(
     user_token: Option<&str>,
     provider_config: Option<&PiProviderConfig>,
 ) -> Result<(), String> {
@@ -786,7 +807,7 @@ fn ensure_pi_config(
     std::fs::create_dir_all(&config_dir)
         .map_err(|e| format!("Failed to create pi config dir: {}", e))?;
 
-    let new_providers = build_models_json(user_token, provider_config);
+    let new_providers = build_models_json(user_token, provider_config).await;
 
     // Merge into existing models.json to avoid race conditions with concurrent pipes
     let models_path = config_dir.join("models.json");
@@ -1018,7 +1039,7 @@ pub async fn pi_start_inner(
     ensure_web_search_extension(&project_dir, provider_config.as_ref())?;
 
     // Ensure Pi is configured with the user's provider
-    ensure_pi_config(user_token.as_deref(), provider_config.as_ref())?;
+    ensure_pi_config(user_token.as_deref(), provider_config.as_ref()).await?;
 
     // Determine which Pi provider and model to use
     let (pi_provider, pi_model) = match &provider_config {
@@ -1252,17 +1273,14 @@ pub async fn pi_start_inner(
         cmd.env("SCREENPIPE_API_KEY", token);
     }
 
-    // Pass local API auth key so the Pi agent can authenticate to localhost:3030
+    // Pass local API config so the Pi agent can authenticate to the runtime local API.
     {
-        use crate::recording::RecordingState;
-        if let Some(state) = app.try_state::<RecordingState>() {
-            if let Ok(guard) = state.server.try_lock() {
-                if let Some(ref core) = *guard {
-                    if let Some(ref key) = core.local_api_key {
-                        cmd.env("SCREENPIPE_LOCAL_API_KEY", key);
-                    }
-                }
-            }
+        use crate::recording::local_api_context_from_app;
+        let api = local_api_context_from_app(&app);
+        cmd.env("SCREENPIPE_LOCAL_API_PORT", api.port.to_string());
+        cmd.env("SCREENPIPE_LOCAL_API_URL", api.url(""));
+        if let Some(ref key) = api.api_key {
+            cmd.env("SCREENPIPE_LOCAL_API_KEY", key);
         }
     }
 
@@ -2587,6 +2605,82 @@ mod tests {
         assert_eq!(providers.len(), 2);
         assert!(providers.contains_key("custom"));
         assert_eq!(providers["custom"]["baseUrl"], "http://my-server:8080/v1");
+    }
+
+    #[test]
+    fn test_build_models_json_custom_generic_no_compat_override() {
+        // Plain OpenAI-compatible endpoints (Ollama, vLLM, OpenRouter-like)
+        // should NOT have compat.maxTokensField set — Pi's auto-detection
+        // defaults to max_completion_tokens which works for most of these.
+        let mut pc = make_provider_config("custom", "my-model");
+        pc.url = "http://localhost:8080/v1".to_string();
+        let config = build_models_json(None, Some(&pc));
+        let model = &config["providers"]["custom"]["models"][0];
+        assert!(
+            model.get("compat").is_none(),
+            "generic custom should not have compat"
+        );
+    }
+
+    #[test]
+    fn test_build_models_json_azure_openai_forces_max_completion_tokens() {
+        let mut pc = make_provider_config("custom", "gpt-4o");
+        pc.url = "https://myresource.openai.azure.com/openai/deployments/gpt-4o".to_string();
+        let config = build_models_json(None, Some(&pc));
+        let model = &config["providers"]["custom"]["models"][0];
+        assert_eq!(
+            model["compat"]["maxTokensField"], "max_completion_tokens",
+            "Azure OpenAI must use max_completion_tokens"
+        );
+    }
+
+    #[test]
+    fn test_build_models_json_azure_foundry_forces_max_completion_tokens() {
+        let mut pc = make_provider_config("custom", "gpt-5-mini");
+        pc.url = "https://myresource.services.ai.azure.com/api/projects/proj".to_string();
+        let config = build_models_json(None, Some(&pc));
+        let model = &config["providers"]["custom"]["models"][0];
+        assert_eq!(model["compat"]["maxTokensField"], "max_completion_tokens");
+    }
+
+    #[test]
+    fn test_build_models_json_azure_cognitive_services_forces_max_completion_tokens() {
+        let mut pc = make_provider_config("custom", "my-deployment");
+        pc.url = "https://myresource.cognitiveservices.azure.com/".to_string();
+        let config = build_models_json(None, Some(&pc));
+        let model = &config["providers"]["custom"]["models"][0];
+        assert_eq!(model["compat"]["maxTokensField"], "max_completion_tokens");
+    }
+
+    #[test]
+    fn test_build_models_json_gpt5_model_forces_max_completion_tokens() {
+        // Even on a generic OpenAI-compatible proxy, GPT-5 models require
+        // max_completion_tokens. Detect by model ID.
+        let mut pc = make_provider_config("custom", "gpt-5");
+        pc.url = "https://my-proxy.example.com/v1".to_string();
+        let config = build_models_json(None, Some(&pc));
+        let model = &config["providers"]["custom"]["models"][0];
+        assert_eq!(model["compat"]["maxTokensField"], "max_completion_tokens");
+    }
+
+    #[test]
+    fn test_build_models_json_o3_model_forces_max_completion_tokens() {
+        let mut pc = make_provider_config("custom", "o3-mini");
+        pc.url = "https://my-proxy.example.com/v1".to_string();
+        let config = build_models_json(None, Some(&pc));
+        let model = &config["providers"]["custom"]["models"][0];
+        assert_eq!(model["compat"]["maxTokensField"], "max_completion_tokens");
+    }
+
+    #[test]
+    fn test_build_models_json_regular_gpt4_no_compat_override() {
+        // gpt-4 and gpt-4o should NOT be forced — they work with both field names
+        // and Pi's default is already max_completion_tokens for non-chutes URLs.
+        let mut pc = make_provider_config("custom", "gpt-4o");
+        pc.url = "https://my-proxy.example.com/v1".to_string();
+        let config = build_models_json(None, Some(&pc));
+        let model = &config["providers"]["custom"]["models"][0];
+        assert!(model.get("compat").is_none());
     }
 
     #[test]

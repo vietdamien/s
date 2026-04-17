@@ -7,7 +7,7 @@ use crate::enterprise_policy::is_tray_item_hidden;
 use crate::health::{
     get_audio_device_status, get_recording_info, get_recording_status, DeviceKind, RecordingStatus,
 };
-use crate::recording::RecordingState;
+use crate::recording::{local_api_context_from_app, RecordingState};
 use crate::store::{get_store, OnboardingStore, SettingsStore};
 use crate::updates::{is_enterprise_build, is_source_build};
 use crate::window::ShowRewindWindow;
@@ -59,29 +59,28 @@ fn prefetch_tray_menu_data(app: &AppHandle) -> TrayMenuData {
         ("Control+Super+S", "Control+Super+K", "Control+Super+L")
     };
 
-    let (show_shortcut, search_shortcut, chat_shortcut) =
-        if let Ok(store) = get_store(app, None) {
-            (
-                store
-                    .get("showScreenpipeShortcut")
-                    .and_then(|v| v.as_str().map(String::from))
-                    .unwrap_or_else(|| default_show.to_string()),
-                store
-                    .get("searchShortcut")
-                    .and_then(|v| v.as_str().map(String::from))
-                    .unwrap_or_else(|| default_search.to_string()),
-                store
-                    .get("showChatShortcut")
-                    .and_then(|v| v.as_str().map(String::from))
-                    .unwrap_or_else(|| default_chat.to_string()),
-            )
-        } else {
-            (
-                default_show.to_string(),
-                default_search.to_string(),
-                default_chat.to_string(),
-            )
-        };
+    let (show_shortcut, search_shortcut, chat_shortcut) = if let Ok(store) = get_store(app, None) {
+        (
+            store
+                .get("showScreenpipeShortcut")
+                .and_then(|v| v.as_str().map(String::from))
+                .unwrap_or_else(|| default_show.to_string()),
+            store
+                .get("searchShortcut")
+                .and_then(|v| v.as_str().map(String::from))
+                .unwrap_or_else(|| default_search.to_string()),
+            store
+                .get("showChatShortcut")
+                .and_then(|v| v.as_str().map(String::from))
+                .unwrap_or_else(|| default_chat.to_string()),
+        )
+    } else {
+        (
+            default_show.to_string(),
+            default_search.to_string(),
+            default_chat.to_string(),
+        )
+    };
 
     let cloud_subscribed = SettingsStore::get(app)
         .unwrap_or_default()
@@ -337,9 +336,12 @@ pub fn recreate_tray(app: &AppHandle) {
                         debug!("recreate_tray: build succeeded, setting menu");
                         // Setup menu
                         let data = prefetch_tray_menu_data(&app);
-                        if let Ok(menu) =
-                            create_dynamic_menu(&app, &MenuState::default(), update_item.as_ref(), &data)
-                        {
+                        if let Ok(menu) = create_dynamic_menu(
+                            &app,
+                            &MenuState::default(),
+                            update_item.as_ref(),
+                            &data,
+                        ) {
                             // Keep a clone alive to prevent use-after-free (see PREVIOUS_TRAY_MENU doc).
                             if let Ok(mut guard) = PREVIOUS_TRAY_MENU.lock() {
                                 *guard = Some(menu.clone());
@@ -537,9 +539,8 @@ fn create_dynamic_menu(
 
     // Show "fix permissions" when recording is in error state
     if effective_status == RecordingStatus::Error && data.has_permission_issue {
-        menu_builder = menu_builder.item(
-            &MenuItemBuilder::with_id("fix_permissions", "⚠ Fix permissions").build(app)?,
-        );
+        menu_builder = menu_builder
+            .item(&MenuItemBuilder::with_id("fix_permissions", "⚠ Fix permissions").build(app)?);
     }
 
     // --- Plan / usage info ---
@@ -725,10 +726,7 @@ fn handle_menu_event(app_handle: &AppHandle, event: tauri::menu::MenuEvent) {
             });
         }
         id if id.starts_with("toggle_audio_device_") => {
-            let device_name = id
-                .strip_prefix("toggle_audio_device_")
-                .unwrap()
-                .to_string();
+            let device_name = id.strip_prefix("toggle_audio_device_").unwrap().to_string();
 
             // Check current state from cached device status.
             // Default to "running" if device isn't in cache yet (it's shown
@@ -742,19 +740,18 @@ fn handle_menu_event(app_handle: &AppHandle, event: tauri::menu::MenuEvent) {
 
             // macOS CheckMenuItem already toggles the visual check on click.
             // Just fire the API call — the health poll (every 1s) will sync state.
+            let api = local_api_context_from_app(&app_handle);
             let endpoint = if is_running {
-                "http://localhost:3030/audio/device/stop"
+                api.url("/audio/device/stop")
             } else {
-                "http://localhost:3030/audio/device/start"
+                api.url("/audio/device/start")
             };
             tauri::async_runtime::spawn(async move {
                 let client = reqwest::Client::new();
-                let _ = client
-                    .post(endpoint)
+                let _ = api
+                    .apply_auth(client.post(endpoint))
                     .header("Content-Type", "application/json")
-                    .body(
-                        serde_json::json!({"device_name": device_name}).to_string(),
-                    )
+                    .body(serde_json::json!({"device_name": device_name}).to_string())
                     .send()
                     .await;
             });
@@ -1019,7 +1016,6 @@ async fn update_menu_if_needed(
 
     Ok(())
 }
-
 
 pub fn setup_tray_menu_updater(app: AppHandle, update_item: &tauri::menu::MenuItem<Wry>) {
     let update_item = update_item.clone();

@@ -66,15 +66,47 @@ async function finishOpenHomeWindow(): Promise<void> {
   if (!homeHandle) throw new Error('Could not get home window handle');
   await browser.switchToWindow(homeHandle as string);
 
-  // Wait for sidebar brand to confirm hydration
+  // Give the webview a moment to settle after switchToWindow before we start
+  // running JS against it — WebKitGTK on CI can otherwise return a stale
+  // pathname while the page is still navigating from Tauri's initial URL.
+  await browser.pause(t(500));
+
+  // The Home window persists across specs. A prior spec may have navigated it
+  // to /settings (or elsewhere), and `show_window { Home: { page: null } }`
+  // only focuses — it doesn't navigate. Force /home so every spec starts
+  // from the same route and testids like nav-pipes / home-page are present.
+  const currentPath = (await browser
+    .execute(() => window.location.pathname)
+    .catch(() => '')) as string;
+  if (currentPath !== '/home') {
+    await browser.execute(() => {
+      window.location.href = '/home';
+    });
+  }
+
+  // Wait for the Home page to actually render its root element — stronger
+  // than a text match, which false-passes on /settings (sidebar brand is
+  // present there too). WebKitGTK on Linux CI needs noticeably more time
+  // than macOS/Windows here, hence the generous timeout.
   await browser.waitUntil(
     async () => {
-      const text = await browser.execute(() => document.body?.innerText || '');
-      return text.includes('screenpipe');
+      try {
+        const present = (await browser.execute(
+          () => !!document.querySelector('[data-testid="home-page"]')
+        )) as boolean;
+        return present;
+      } catch {
+        // Transient during webview reload — retry.
+        return false;
+      }
     },
-    { timeout: t(15000), timeoutMsg: 'Home page did not hydrate' }
+    {
+      timeout: t(30000),
+      interval: 500,
+      timeoutMsg: 'Home page did not render [data-testid="home-page"]',
+    }
   );
-  await browser.pause(t(3000));
+  await browser.pause(t(1500));
 }
 
 /**

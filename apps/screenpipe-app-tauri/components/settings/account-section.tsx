@@ -189,7 +189,7 @@ export function AccountSection() {
               <Button
                 variant="outline"
                 size="sm"
-                onClick={() => openUrl("https://screenpi.pe/user-dashboard")}
+                onClick={() => openUrl("https://screenpi.pe/account")}
               >
                 <UserCog className="w-4 h-4 mr-1.5" />
                 manage

@@ -405,7 +405,10 @@ async fn drain_loop(
         // during sleep transitions.
         if WRITE_PAUSED.load(Ordering::SeqCst) {
             if !batch.is_empty() {
-                info!("write_queue: paused for sleep, holding {} writes", batch.len());
+                info!(
+                    "write_queue: paused for sleep, holding {} writes",
+                    batch.len()
+                );
             }
             let notify = RESUME_NOTIFY.get_or_init(|| tokio::sync::Notify::new());
             tokio::select! {

@@ -162,14 +162,7 @@ enum KeychainLookup {
 #[cfg(target_os = "macos")]
 fn get_password_from_keychain() -> KeychainLookup {
     let output = match std::process::Command::new("security")
-        .args([
-            "find-generic-password",
-            "-s",
-            SERVICE,
-            "-a",
-            KEY_NAME,
-            "-w",
-        ])
+        .args(["find-generic-password", "-s", SERVICE, "-a", KEY_NAME, "-w"])
         .output()
     {
         Ok(o) => o,

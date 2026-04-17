@@ -669,6 +669,12 @@ async fn main() -> anyhow::Result<()> {
     // earlier init step (like DB) fails and the process exits.
     start_sleep_monitor();
 
+    // Start the permission monitor — polls OS permission state and emits
+    // `permission_lost` / `permission_restored` on the shared event bus.
+    // Capture modules emit loss events eagerly on OS errors; this task covers
+    // accessibility transitions and confirms restorations across all three.
+    let _permission_monitor_handle = screenpipe_engine::permission_monitor::start();
+
     // Start cloud sync service if enabled
     let sync_service_handle = if record_args.enable_sync {
         match start_sync_service(&record_args, db.clone()).await {
@@ -924,7 +930,8 @@ async fn main() -> anyhow::Result<()> {
                 _ => None,
             }
         };
-        let secret_store_result = screenpipe_secrets::SecretStore::new(db.pool.clone(), secret_key).await;
+        let secret_store_result =
+            screenpipe_secrets::SecretStore::new(db.pool.clone(), secret_key).await;
         match secret_store_result {
             Ok(store) => {
                 // Run startup permission sweep
@@ -1124,7 +1131,11 @@ async fn main() -> anyhow::Result<()> {
     );
     println!(
         "│ api auth               │ {:<34} │",
-        if record_args.api_auth { "enabled" } else { "disabled" }
+        if record_args.api_auth {
+            "enabled"
+        } else {
+            "disabled"
+        }
     );
     println!(
         "│ encrypt secrets        │ {:<34} │",

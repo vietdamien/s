@@ -40,7 +40,12 @@ impl Integration for Pushover {
         &DEF
     }
 
-    async fn test(&self, client: &reqwest::Client, creds: &Map<String, Value>, _secret_store: Option<&SecretStore>) -> Result<String> {
+    async fn test(
+        &self,
+        client: &reqwest::Client,
+        creds: &Map<String, Value>,
+        _secret_store: Option<&SecretStore>,
+    ) -> Result<String> {
         let token = require_str(creds, "api_token")?;
         let user_key = require_str(creds, "user_key")?;
         client

@@ -63,13 +63,9 @@ impl CaptureSession {
                 config.to_vision_manager_config(output_path, server.vision_metrics.clone());
 
             let vision_manager = Arc::new(
-                VisionManager::new(
-                    vision_config,
-                    db_clone,
-                    tokio::runtime::Handle::current(),
-                )
-                .with_hot_frame_cache(server.hot_frame_cache.clone())
-                .with_power_profile(server.power_manager.subscribe()),
+                VisionManager::new(vision_config, db_clone, tokio::runtime::Handle::current())
+                    .with_hot_frame_cache(server.hot_frame_cache.clone())
+                    .with_power_profile(server.power_manager.subscribe()),
             );
 
             capture_trigger_tx = Some(vision_manager.trigger_sender());
@@ -91,8 +87,7 @@ impl CaptureSession {
                 }
                 info!("VisionManager started successfully");
 
-                if let Err(e) =
-                    start_monitor_watcher(vm_clone.clone(), audio_manager_for_drm).await
+                if let Err(e) = start_monitor_watcher(vm_clone.clone(), audio_manager_for_drm).await
                 {
                     error!("Failed to start monitor watcher: {:?}", e);
                 }
