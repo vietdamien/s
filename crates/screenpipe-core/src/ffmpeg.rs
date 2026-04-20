@@ -42,6 +42,30 @@ pub fn ffmpeg_cmd_async(path: impl AsRef<std::ffi::OsStr>) -> tokio::process::Co
     cmd
 }
 
+/// True when a usable ffprobe exists next to the given ffmpeg binary, OR
+/// somewhere on PATH. Frame extraction requires both — if we return an
+/// ffmpeg path without a matching ffprobe we get runtime 500s from
+/// `get_ffprobe_path`. Callers should fall through to the next discovery
+/// source when this returns false.
+fn has_matching_ffprobe(ffmpeg_path: &std::path::Path) -> bool {
+    #[cfg(windows)]
+    let sibling_names = ["ffprobe.exe", "ffprobe"];
+    #[cfg(not(windows))]
+    let sibling_names = ["ffprobe"];
+
+    for name in sibling_names {
+        if ffmpeg_path.with_file_name(name).exists() {
+            return true;
+        }
+    }
+
+    #[cfg(not(windows))]
+    let probe_name = "ffprobe";
+    #[cfg(windows)]
+    let probe_name = "ffprobe.exe";
+    which(probe_name).is_ok()
+}
+
 fn find_ffmpeg_path_internal() -> Option<PathBuf> {
     debug!("Starting search for ffmpeg executable");
 
@@ -73,14 +97,27 @@ fn find_ffmpeg_path_internal() -> Option<PathBuf> {
         }
     }
 
-    // Check if `ffmpeg` is in the PATH environment variable
+    // Check if `ffmpeg` is in the PATH environment variable.
+    //
+    // We MUST only accept a PATH ffmpeg if a matching ffprobe is available —
+    // frame extraction requires both. A user can easily end up with just
+    // ffmpeg in ~/.local/bin (e.g. an old auto-install that only extracted
+    // ffmpeg, or a user-installed ffmpeg without the full suite); without
+    // this guard we pick the broken half-install over the app-bundled pair
+    // and every compacted-frame fetch returns a 500. See #2999.
     if let Ok(path) = which(EXECUTABLE_NAME) {
-        debug!("Found ffmpeg in PATH: {:?}", path);
-        return Some(path);
+        if has_matching_ffprobe(&path) {
+            debug!("Found ffmpeg+ffprobe pair via PATH: {:?}", path);
+            return Some(path);
+        }
+        debug!(
+            "ffmpeg in PATH at {:?} has no matching ffprobe — falling through",
+            path
+        );
     }
     debug!("ffmpeg not found in PATH");
 
-    // Check in $HOME/.local/bin on macOS
+    // Check in $HOME/.local/bin on macOS. Same pair requirement as above.
     #[cfg(target_os = "macos")]
     {
         if let Ok(home) = std::env::var("HOME") {
@@ -88,11 +125,17 @@ fn find_ffmpeg_path_internal() -> Option<PathBuf> {
             debug!("Checking $HOME/.local/bin: {:?}", local_bin);
             let ffmpeg_in_local_bin = local_bin.join(EXECUTABLE_NAME);
             if ffmpeg_in_local_bin.exists() {
+                if has_matching_ffprobe(&ffmpeg_in_local_bin) {
+                    debug!(
+                        "Found ffmpeg+ffprobe pair in $HOME/.local/bin: {:?}",
+                        ffmpeg_in_local_bin
+                    );
+                    return Some(ffmpeg_in_local_bin);
+                }
                 debug!(
-                    "Found ffmpeg in $HOME/.local/bin: {:?}",
+                    "ffmpeg in ~/.local/bin at {:?} has no matching ffprobe — falling through",
                     ffmpeg_in_local_bin
                 );
-                return Some(ffmpeg_in_local_bin);
             }
             debug!("ffmpeg not found in $HOME/.local/bin");
         }

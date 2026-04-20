@@ -166,6 +166,14 @@
         {
           "path": "$APPDATA/Claude/**",
           "requireLiteralLeadingDot": false
+        },
+        {
+          "path": "$HOME/AppData/Roaming/Claude",
+          "requireLiteralLeadingDot": false
+        },
+        {
+          "path": "$HOME/AppData/Roaming/Claude/**",
+          "requireLiteralLeadingDot": false
         }
       ]
     },

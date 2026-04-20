@@ -484,32 +484,29 @@ pub async fn spawn_screenpipe(
         );
     }
 
-    let recording_config = store.to_recording_config(data_dir);
-
-    // Mirror the resolved API auth key to the SecretStore in db.sqlite so it's
-    // the single source of truth for every reader: the running server, the
-    // `screenpipe auth token` CLI, and external MCP clients that read db.sqlite
-    // directly. Stored as plaintext (zero nonce, base64-encoded) — this is a
-    // localhost-only API key and encryption-at-rest would block cross-process
-    // readers that don't share the keychain key (notably the MCP server, which
-    // is a Node.js process without keychain access).
-    if let Some(ref key) = recording_config.api_auth_key {
-        let key_clone = key.clone();
-        let data_dir = recording_config.data_dir.clone();
-        tauri::async_runtime::spawn(async move {
-            let db_path = data_dir.join("db.sqlite");
-            let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
-            if let Ok(pool) = sqlx::SqlitePool::connect(&db_url).await {
-                if let Ok(store) = screenpipe_secrets::SecretStore::new(pool, None).await {
-                    if let Err(e) = store.set("api_auth_key", key_clone.as_bytes()).await {
-                        tracing::warn!("failed to sync API key to secret store: {}", e);
-                    } else {
-                        tracing::info!("api auth: key synced to secret store");
-                    }
-                }
-            }
-        });
+    // Resolve the API auth key exactly once per process via the shared
+    // helper and seed the cache before `to_recording_config` reads it. The
+    // helper handles env var / settings / secret-store / auth.json lookup
+    // and persists auto-generated keys to the secret store itself, so every
+    // reader (server, MCP, auth CLI) sees the same value.
+    if store.recording.api_auth {
+        let settings_key_opt = if store.recording.api_key.is_empty() {
+            None
+        } else {
+            Some(store.recording.api_key.clone())
+        };
+        match screenpipe_engine::auth_key::resolve_api_auth_key(
+            &data_dir,
+            settings_key_opt.as_deref(),
+        )
+        .await
+        {
+            Ok(key) => crate::store::seed_api_auth_key(key),
+            Err(e) => tracing::error!("failed to resolve api auth key: {}", e),
+        }
     }
+
+    let recording_config = store.to_recording_config(data_dir);
 
     let server_arc = state.server.clone();
     let capture_arc = state.capture.clone();

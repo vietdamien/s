@@ -158,8 +158,11 @@ export type Settings = SettingsStore & {
 	showRestartNotifications?: boolean;
 	/** Offline mode — blocks all external network from pipes, disables PostHog telemetry, keeps Sentry crash reports */
 	offlineMode?: boolean;
-	/** Pause all screen capture when a DRM streaming app (Netflix, Disney+, etc.) is focused */
+	/** Pause all screen capture when a DRM-protected streaming app (Netflix, Disney+, etc.) or a remote-desktop client (Omnissa/VMware Horizon) is focused — they blank their windows during screen recording */
 	pauseOnDrmContent?: boolean;
+	/** Experimental: capture System Audio via CoreAudio Process Tap (macOS 14.4+) instead of ScreenCaptureKit.
+	 *  Off by default. Ignored on macOS <14.4 and non-macOS — falls back to SCK. */
+	experimentalCoreaudioSystemAudio?: boolean;
 	/** Continue recording audio when the screen is locked (default: false) */
 	recordWhileLocked?: boolean;
 	/** Auto-append typed text to meeting notes when a meeting ends */
@@ -249,20 +252,44 @@ const DEFAULT_IGNORED_WINDOWS_PER_OS: Record<string, string[]> = {
 	linux: ["Info center", "Discover", "Parted"],
 };
 
-// Default Screenpipe Cloud preset
-const DEFAULT_CLOUD_PRESET: AIPreset = {
-	id: "screenpipe-cloud",
-	provider: "screenpipe-cloud",
-	url: "",
-	model: "auto",
-	maxContextChars: 1000000,
-	defaultPreset: true,
-	prompt: "",
-};
+// Two default screenpipe-cloud presets on first install:
+// - "Chat":  Claude Opus 4.7 if the user is pro, Claude Sonnet 4.5 otherwise.
+//           Opus is gated in the ai-gateway (subscribed tier), so pushing
+//           it to non-pro users would 403 their first message.
+// - "Pipes": Claude Haiku 4.5 — cheap/fast for recurring pipe runs.
+//           Pipes default to this preset; users can override per-pipe.
+const CHAT_PRESET_ID = "chat";
+const PIPES_PRESET_ID = "pipes";
 
-// Legacy presets removed — screenpipe-cloud is the only default now
+export function makeDefaultPresets(isPro: boolean): AIPreset[] {
+	return [
+		{
+			id: CHAT_PRESET_ID,
+			provider: "screenpipe-cloud",
+			url: "",
+			model: isPro ? "claude-opus-4-7" : "claude-sonnet-4-5",
+			maxContextChars: 200000,
+			defaultPreset: true,
+			prompt: "",
+		},
+		{
+			id: PIPES_PRESET_ID,
+			provider: "screenpipe-cloud",
+			url: "",
+			model: "claude-haiku-4-5",
+			maxContextChars: 200000,
+			defaultPreset: false,
+			prompt: "",
+		},
+	];
+}
+
+// Seed value — module load can't know pro status yet, so fall back to non-pro.
+// ensureDefaultPreset() re-seeds with pro status once settings.user is loaded.
+const DEFAULT_CLOUD_PRESET: AIPreset = makeDefaultPresets(false)[0];
+
 let DEFAULT_SETTINGS: Settings = {
-			aiPresets: [DEFAULT_CLOUD_PRESET as any],
+			aiPresets: makeDefaultPresets(false) as any,
 			deviceId: crypto.randomUUID(),
 			deepgramApiKey: "",
 			isLoading: false,
@@ -344,6 +371,7 @@ let DEFAULT_SETTINGS: Settings = {
 			filterMusic: false,
 			ignoreIncognitoWindows: true,
 			pauseOnDrmContent: false,
+			experimentalCoreaudioSystemAudio: false,
 			recordWhileLocked: false,
 			appendTypedTextToMeetingNotes: true,
 			localRetentionEnabled: true,
@@ -428,7 +456,8 @@ function createSettingsStore() {
 
 		// Migration: Add default presets if user has none
 		if (!settings.aiPresets || settings.aiPresets.length === 0) {
-			settings.aiPresets = [DEFAULT_CLOUD_PRESET as any];
+			const isPro = settings.user?.cloud_subscribed === true;
+			settings.aiPresets = makeDefaultPresets(isPro) as any;
 			needsUpdate = true;
 		}
 
@@ -538,6 +567,37 @@ function createSettingsStore() {
 			settings.audioTranscriptionEngine = "screenpipe-cloud";
 			(settings as any)._cloudEngineApplied = true;
 			needsUpdate = true;
+		}
+
+		// Post-migration: if user becomes pro and the Chat preset is still on the
+		// non-pro fallback (Sonnet), upgrade it to Opus 4.7.
+		// Guards:
+		//   - only touches the preset with id === "chat" (leaves user-created presets alone)
+		//   - only if provider is still screenpipe-cloud and model is exactly the seeded
+		//     Sonnet value (prevents clobbering a manual override like glm-5)
+		//   - _chatOpusAppliedForPro flag prevents re-upgrading after user manually
+		//     switches back to something else
+		if (
+			settings.user?.cloud_subscribed &&
+			!(settings as any)._chatOpusAppliedForPro &&
+			Array.isArray(settings.aiPresets)
+		) {
+			let upgraded = false;
+			settings.aiPresets = settings.aiPresets.map((p: any) => {
+				if (
+					p?.id === "chat" &&
+					p?.provider === "screenpipe-cloud" &&
+					p?.model === "claude-sonnet-4-5"
+				) {
+					upgraded = true;
+					return { ...p, model: "claude-opus-4-7" };
+				}
+				return p;
+			});
+			if (upgraded) {
+				(settings as any)._chatOpusAppliedForPro = true;
+				needsUpdate = true;
+			}
 		}
 
 		// Save migrations if needed
@@ -699,36 +759,42 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 		// eslint-disable-next-line react-hooks/exhaustive-deps
 	}, [isSettingsLoaded, settings.user?.token]);
 
-	// Identify with persistent analyticsId for consistent tracking across frontend/backend
+	// Identify the user in PostHog. When a Clerk-authenticated user is present,
+	// we identify by clerk_id (matches the web's identify call), so PostHog
+	// merges the web profile (carrying UTM/gclid from ad attribution) with the
+	// desktop-app profile. Before switching, alias the machine analyticsId to
+	// the clerk_id so prior anonymous app events also merge forward.
 	useEffect(() => {
-		if (settings.analyticsId) {
-			getVersion()
-				.then((appVersion) => {
-					posthog.identify(settings.analyticsId, {
-						email: settings.user?.email,
-						name: settings.user?.name,
-						user_id: settings.user?.id,
-						github_username: settings.user?.github_username,
-						website: settings.user?.website,
-						contact: settings.user?.contact,
-						cloud_subscribed: !!settings.user?.cloud_subscribed,
-						app_version: appVersion,
-					});
-				})
-				.catch(() => {
-					posthog.identify(settings.analyticsId, {
-						email: settings.user?.email,
-						name: settings.user?.name,
-						user_id: settings.user?.id,
-						github_username: settings.user?.github_username,
-						website: settings.user?.website,
-						contact: settings.user?.contact,
-						cloud_subscribed: !!settings.user?.cloud_subscribed,
-					});
-				});
+		if (!settings.analyticsId) return;
+
+		const clerkId = settings.user?.clerk_id || undefined;
+		const distinctId = clerkId || settings.analyticsId;
+
+		if (clerkId) {
+			try { posthog.alias(clerkId); } catch {}
 		}
+
+		const baseProps = {
+			email: settings.user?.email,
+			name: settings.user?.name,
+			user_id: settings.user?.id,
+			clerk_id: clerkId,
+			github_username: settings.user?.github_username,
+			website: settings.user?.website,
+			contact: settings.user?.contact,
+			cloud_subscribed: !!settings.user?.cloud_subscribed,
+			machine_analytics_id: settings.analyticsId,
+		};
+
+		getVersion()
+			.then((appVersion) => {
+				posthog.identify(distinctId, { ...baseProps, app_version: appVersion });
+			})
+			.catch(() => {
+				posthog.identify(distinctId, baseProps);
+			});
 		// eslint-disable-next-line react-hooks/exhaustive-deps
-	}, [settings.analyticsId, settings.user?.id, settings.user?.cloud_subscribed]);
+	}, [settings.analyticsId, settings.user?.id, settings.user?.clerk_id, settings.user?.cloud_subscribed]);
 
 	// When user becomes a Pro subscriber, default to cloud transcription (one-time)
 	useEffect(() => {
@@ -738,6 +804,40 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 		// Mark migration as done — we no longer force cloud transcription for Pro users.
 		// Local engines (whisper/qwen3) are now the default for all users.
 		settingsStore.set({ _proCloudMigrationDone: true } as any);
+		// eslint-disable-next-line react-hooks/exhaustive-deps
+	}, [settings.user?.cloud_subscribed, isSettingsLoaded]);
+
+	// Upgrade the seeded "chat" preset Sonnet → Opus 4.7 the moment the user
+	// becomes pro (mirrors the on-load migration for same-session transitions).
+	// Guards match the migration: only touch the unmodified seeded chat preset,
+	// never clobber a user override, only fire once.
+	useEffect(() => {
+		if (!isSettingsLoaded) return;
+		if (!settings.user?.cloud_subscribed) return;
+		if ((settings as any)._chatOpusAppliedForPro) return;
+		if (!Array.isArray(settings.aiPresets)) return;
+
+		const idx = settings.aiPresets.findIndex(
+			(p: any) =>
+				p?.id === "chat" &&
+				p?.provider === "screenpipe-cloud" &&
+				p?.model === "claude-sonnet-4-5"
+		);
+		if (idx === -1) {
+			// Nothing to upgrade, but still record the decision so we don't re-check
+			// every render. User either (a) already has Opus, (b) customized, or
+			// (c) deleted the chat preset.
+			settingsStore.set({ _chatOpusAppliedForPro: true } as any);
+			return;
+		}
+
+		const nextPresets = settings.aiPresets.map((p: any, i: number) =>
+			i === idx ? { ...p, model: "claude-opus-4-7" } : p
+		);
+		settingsStore.set({
+			aiPresets: nextPresets,
+			_chatOpusAppliedForPro: true,
+		} as any);
 		// eslint-disable-next-line react-hooks/exhaustive-deps
 	}, [settings.user?.cloud_subscribed, isSettingsLoaded]);
 

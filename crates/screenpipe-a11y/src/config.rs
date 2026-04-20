@@ -295,13 +295,20 @@ mod tests {
 
     #[test]
     fn test_window_exclusion() {
+        // Defaults have no window patterns — password/secret patterns were
+        // removed because of false positives (e.g. password-manager settings,
+        // "Secret Santa Planning", AWS Secrets Manager). Exercise the mechanism
+        // with explicit patterns instead.
         let mut config = UiCaptureConfig::new();
+        config.excluded_window_pattern_strings = vec![
+            r"(?i)enter password".to_string(),
+            r"(?i)secret notes".to_string(),
+        ];
         config.compile_patterns();
 
         assert!(!config.should_capture_window("Enter Password - Chrome"));
         assert!(!config.should_capture_window("Secret Notes - App"));
-        // Note: "Private Browsing" and "Incognito" are now handled by
-        // crate::incognito module, not by config excluded_window_patterns.
+        // "Private Browsing" and "Incognito" are handled by crate::incognito.
         assert!(config.should_capture_window("GitHub - Chrome"));
     }
 

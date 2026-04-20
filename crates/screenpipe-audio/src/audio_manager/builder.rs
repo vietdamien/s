@@ -59,6 +59,10 @@ pub struct AudioManagerOptions {
     /// When true, automatically follow system default audio devices
     /// and switch when the system default changes (e.g., device plug/unplug)
     pub use_system_default_audio: bool,
+    /// Experimental: use CoreAudio Process Tap for System Audio (macOS 14.4+).
+    /// When false (default), System Audio uses ScreenCaptureKit as before.
+    /// Has no effect on non-macOS or macOS <14.4 — falls back to SCK.
+    pub experimental_coreaudio_system_audio: bool,
     /// Controls when local Whisper transcription runs.
     /// `Realtime` = immediate (default), `Batch` = accumulate longer chunks for quality.
     pub transcription_mode: TranscriptionMode,
@@ -98,6 +102,7 @@ impl Default for AudioManagerOptions {
             use_pii_removal: false,
             filter_music: false,
             use_system_default_audio: true,
+            experimental_coreaudio_system_audio: false,
             transcription_mode: TranscriptionMode::default(),
             meeting_detector: None,
             vocabulary: vec![],
@@ -183,6 +188,11 @@ impl AudioManagerBuilder {
 
     pub fn filter_music(mut self, filter_music: bool) -> Self {
         self.options.filter_music = filter_music;
+        self
+    }
+
+    pub fn experimental_coreaudio_system_audio(mut self, enabled: bool) -> Self {
+        self.options.experimental_coreaudio_system_audio = enabled;
         self
     }
 

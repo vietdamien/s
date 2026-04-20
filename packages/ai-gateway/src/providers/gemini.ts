@@ -98,10 +98,18 @@ export class GeminiProvider implements AIProvider {
 			'gemini-3-flash': 'gemini-3-flash-preview',
 			'gemini-3-pro': 'gemini-3.1-pro-preview',
 			'gemini-3.1-pro': 'gemini-3.1-pro-preview',
+			'gemini-3.1-flash-lite': 'gemini-3.1-flash-lite-preview',
 		};
 		const mapped = modelMap[model] || model;
 		console.log('[Gemini] Model mapping:', model, '->', mapped);
 		return mapped;
+	}
+
+	// Gemini 3 preview models are only available on Vertex's global endpoint,
+	// not regional ones. Regional requests return 404 "model not found".
+	// See: https://docs.cloud.google.com/vertex-ai/generative-ai/docs/models/gemini/3-flash
+	private requiresGlobalEndpoint(geminiModel: string): boolean {
+		return geminiModel.startsWith('gemini-3-') || geminiModel.startsWith('gemini-3.');
 	}
 
 	private getEndpointUrl(model: string, streaming: boolean = false): string {
@@ -109,9 +117,14 @@ export class GeminiProvider implements AIProvider {
 		const method = streaming ? 'streamGenerateContent' : 'generateContent';
 
 		if (this.vertexConfig) {
-			const region = this.vertexConfig.region || 'us-central1';
+			const region = this.requiresGlobalEndpoint(geminiModel)
+				? 'global'
+				: this.vertexConfig.region || 'us-central1';
+			const hostname = region === 'global'
+				? 'aiplatform.googleapis.com'
+				: `${region}-aiplatform.googleapis.com`;
 			const streamParam = streaming ? '?alt=sse' : '';
-			return `https://${region}-aiplatform.googleapis.com/v1/projects/${this.vertexConfig.projectId}/locations/${region}/publishers/google/models/${geminiModel}:${method}${streamParam}`;
+			return `https://${hostname}/v1/projects/${this.vertexConfig.projectId}/locations/${region}/publishers/google/models/${geminiModel}:${method}${streamParam}`;
 		}
 
 		const streamParam = streaming ? '&alt=sse' : '';

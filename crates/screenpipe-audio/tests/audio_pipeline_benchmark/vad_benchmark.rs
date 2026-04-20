@@ -450,7 +450,7 @@ async fn vad_silero_integration() {
     println!(" VAD SILERO INTEGRATION TEST");
     println!("{}", "=".repeat(70));
 
-    let mut vad = SileroVad::new().await.expect("failed to init SileroVad");
+    let mut vad = crate::new_test_vad().await;
 
     // Test 1: Silence should not be detected as speech
     let silence = audio_fixtures::silence(1.0);
@@ -665,7 +665,7 @@ async fn chunk_duration_sweep_dataset() {
         println!("  {}", "─".repeat(62));
 
         for &chunk_dur in CHUNK_DURATIONS {
-            let mut vad = SileroVad::new().await.expect("failed to init SileroVad");
+            let mut vad = crate::new_test_vad().await;
 
             // Aggregate across all scenarios and channels
             let mut total_speech_passed = 0usize;
@@ -769,7 +769,7 @@ async fn vad_threshold_sweep_dataset() {
     println!(" VAD THRESHOLD SWEEP — FULL DATASET");
     println!("{}", "=".repeat(70));
 
-    let mut vad = SileroVad::new().await.expect("failed to init SileroVad");
+    let mut vad = crate::new_test_vad().await;
     let mut all_results: Vec<VadSweepResult> = Vec::new();
 
     // Find all scenario directories

@@ -862,15 +862,26 @@ fn resolve_preset(pipes_dir: &Path, preset_id: &str) -> Option<ResolvedPreset> {
     if !store_path.exists() {
         // Bootstrap for CLI users who don't have the app.
         // Default to screenpipe cloud — user needs SCREENPIPE_API_KEY env var.
+        // Mirrors the app's first-install seed (use-settings.tsx makeDefaultPresets):
+        // non-pro Sonnet for chat, Haiku for pipes. Users can swap to Opus 4.7 later.
         let default_store = serde_json::json!({
             "settings": {
-                "aiPresets": [{
-                    "id": "default",
-                    "model": "auto",
-                    "provider": "screenpipe-cloud",
-                    "defaultPreset": true,
-                    "maxContextChars": 200000
-                }]
+                "aiPresets": [
+                    {
+                        "id": "chat",
+                        "model": "claude-sonnet-4-5",
+                        "provider": "screenpipe-cloud",
+                        "defaultPreset": true,
+                        "maxContextChars": 200000
+                    },
+                    {
+                        "id": "pipes",
+                        "model": "claude-haiku-4-5",
+                        "provider": "screenpipe-cloud",
+                        "defaultPreset": false,
+                        "maxContextChars": 200000
+                    }
+                ]
             }
         });
         if let Ok(json) = serde_json::to_string_pretty(&default_store) {
@@ -882,7 +893,7 @@ fn resolve_preset(pipes_dir: &Path, preset_id: &str) -> Option<ResolvedPreset> {
                 let _ =
                     std::fs::set_permissions(&store_path, std::fs::Permissions::from_mode(0o600));
             }
-            info!("created store.bin with default preset (screenpipe cloud)");
+            info!("created store.bin with default presets (chat: sonnet, pipes: haiku)");
         }
     }
 

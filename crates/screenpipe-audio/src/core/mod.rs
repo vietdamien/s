@@ -5,6 +5,8 @@
 pub mod device;
 pub mod device_detection;
 pub mod engine;
+#[cfg(target_os = "macos")]
+pub mod process_tap;
 #[cfg(all(target_os = "linux", feature = "pulseaudio"))]
 pub mod pulse;
 mod run_record_and_transcribe;

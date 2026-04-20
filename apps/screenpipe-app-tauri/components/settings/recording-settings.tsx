@@ -86,6 +86,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { ToastAction } from "@/components/ui/toast";
 import { open as openUrl } from "@tauri-apps/plugin-shell";
 import { listen } from "@tauri-apps/api/event";
+import { invoke } from "@tauri-apps/api/core";
 import { Dialog, DialogContent, DialogTitle, DialogDescription } from "@/components/ui/dialog";
 import { Progress } from "@/components/ui/progress";
 import { Card, CardContent } from "@/components/ui/card";
@@ -500,6 +501,18 @@ export function RecordingSettings() {
   const [availableAudioDevices, setAvailableAudioDevices] = useState<
     AudioDeviceInfo[]
   >([]);
+
+  // Gate for the experimental CoreAudio Process Tap toggle — we only show
+  // the switch on macOS 14.4+ where the API exists. Probed once via a
+  // Tauri command that proxies to
+  // `screenpipe_audio::core::process_tap::is_process_tap_available()`.
+  const [coreaudioTapAvailable, setCoreaudioTapAvailable] = useState<boolean | null>(null);
+  useEffect(() => {
+    invoke<boolean>("check_coreaudio_process_tap_available")
+      .then(setCoreaudioTapAvailable)
+      .catch(() => setCoreaudioTapAvailable(false));
+  }, []);
+
   const { toast } = useToast();
   const [isUpdating, setIsUpdating] = useState(false);
   const { health } = useHealthCheck();
@@ -1592,6 +1605,32 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                 id="useSystemDefaultAudio"
                 checked={settings.useSystemDefaultAudio ?? true}
                 onCheckedChange={(checked) => handleSettingsChange({ useSystemDefaultAudio: checked }, true)}
+              />
+            </div>
+          </CardContent>
+        </Card>
+        )}
+
+        {/* Experimental: CoreAudio System Audio (macOS 14.4+ only) */}
+        {!settings.disableAudio && coreaudioTapAvailable && (
+        <Card className="border-border bg-card">
+          <CardContent className="px-3 py-2.5">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center space-x-2.5">
+                <Monitor className="h-4 w-4 text-muted-foreground shrink-0" />
+                <div>
+                  <h3 className="text-sm font-medium text-foreground">
+                    Experimental: CoreAudio System Audio
+                  </h3>
+                  <p className="text-xs text-muted-foreground">
+                    Use the CoreAudio Process Tap API (macOS 14.4+) for System Audio. Avoids ScreenCaptureKit — lighter permission, no GPU wake, survives sleep/wake. Restart recording after changing.
+                  </p>
+                </div>
+              </div>
+              <Switch
+                id="experimentalCoreaudioSystemAudio"
+                checked={Boolean(settings.experimentalCoreaudioSystemAudio ?? false)}
+                onCheckedChange={(checked) => handleSettingsChange({ experimentalCoreaudioSystemAudio: checked }, true)}
               />
             </div>
           </CardContent>

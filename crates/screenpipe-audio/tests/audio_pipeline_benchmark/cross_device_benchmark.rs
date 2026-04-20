@@ -119,7 +119,7 @@ fn analyze_cross_device(
 async fn cross_device_coverage_synthetic() {
     println!("\n--- Cross-Device Coverage: Synthetic ---");
 
-    let mut vad = SileroVad::new().await.expect("failed to init SileroVad");
+    let mut vad = crate::new_test_vad().await;
     let duration = 120.0; // 2 minutes
 
     // Mic track: local speaker (clear) + silence during remote speech
@@ -214,7 +214,7 @@ async fn cross_device_coverage_dataset() {
 
     println!("\n--- Cross-Device Coverage: Full Dataset ---");
 
-    let mut vad = SileroVad::new().await.expect("failed to init SileroVad");
+    let mut vad = crate::new_test_vad().await;
     let mut results_current = Vec::new();
     let mut results_proposed = Vec::new();
 

@@ -269,6 +269,12 @@ pub struct RecordArgs {
     #[arg(long, default_value_t = true)]
     pub use_system_default_audio: bool,
 
+    /// [experimental, macOS 14.4+] Capture System Audio via CoreAudio Process
+    /// Tap instead of ScreenCaptureKit. Off by default; ignored on older macOS
+    /// and non-macOS.
+    #[arg(long, default_value_t = false)]
+    pub experimental_coreaudio_system_audio: bool,
+
     /// Data directory. Default to $HOME/.screenpipe
     #[arg(long, value_hint = ValueHint::DirPath)]
     pub data_dir: Option<String>,
@@ -357,7 +363,10 @@ pub struct RecordArgs {
     #[arg(long)]
     pub sync_machine_id: Option<String>,
 
-    /// Pause screen and audio capture when DRM content (Netflix, Disney+, etc.) is detected
+    /// Pause screen and audio capture when a DRM-protected streaming app
+    /// (Netflix, Disney+, etc.) or a remote-desktop client (Omnissa/VMware
+    /// Horizon) is focused — these blank their windows while any app is
+    /// recording the screen.
     #[arg(long, default_value_t = false)]
     pub pause_on_drm_content: bool,
 
@@ -426,6 +435,7 @@ impl RecordArgs {
             transcription_mode: mode_str.to_string(),
             audio_devices: self.audio_device.clone(),
             use_system_default_audio: self.use_system_default_audio,
+            experimental_coreaudio_system_audio: self.experimental_coreaudio_system_audio,
             monitor_ids: self.monitor_id.iter().map(|id| id.to_string()).collect(),
             use_all_monitors: self.use_all_monitors,
             ignored_windows: self.ignored_windows.clone(),
@@ -523,46 +533,14 @@ impl RecordArgs {
             crate::recording_config::RecordingConfig::from_settings(&settings, data_dir, None);
         config.api_auth = self.api_auth;
         if config.api_auth {
-            // Priority: env var > settings > secret store > auth.json (legacy) > auto-generate
-            config.api_auth_key = std::env::var("SCREENPIPE_API_KEY").ok().or_else(|| {
-                let key = settings.api_key.as_str();
-                if key.is_empty() {
-                    None
-                } else {
-                    Some(key.to_string())
-                }
-            });
-
-            // Try secret store
-            if config.api_auth_key.is_none() {
-                if let Ok(store) = auth::open_secret_store().await {
-                    if let Ok(Some(bytes)) = store.get("api_auth_key").await {
-                        config.api_auth_key =
-                            String::from_utf8(bytes).ok().filter(|s| !s.is_empty());
-                    }
-                }
-            }
-
-            // Legacy fallback: auth.json (for users upgrading from older versions)
-            if config.api_auth_key.is_none() {
-                config.api_auth_key = dirs::home_dir().and_then(|home| {
-                    let content =
-                        std::fs::read_to_string(home.join(".screenpipe/auth.json")).ok()?;
-                    let json: serde_json::Value = serde_json::from_str(&content).ok()?;
-                    json["token"].as_str().map(|s| s.to_string())
-                });
-            }
-
-            // Auto-generate if none found — persist to secret store
-            if config.api_auth_key.is_none() {
-                let key = format!("sp-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
-                if let Ok(store) = auth::open_secret_store().await {
-                    let _ = store.set("api_auth_key", key.as_bytes()).await;
-                }
-                tracing::info!("api auth enabled — auto-generated key");
-                config.api_auth_key = Some(key);
+            let settings_key = if settings.api_key.is_empty() {
+                None
             } else {
-                tracing::info!("api auth enabled — key loaded");
+                Some(settings.api_key.as_str())
+            };
+            match crate::auth_key::resolve_api_auth_key(&config.data_dir, settings_key).await {
+                Ok(key) => config.api_auth_key = Some(key),
+                Err(e) => tracing::error!("failed to resolve api auth key: {}", e),
             }
         }
 

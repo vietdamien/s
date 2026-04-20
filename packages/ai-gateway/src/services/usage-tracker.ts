@@ -125,6 +125,7 @@ const MODEL_WEIGHTS: Record<string, number> = {
   'gemini-3.1-pro': 3,
   'gemini-2.5-pro': 3,
   'gemini-3-flash': 0,
+  'gemini-3.1-flash-lite': 0,
   'gemini-2.5-flash': 0,
   // OpenRouter models
   'qwen3.5-flash': 0,
@@ -163,6 +164,7 @@ const DEFAULT_TIER_CONFIG: Record<UserTier, TierLimits> = {
       'auto',
       'claude-haiku-4-5',
       'gemini-3-flash',
+      'gemini-3.1-flash-lite',
       'glm-4.7',
       'glm-5',
       'kimi-k2.5',
@@ -179,6 +181,7 @@ const DEFAULT_TIER_CONFIG: Record<UserTier, TierLimits> = {
       'claude-haiku-4-5',
       'claude-sonnet-4-5',
       'gemini-3-flash',
+      'gemini-3.1-flash-lite',
       'gemini-3-pro',
       'gemini-3.1-pro',
       'glm-4.7',

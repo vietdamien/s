@@ -44,8 +44,9 @@ async function fetchWithRetry(url: string, init: RequestInit, label: string): Pr
 const VERTEX_MAAS_MODELS: Record<string, { vertexId: string; region: string }> = {
 	'glm-4.7': { vertexId: 'zai-org/glm-4.7-maas', region: 'global' },
 	'glm-5': { vertexId: 'zai-org/glm-5-maas', region: 'global' },
-	'glm-5.1': { vertexId: 'zai-org/glm-5.1-maas', region: 'global' },
-	'minimax-m2.7': { vertexId: 'minimax/minimax-m2-maas', region: 'global' },
+	// 'glm-5.1' and 'minimax-m2.7' removed 2026-04-17 — Vertex returns
+	// 404 "Publisher Model not found" for their configured IDs. Re-add
+	// once we verify the real publisher/model path via Model Garden.
 	'kimi-k2.5': { vertexId: 'moonshotai/kimi-k2-thinking-maas', region: 'global' },
 	'llama-4-maverick': { vertexId: 'meta/llama-4-maverick-17b-128e-instruct-maas', region: 'us-east5' },
 	'llama-4-scout': { vertexId: 'meta/llama-4-scout-17b-16e-instruct-maas', region: 'us-east5' },
@@ -209,8 +210,7 @@ export class VertexMaasProvider implements AIProvider {
 		return [
 			{ id: 'glm-4.7', name: 'GLM-4.7 (best coding, 200K ctx)', provider: 'vertex-maas' },
 			{ id: 'glm-5', name: 'GLM-5 (reasoning, 745B)', provider: 'vertex-maas' },
-			{ id: 'glm-5.1', name: 'GLM-5.1 (#1 open-source coding, 754B MoE)', provider: 'vertex-maas' },
-			{ id: 'minimax-m2.7', name: 'MiniMax M2.7 (near-Opus quality, 230B MoE)', provider: 'vertex-maas' },
+			// glm-5.1 and minimax-m2.7 hidden 2026-04-17 — Vertex 404 on their IDs.
 			{ id: 'kimi-k2.5', name: 'Kimi K2.5 (strong all-rounder)', provider: 'vertex-maas' },
 			{ id: 'llama-4-maverick', name: 'Llama 4 Maverick (vision, 400B MoE)', provider: 'vertex-maas' },
 			{ id: 'llama-4-scout', name: 'Llama 4 Scout (vision, 109B MoE)', provider: 'vertex-maas' },

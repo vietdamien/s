@@ -164,6 +164,55 @@ pub struct DatabaseManager {
     write_queue: crate::write_queue::WriteQueue,
 }
 
+/// One level-0 OCR element row, buffered for bulk insertion.
+struct Level0Row<'a> {
+    text: &'a str,
+    left: Option<f64>,
+    top: Option<f64>,
+    width: Option<f64>,
+    height: Option<f64>,
+    confidence: Option<f64>,
+    sort_order: i32,
+}
+
+/// Bulk-insert a batch of level-0 OCR elements (no hierarchy, parent_id = NULL).
+/// One INSERT statement with `chunk.len()` VALUES rows replaces N round-trips
+/// through `RETURNING id`. Used by the level-0 fast path in
+/// `DatabaseManager::insert_ocr_elements`.
+async fn flush_level0_bulk(
+    tx: &mut sqlx::pool::PoolConnection<Sqlite>,
+    frame_id: i64,
+    chunk: &[Level0Row<'_>],
+) -> Result<(), sqlx::Error> {
+    if chunk.is_empty() {
+        return Ok(());
+    }
+    let mut sql = String::with_capacity(200 + chunk.len() * 40);
+    sql.push_str(
+        "INSERT INTO elements (frame_id, source, role, text, parent_id, depth, left_bound, top_bound, width_bound, height_bound, confidence, sort_order) VALUES ",
+    );
+    for i in 0..chunk.len() {
+        if i > 0 {
+            sql.push(',');
+        }
+        sql.push_str("(?,'ocr','block',?,NULL,0,?,?,?,?,?,?)");
+    }
+    let mut q = sqlx::query(&sql);
+    for row in chunk {
+        q = q
+            .bind(frame_id)
+            .bind(row.text)
+            .bind(row.left)
+            .bind(row.top)
+            .bind(row.width)
+            .bind(row.height)
+            .bind(row.confidence)
+            .bind(row.sort_order);
+    }
+    q.execute(&mut **tx).await?;
+    Ok(())
+}
+
 impl DatabaseManager {
     pub async fn new(database_path: &str, config: DbConfig) -> Result<Self, sqlx::Error> {
         debug!(
@@ -1765,6 +1814,11 @@ impl DatabaseManager {
     /// `elements` table. Builds a page→block→paragraph→line→word hierarchy using
     /// `RETURNING id` to chain parent IDs within the same transaction.
     ///
+    /// Level-0 blocks (Apple Native OCR — the default macOS path) have no hierarchy,
+    /// so they are accumulated and bulk-inserted in chunks via multi-row VALUES.
+    /// Hierarchical levels (Tesseract: 1-5) still go through per-row `RETURNING id`
+    /// because each row's id may become the parent of a later row.
+    ///
     /// Errors are logged and swallowed so that the primary OCR insert path is never
     /// blocked by a failure in the new elements table.
     pub(crate) async fn insert_ocr_elements(
@@ -1783,8 +1837,16 @@ impl DatabaseManager {
             return;
         }
 
+        // 12 params per row × 80 rows = 960 params, well below SQLite's
+        // default SQLITE_LIMIT_VARIABLE_NUMBER (999 on older builds, 32766 on
+        // newer). Larger flushes save round-trips on the hot path.
+        const BULK_CHUNK: usize = 80;
+
+        // Buffer of ready-to-insert level-0 rows. Flushed when full or when
+        // we encounter a hierarchical block that needs RETURNING.
+        let mut buf: Vec<Level0Row<'_>> = Vec::with_capacity(BULK_CHUNK);
+
         // Track hierarchy: (page, block, par, line) → element_id
-        // We use a BTreeMap so keys are ordered.
         let mut page_ids: BTreeMap<i64, i64> = BTreeMap::new();
         let mut block_ids: BTreeMap<(i64, i64), i64> = BTreeMap::new();
         let mut par_ids: BTreeMap<(i64, i64, i64), i64> = BTreeMap::new();
@@ -1804,16 +1866,49 @@ impl DatabaseManager {
             let height: Option<f64> = block.height.parse().ok();
             let conf: Option<f64> = block.conf.parse().ok();
 
-            let (role, text, parent_id, depth, confidence) = match level {
-                // Level 0: flat text blocks from Apple Native OCR (no hierarchy).
-                // Each block is a standalone text element (like a line/word).
-                0 => {
-                    let text_val = block.text.as_str();
-                    if text_val.trim().is_empty() {
-                        continue;
-                    }
-                    ("block", Some(text_val), None::<i64>, 0i32, conf)
+            // Fast path for level 0 (Apple Native, vast majority of Mac frames).
+            if level == 0 {
+                let text_val = block.text.as_str();
+                if text_val.trim().is_empty() {
+                    continue;
                 }
+                buf.push(Level0Row {
+                    text: text_val,
+                    left,
+                    top,
+                    width,
+                    height,
+                    confidence: conf,
+                    sort_order,
+                });
+                sort_order += 1;
+                if buf.len() >= BULK_CHUNK {
+                    if let Err(e) = flush_level0_bulk(tx, frame_id, &buf).await {
+                        debug!(
+                            "elements: OCR bulk insert failed for frame {}: {}",
+                            frame_id, e
+                        );
+                        return;
+                    }
+                    buf.clear();
+                }
+                continue;
+            }
+
+            // Hierarchical levels (Tesseract). Flush any pending level-0 rows
+            // first so sort_order interleaves correctly.
+            if !buf.is_empty() {
+                if let Err(e) = flush_level0_bulk(tx, frame_id, &buf).await {
+                    debug!(
+                        "elements: OCR bulk insert failed for frame {}: {}",
+                        frame_id, e
+                    );
+                    return;
+                }
+                buf.clear();
+            }
+
+            let (role, text, parent_id, depth, confidence) = match level {
                 1 => {
                     if page_ids.contains_key(&page_num) {
                         continue;
@@ -1894,6 +1989,16 @@ impl DatabaseManager {
                     debug!("elements: OCR insert failed for frame {}: {}", frame_id, e);
                     return;
                 }
+            }
+        }
+
+        // Flush any remaining buffered level-0 rows.
+        if !buf.is_empty() {
+            if let Err(e) = flush_level0_bulk(tx, frame_id, &buf).await {
+                debug!(
+                    "elements: OCR bulk insert failed for frame {}: {}",
+                    frame_id, e
+                );
             }
         }
     }

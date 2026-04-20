@@ -116,6 +116,10 @@ pub struct PiExecutor {
     pub user_token: Option<String>,
     /// Screenpipe API base URL (default: `https://api.screenpi.pe/v1`).
     pub api_url: String,
+    /// Bearer token for the *local* screenpipe-server API (localhost:3030).
+    /// Exposed to the Pi subprocess as `SCREENPIPE_API_AUTH_KEY` so bash tool
+    /// calls against the local server can authenticate. None = auth disabled.
+    pub api_auth_key: Option<String>,
 }
 
 impl PiExecutor {
@@ -123,7 +127,15 @@ impl PiExecutor {
         Self {
             user_token,
             api_url: SCREENPIPE_API_URL.to_string(),
+            api_auth_key: None,
         }
+    }
+
+    /// Attach the local server's api_auth_key so Pi's bash tool can include
+    /// `Authorization: Bearer ...` on localhost:3030 calls.
+    pub fn with_api_auth_key(mut self, key: Option<String>) -> Self {
+        self.api_auth_key = key.filter(|k| !k.is_empty());
+        self
     }
 
     /// Ensure screenpipe skills exist in `project_dir/.pi/skills/`.
@@ -631,6 +643,12 @@ impl PiExecutor {
             }
         }
 
+        // Local server bearer token — kept separate from cloud keys so it
+        // flows even in offline mode (the local server is always localhost).
+        if let Some(ref key) = self.api_auth_key {
+            cmd.env("SCREENPIPE_API_AUTH_KEY", key);
+        }
+
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
 
@@ -741,6 +759,11 @@ impl PiExecutor {
                     }
                 }
             }
+        }
+
+        // Local server bearer token — unaffected by offline mode.
+        if let Some(ref key) = self.api_auth_key {
+            cmd.env("SCREENPIPE_API_AUTH_KEY", key);
         }
 
         cmd.stdout(std::process::Stdio::piped());
@@ -1851,8 +1874,8 @@ mod tests {
         assert_eq!(lines[1], "OK");
     }
 
-    #[test]
-    fn test_ensure_pi_config_adds_ollama_provider() {
+    #[tokio::test]
+    async fn test_ensure_pi_config_adds_ollama_provider() {
         // Call ensure_pi_config with ollama provider info
         PiExecutor::ensure_pi_config(
             None,
@@ -1861,6 +1884,7 @@ mod tests {
             Some("qwen3:8b"),
             Some("http://localhost:11434/v1"),
         )
+        .await
         .expect("ensure_pi_config should succeed");
 
         // Read models.json and verify ollama provider was added

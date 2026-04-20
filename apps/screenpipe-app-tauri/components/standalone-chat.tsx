@@ -169,6 +169,9 @@ TOOL SELECTION (use the right tool for the job):
 - "what was on screen", "what was I reading/looking at" → search with content_type: "all" or "accessibility"
 - Broad overview ("what was I doing?") → activity-summary FIRST. The windows field shows exactly what the user was working on (window titles, URLs, time per tab). Usually sufficient without further searches.
 
+LOCAL SERVER AUTH:
+The local screenpipe server (localhost:3030) requires a bearer token. It is exposed to you as the env var SCREENPIPE_API_AUTH_KEY. EVERY curl against localhost:3030 MUST include the header: -H "Authorization: Bearer $SCREENPIPE_API_AUTH_KEY". Do NOT ask the user for an API key — you already have it. If a call returns 401, the env var may be empty (auth disabled on this install) — retry without the header.
+
 CRITICAL SEARCH RULES (database has 600k+ entries):
 1. ALWAYS include start_time in EVERY search - NEVER search without a time range
 2. Default time range: last 1-2 hours. Expand ONLY if no results found
@@ -282,13 +285,11 @@ function GridDissolveLoader({
   label,
   toolName,
   thinkingSecs,
-  tokenCount,
 }: {
   phase?: LoaderPhase;
   label?: string;
   toolName?: string;
   thinkingSecs?: number;
-  tokenCount?: number;
 }) {
   const ROWS = 3;
   const COLS = 5;
@@ -338,12 +339,6 @@ function GridDissolveLoader({
     "analyzing..."
   );
 
-  const tokenLabel = tokenCount != null && tokenCount > 0
-    ? tokenCount >= 1000
-      ? `${(tokenCount / 1000).toFixed(1)}k tokens`
-      : `${tokenCount} tokens`
-    : null;
-
   return (
     <div className="flex items-center gap-2">
       <div
@@ -370,7 +365,7 @@ function GridDissolveLoader({
         ))}
       </div>
       <span className="text-[11px] font-mono text-muted-foreground tracking-wide">
-        {displayLabel}{tokenLabel && <span className="ml-1.5 opacity-60">· {tokenLabel}</span>}
+        {displayLabel}
       </span>
     </div>
   );
@@ -1354,8 +1349,77 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
         setTimeout(() => emit("chat-prefill", data), 500);
       } catch {}
     }
+    // Clean up stale pipe-generation markers (>30 min old) so they don't
+    // leak into a future unrelated chat session.
+    try {
+      const raw = sessionStorage.getItem("pipeGenerationContext");
+      if (raw) {
+        const ctx = JSON.parse(raw);
+        if (!ctx?.started_at || Date.now() - ctx.started_at > 30 * 60 * 1000) {
+          sessionStorage.removeItem("pipeGenerationContext");
+          if (ctx?.generation_id) {
+            posthog.capture("pipe_generation_abandoned", {
+              generation_id: ctx.generation_id,
+              age_ms: Date.now() - (ctx.started_at ?? Date.now()),
+            });
+          }
+        }
+      }
+    } catch {}
     return () => { unlisten.then((fn) => fn()); };
   }, []);
+
+  // Pipe-generation funnel completion detector.
+  // Fires `pipe_generation_completed` the first time Pi's message stream
+  // ends (isLoading: true → false) AFTER we see a new pipe installed
+  // compared to the baseline captured when the user submitted the
+  // "describe a pipe to create" form. Single-shot per generation_id.
+  const prevIsLoadingRef = useRef(isLoading);
+  useEffect(() => {
+    const wasLoading = prevIsLoadingRef.current;
+    prevIsLoadingRef.current = isLoading;
+    if (!wasLoading || isLoading) return; // only fire on true → false edge
+
+    let cancelled = false;
+    (async () => {
+      let ctx: { generation_id: string; started_at: number; baseline_pipes: string[] } | null = null;
+      try {
+        const raw = sessionStorage.getItem("pipeGenerationContext");
+        if (!raw) return;
+        ctx = JSON.parse(raw);
+      } catch {
+        return;
+      }
+      if (!ctx?.generation_id) return;
+
+      try {
+        const res = await localFetch("/pipes");
+        if (!res.ok) return;
+        const data = await res.json();
+        if (cancelled) return;
+        const installedNames: string[] = (data?.data ?? [])
+          .map((p: any) => p?.config?.name ?? p?.name)
+          .filter((n: unknown): n is string => typeof n === "string");
+        const baseline = new Set(ctx.baseline_pipes ?? []);
+        const newPipes = installedNames.filter((n) => !baseline.has(n));
+        if (newPipes.length === 0) return;
+
+        posthog.capture("pipe_generation_completed", {
+          generation_id: ctx.generation_id,
+          pipe_name: newPipes[0],
+          new_pipes_count: newPipes.length,
+          duration_ms: Date.now() - ctx.started_at,
+        });
+        sessionStorage.removeItem("pipeGenerationContext");
+      } catch {
+        // Leave context in place — maybe the next assistant turn installs the pipe.
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [isLoading]);
 
   // Guard against duplicate chat-prefill processing. The listener below
   // re-subscribes when piInfo changes; during the brief overlap window
@@ -3132,13 +3196,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
         >
           <History size={14} />
         </Button>
-        <div className="relative z-10 p-1.5 rounded-lg bg-foreground/5 border border-border/50">
-          <PipeAIIcon size={18} animated={false} className="text-foreground" />
-        </div>
-        <div className="flex-1">
-          <h2 className="font-semibold text-sm tracking-tight">Pipe AI</h2>
-          <p className="text-[10px] text-muted-foreground font-mono uppercase tracking-wider">Screen Activity Assistant</p>
-        </div>
+        <div className="flex-1" />
         <Button
           variant="default"
           size="sm"
@@ -3464,25 +3522,6 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
                       <RefreshCw className="h-3 w-3" />
                     </button>
                   )}
-                  {message.role === "assistant" && !message.content.includes("used all your free queries") && !message.content.startsWith("Error") && message.content !== "Processing..." && (
-                    <button
-                      onClick={() => {
-                        // Find the user message that triggered this response
-                        const msgIndex = messages.findIndex((m) => m.id === message.id);
-                        const userMsg = messages.slice(0, msgIndex).reverse().find((m) => m.role === "user");
-                        if (userMsg) {
-                          setScheduleDialogMessage({
-                            prompt: userMsg.content,
-                            response: message.content,
-                          });
-                        }
-                      }}
-                      className="p-1 rounded-md hover:bg-muted text-muted-foreground hover:text-foreground"
-                      title="Run on schedule"
-                    >
-                      <Clock className="h-3 w-3" />
-                    </button>
-                  )}
                   {message.role === "assistant" && (
                     <Popover
                       open={openMessageMenuId === message.id}
@@ -3500,6 +3539,30 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
                         <div className="text-xs text-muted-foreground px-2 py-1 mb-1">
                           {new Date(message.timestamp).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}
                         </div>
+                        {!message.content.includes("used all your free queries") &&
+                          !message.content.startsWith("Error") &&
+                          message.content !== "Processing..." && (
+                          <button
+                            onClick={() => {
+                              setOpenMessageMenuId(null);
+                              const msgIndex = messages.findIndex((m) => m.id === message.id);
+                              const userMsg = messages
+                                .slice(0, msgIndex)
+                                .reverse()
+                                .find((m) => m.role === "user");
+                              if (userMsg) {
+                                setScheduleDialogMessage({
+                                  prompt: userMsg.content,
+                                  response: message.content,
+                                });
+                              }
+                            }}
+                            className="w-full flex items-center gap-2 px-2 py-1.5 text-sm rounded-md hover:bg-muted text-left"
+                          >
+                            <Clock className="h-3.5 w-3.5 shrink-0" />
+                            Run on schedule
+                          </button>
+                        )}
                         <button
                           onClick={() => {
                             setOpenMessageMenuId(null);
@@ -3556,7 +3619,6 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
                   phase={loaderPhase}
                   toolName={toolName}
                   thinkingSecs={thinkingSecs}
-                  tokenCount={Math.round(streamedCharCount / 4)}
                 />
               </motion.div>
             );

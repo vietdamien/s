@@ -793,6 +793,11 @@ async fn execute_single_write(
 
             // Insert OCR text in same transaction (always — needed for search)
             // Element inserts are deferred to a separate transaction (see caller).
+            // Duplicate app_name/window_name/focused from the frame onto the OCR
+            // row so queries like `SELECT ... FROM ocr_text WHERE app_name='Obsidian'`
+            // actually return results. Without these binds the columns fall back
+            // to their schema defaults ('' / NULL / false), making OCR data
+            // effectively untagged even though the parent frame has the metadata.
             if let (Some(text), Some(text_json), Some(engine)) = (
                 ocr_text.as_deref(),
                 ocr_text_json.as_deref(),
@@ -800,13 +805,16 @@ async fn execute_single_write(
             ) {
                 let text_length = text.len() as i64;
                 sqlx::query(
-                    "INSERT INTO ocr_text (frame_id, text, text_json, ocr_engine, text_length) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    "INSERT INTO ocr_text (frame_id, text, text_json, ocr_engine, text_length, app_name, window_name, focused) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 )
                 .bind(id)
                 .bind(text)
                 .bind(text_json)
                 .bind(engine)
                 .bind(text_length)
+                .bind(app_name.as_deref().unwrap_or(""))
+                .bind(window_name.as_deref())
+                .bind(focused)
                 .execute(&mut **conn)
                 .await?;
             }
@@ -1198,16 +1206,20 @@ async fn execute_single_write(
                 .await?
                 .last_insert_rowid();
 
-                // Insert OCR text
+                // Insert OCR text — duplicate app/window/focused from frame so
+                // OCR rows are filterable (see handler above for rationale).
                 let text_length = window.text.len() as i64;
                 sqlx::query(
-                    "INSERT INTO ocr_text (frame_id, text, text_json, ocr_engine, text_length) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    "INSERT INTO ocr_text (frame_id, text, text_json, ocr_engine, text_length, app_name, window_name, focused) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 )
                 .bind(frame_id)
                 .bind(&window.text)
                 .bind(&window.text_json)
                 .bind(ocr_engine_str.as_str())
                 .bind(text_length)
+                .bind(window.app_name.as_deref().unwrap_or(""))
+                .bind(window.window_name.as_deref())
+                .bind(window.focused)
                 .execute(&mut **conn)
                 .await?;
 

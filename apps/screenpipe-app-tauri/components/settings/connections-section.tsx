@@ -16,13 +16,13 @@ import { useSettings, getStore } from "@/lib/hooks/use-settings";
 import { ensureChatGptPreset } from "@/lib/utils/chatgpt-preset";
 import { showChatWithPrefill } from "@/lib/chat-utils";
 import { Command } from "@tauri-apps/plugin-shell";
-import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { message } from "@tauri-apps/plugin-dialog";
 import { localFetch } from "@/lib/api";
-import { writeFile, readTextFile } from "@tauri-apps/plugin-fs";
+import { writeFile, readTextFile, mkdir } from "@tauri-apps/plugin-fs";
 import { fetch as tauriFetch } from "@tauri-apps/plugin-http";
 import { platform } from "@tauri-apps/plugin-os";
-import { join, homeDir, tempDir } from "@tauri-apps/api/path";
+import { join, homeDir, tempDir, dirname } from "@tauri-apps/api/path";
 import { AppleIntelligenceCard } from "./apple-intelligence-card";
 import { CalendarCard } from "./calendar-card";
 import { GoogleCalendarCard } from "./google-calendar-card";
@@ -384,44 +384,61 @@ function Tile({ tile, selected, onClick }: {
 // Expanded panels for each connection type
 // ---------------------------------------------------------------------------
 
-function ClaudePanel({ onConnected }: { onConnected?: () => void }) {
-  const [downloadState, setDownloadState] = useState<"idle" | "downloading" | "downloaded">("idle");
-  const [versionInfo, setVersionInfo] = useState<McpVersionInfo>({ available: null, installed: null });
-  const [mcpbPath, setMcpbPath] = useState<string>("");
+async function uninstallClaudeMcp(): Promise<void> {
+  const configPath = await getClaudeConfigPath();
+  if (!configPath) return;
+  let config: Record<string, unknown> = {};
+  try { config = JSON.parse(await readTextFile(configPath)); } catch { return; }
+  const servers = config.mcpServers as Record<string, unknown> | undefined;
+  if (!servers?.screenpipe) return;
+  delete servers.screenpipe;
+  await writeFile(configPath, new TextEncoder().encode(JSON.stringify(config, null, 2)));
+}
+
+async function uninstallCursorMcp(): Promise<void> {
+  const configPath = await getCursorMcpConfigPath();
+  let config: Record<string, unknown> = {};
+  try { config = JSON.parse(await readTextFile(configPath)); } catch { return; }
+  const servers = config.mcpServers as Record<string, unknown> | undefined;
+  if (!servers?.screenpipe) return;
+  delete servers.screenpipe;
+  await writeFile(configPath, new TextEncoder().encode(JSON.stringify(config, null, 2)));
+}
+
+function ClaudePanel({ onConnected, onDisconnected }: { onConnected?: () => void; onDisconnected?: () => void }) {
+  const [state, setState] = useState<"idle" | "connecting" | "connected">("idle");
 
   useEffect(() => {
-    Promise.all([
-      getLatestMcpRelease().catch(() => null),
-      getInstalledMcpVersion(),
-    ]).then(([release, installed]) => {
-      setVersionInfo({ available: release?.version || null, installed });
-    }).catch(() => {});
-  }, [downloadState]);
+    getInstalledMcpVersion().then(v => { if (v) setState("connected"); }).catch(() => {});
+  }, []);
 
   const handleConnect = async () => {
     try {
-      setDownloadState("downloading");
-      const release = await getLatestMcpRelease();
-      const response = await tauriFetch(release.url, { method: "GET" });
-      if (!response.ok) throw new Error("failed to download .mcpb file");
-      const data = new Uint8Array(await response.arrayBuffer());
-      const tmp = await tempDir();
-      const filePath = await join(tmp, "screenpipe.mcpb");
-      await writeFile(filePath, data);
-      setMcpbPath(filePath);
-      const os = platform();
-      if (os === "macos") await Command.create("open", [filePath]).execute();
-      else if (os === "windows") await Command.create("cmd", ["/c", "start", "", filePath]).execute();
-      setDownloadState("downloaded");
+      setState("connecting");
+      const configPath = await getClaudeConfigPath();
+      if (!configPath) throw new Error("unsupported platform");
+      let config: Record<string, unknown> = {};
+      try { config = JSON.parse(await readTextFile(configPath)); } catch { /* fresh */ }
+      if (!config.mcpServers || typeof config.mcpServers !== "object") config.mcpServers = {};
+      (config.mcpServers as Record<string, unknown>).screenpipe = { command: "npx", args: ["-y", "screenpipe-mcp"] };
+      await mkdir(await dirname(configPath), { recursive: true });
+      await writeFile(configPath, new TextEncoder().encode(JSON.stringify(config, null, 2)));
+      setState("connected");
       onConnected?.();
     } catch (error) {
       console.error("failed to install claude mcp:", error instanceof Error ? error.message : String(error));
       await message(
-        "could not connect to claude desktop.\n\nmake sure claude desktop is installed and has been opened at least once, then try again.\n\ndownload: https://claude.ai/download",
+        "could not write Claude Desktop config.\n\nmake sure claude desktop is installed and has been opened at least once, then try again.\n\ndownload: https://claude.ai/download",
         { title: "claude mcp setup", kind: "error" }
       );
-      setDownloadState("idle");
+      setState("idle");
     }
+  };
+
+  const handleDisconnect = async () => {
+    try { await uninstallClaudeMcp(); } catch (e) { console.warn("claude config remove failed:", e); }
+    setState("idle");
+    onDisconnected?.();
   };
 
   const openClaude = async () => {
@@ -442,40 +459,29 @@ function ClaudePanel({ onConnected }: { onConnected?: () => void }) {
         Search your screen recordings and audio with natural language.
       </p>
       <div className="flex flex-wrap gap-2">
-        <Button onClick={handleConnect} disabled={downloadState === "downloading"} size="sm" className="gap-1.5 h-7 text-xs normal-case font-sans tracking-normal">
-          {downloadState === "downloading" ? (<><Loader2 className="h-3 w-3 animate-spin" />connecting...</>)
-           : downloadState === "downloaded" || versionInfo.installed ? (<><Check className="h-3 w-3" />{downloadState === "downloaded" ? "connected" : "reconnect"}</>)
-           : (<><Download className="h-3 w-3" />connect</>)}
-        </Button>
+        {state === "connected" ? (
+          <Button onClick={handleDisconnect} variant="outline" size="sm" className="gap-1.5 h-7 text-xs normal-case font-sans tracking-normal">
+            <LogOut className="h-3 w-3" />disconnect
+          </Button>
+        ) : (
+          <Button onClick={handleConnect} disabled={state === "connecting"} size="sm" className="gap-1.5 h-7 text-xs normal-case font-sans tracking-normal">
+            {state === "connecting" ? (<><Loader2 className="h-3 w-3 animate-spin" />connecting...</>) : (<><Download className="h-3 w-3" />connect</>)}
+          </Button>
+        )}
         <Button variant="outline" onClick={openClaude} size="sm" className="gap-1.5 h-7 text-xs normal-case font-sans tracking-normal">
           <ExternalLink className="h-3 w-3" />open claude
         </Button>
       </div>
-      {downloadState === "downloaded" && (
-        <div className="p-3 bg-muted border border-border rounded-lg space-y-2">
-          <p className="text-xs"><strong>connected!</strong> restart claude if it was running. try: &quot;what did I do in the last 5 minutes?&quot;</p>
-          <details className="text-xs text-muted-foreground">
-            <summary className="cursor-pointer hover:text-foreground">didn&apos;t work? troubleshooting steps</summary>
-            <ol className="mt-1.5 ml-4 list-decimal space-y-1">
-              <li>
-                open claude desktop → developer → extensions
-              </li>
-              <li>
-                <button className="underline hover:text-foreground" onClick={() => mcpbPath && revealItemInDir(mcpbPath)}>
-                  click here to show the .mcpb file
-                </button>
-                {" "}then drag it into the extensions panel
-              </li>
-              <li>if nothing works, reinstall claude desktop to fix file associations</li>
-            </ol>
-          </details>
-        </div>
+      {state === "connected" && (
+        <p className="text-xs text-muted-foreground">
+          <strong>connected!</strong> restart claude if it was running. try: &quot;what did I do in the last 5 minutes?&quot;
+        </p>
       )}
     </div>
   );
 }
 
-function CursorPanel() {
+function CursorPanel({ onConnected, onDisconnected }: { onConnected?: () => void; onDisconnected?: () => void }) {
   const [state, setState] = useState<"idle" | "installing" | "installed">("idle");
   useEffect(() => { isCursorMcpInstalled().then(ok => { if (ok) setState("installed"); }); }, []);
 
@@ -484,6 +490,7 @@ function CursorPanel() {
       setState("installing");
       await installCursorMcp();
       setState("installed");
+      onConnected?.();
     } catch (error) {
       console.error("failed to install cursor mcp:", error);
       await message(
@@ -493,6 +500,12 @@ function CursorPanel() {
       );
       setState("idle");
     }
+  };
+
+  const handleDisconnect = async () => {
+    try { await uninstallCursorMcp(); } catch (e) { console.warn("cursor config remove failed:", e); }
+    setState("idle");
+    onDisconnected?.();
   };
 
   const openCursor = async () => {
@@ -508,11 +521,15 @@ function CursorPanel() {
     <div className="space-y-3">
       <p className="text-xs text-muted-foreground">Give Cursor access to your screen &amp; audio history via MCP.</p>
       <div className="flex flex-wrap gap-2">
-        <Button onClick={handleConnect} disabled={state === "installing"} size="sm" className="gap-1.5 h-7 text-xs normal-case font-sans tracking-normal">
-          {state === "installing" ? (<><Loader2 className="h-3 w-3 animate-spin" />installing...</>)
-           : state === "installed" ? (<><Check className="h-3 w-3" />connected</>)
-           : (<><Download className="h-3 w-3" />connect</>)}
-        </Button>
+        {state === "installed" ? (
+          <Button onClick={handleDisconnect} variant="outline" size="sm" className="gap-1.5 h-7 text-xs normal-case font-sans tracking-normal">
+            <LogOut className="h-3 w-3" />disconnect
+          </Button>
+        ) : (
+          <Button onClick={handleConnect} disabled={state === "installing"} size="sm" className="gap-1.5 h-7 text-xs normal-case font-sans tracking-normal">
+            {state === "installing" ? (<><Loader2 className="h-3 w-3 animate-spin" />installing...</>) : (<><Download className="h-3 w-3" />connect</>)}
+          </Button>
+        )}
         <Button variant="outline" onClick={openCursor} size="sm" className="gap-1.5 h-7 text-xs normal-case font-sans tracking-normal">
           <ExternalLink className="h-3 w-3" />open cursor
         </Button>
@@ -1424,7 +1441,7 @@ function ApiIntegrationPanel({ integration, onRefresh }: {
 export function ConnectionsSection() {
   const [search, setSearch] = useState("");
   const [selected, setSelected] = useState<string | null>(() => {
-    // Auto-select if navigated from pipes config "setup" link
+    if (typeof window === "undefined") return null;
     const pending = sessionStorage.getItem("openConnection");
     if (pending) {
       sessionStorage.removeItem("openConnection");
@@ -1565,8 +1582,14 @@ export function ConnectionsSection() {
   const renderPanel = () => {
     if (!selected) return null;
     switch (selected) {
-      case "claude": return <ClaudePanel onConnected={() => { localStorage.setItem("screenpipe_claude_connected", "true"); setClaudeInstalled(true); }} />;
-      case "cursor": return <CursorPanel />;
+      case "claude": return <ClaudePanel
+        onConnected={() => { localStorage.setItem("screenpipe_claude_connected", "true"); setClaudeInstalled(true); }}
+        onDisconnected={() => { localStorage.removeItem("screenpipe_claude_connected"); setClaudeInstalled(false); }}
+      />;
+      case "cursor": return <CursorPanel
+        onConnected={() => setCursorInstalled(true)}
+        onDisconnected={() => setCursorInstalled(false)}
+      />;
       case "claude-code": return <ClaudeCodePanel />;
       case "chatgpt": return <ChatGptPanel />;
       case "browser-extension": return <BrowserExtensionPanel connected={browserExtConnected} onRefresh={refreshStatus} />;

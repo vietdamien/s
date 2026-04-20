@@ -4,10 +4,30 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use specta::Type;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use tauri::AppHandle;
 use tauri_plugin_store::StoreBuilder;
 use tracing::error;
+
+/// Process-lifetime cache for the resolved API auth key.
+///
+/// `to_recording_config` is a sync function called many times per second
+/// (frontend polls `local_api_context_from_app`). Resolving the key —
+/// which requires async I/O against `db.sqlite` — happens once in
+/// `recording::spawn_screenpipe` via `screenpipe_engine::auth_key::resolve_api_auth_key`,
+/// and the result is seeded here so every subsequent sync read is cheap and
+/// every caller agrees on the same value.
+static RESOLVED_API_AUTH_KEY: OnceLock<String> = OnceLock::new();
+
+/// Seed the resolved API auth key. No-op after the first call.
+pub fn seed_api_auth_key(key: String) {
+    let _ = RESOLVED_API_AUTH_KEY.set(key);
+}
+
+/// Read the resolved API auth key if it has been seeded.
+pub fn resolved_api_auth_key() -> Option<String> {
+    RESOLVED_API_AUTH_KEY.get().cloned()
+}
 
 /// Magic header for encrypted store.bin files.
 const STORE_MAGIC: &[u8; 8] = b"SPSTORE1";
@@ -241,13 +261,24 @@ pub fn get_store(
     app: &AppHandle,
     _profile_name: Option<String>, // Keep parameter for API compatibility but ignore it
 ) -> anyhow::Result<Arc<tauri_plugin_store::Store<tauri::Wry>>> {
-    let mut guard = STORE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    {
+        let guard = STORE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(ref cached) = *guard {
+            return Ok(cached.clone());
+        }
+    }
 
+    let in_tokio = tokio::runtime::Handle::try_current().is_ok();
+    let store = if in_tokio {
+        tokio::task::block_in_place(|| build_store(app))?
+    } else {
+        build_store(app)?
+    };
+
+    let mut guard = STORE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(ref cached) = *guard {
         return Ok(cached.clone());
     }
-
-    let store = build_store(app)?;
     *guard = Some(store.clone());
     Ok(store)
 }
@@ -910,25 +941,24 @@ impl SettingsStore {
             data_dir,
             Some(&resolved_engine),
         );
-        // Set the API auth key: settings apiKey > auto-generate
+        // Resolve the API auth key from the seeded cache. The cache is populated
+        // asynchronously by `recording::spawn_screenpipe` via the shared helper
+        // (`screenpipe_engine::auth_key::resolve_api_auth_key`) — which is the
+        // single source of truth used by the CLI path, the auth CLI, and MCP.
+        // If this function is called before the server has spawned (e.g. an
+        // early frontend poll), fall back to the settings value if present;
+        // otherwise leave `api_auth_key` as `None` so the caller knows the
+        // key hasn't been resolved yet rather than receiving a fresh UUID
+        // that would drift from every other reader.
         if config.api_auth {
             let settings_key = settings.api_key.as_str();
-            config.api_auth_key = if !settings_key.is_empty() {
-                Some(settings_key.to_string())
-            } else {
-                None
-            };
-
-            // Auto-generate if no key found — stored in the encrypted settings
-            // store (not auth.json) so it's protected by keychain encryption.
-            if config.api_auth_key.is_none() {
-                let key = format!("sp-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
-                tracing::info!("api auth enabled — auto-generated key");
-                config.api_auth_key = Some(key);
-                // Note: caller should persist this back to settings.apiKey
-                // so it survives restarts. The key is returned in config and
-                // saved by the recording startup code.
-            }
+            config.api_auth_key = resolved_api_auth_key().or_else(|| {
+                if settings_key.is_empty() {
+                    None
+                } else {
+                    Some(settings_key.to_string())
+                }
+            });
         }
         config
     }

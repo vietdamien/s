@@ -135,7 +135,7 @@ fn word_recall(ground_truth: &str, transcription: &str) -> f64 {
 async fn pipeline_end_to_end_synthetic() {
     println!("\n--- Pipeline End-to-End: Synthetic ---");
 
-    let mut vad = SileroVad::new().await.expect("failed to init SileroVad");
+    let mut vad = crate::new_test_vad().await;
 
     // 5-minute audio with varied speech patterns
     let duration = 300.0;
@@ -397,7 +397,7 @@ async fn pipeline_end_to_end_dataset() {
 
     println!("\n--- Pipeline End-to-End: Full Dataset (VAD only) ---");
 
-    let mut vad = SileroVad::new().await.expect("failed to init SileroVad");
+    let mut vad = crate::new_test_vad().await;
 
     let thresholds = [0.01, 0.02, 0.03, 0.05, 0.10];
 

@@ -850,6 +850,11 @@ impl SCServer {
                             //   (called before frontend loads API key via IPC)
                             // - /connections/oauth/callback: browser redirect from
                             //   OAuth providers (no bearer token in redirect)
+                            // - /pipes/store/*: onboarding can fire pipe install before
+                            //   the frontend's IPC key-fetch completes on cold start /
+                            //   reinstall. Install/list/detail/update proxy the public
+                            //   registry; publish/unpublish/review enforce their own
+                            //   Bearer check inside the handler (see pipe_store.rs).
                             let path = req.uri().path();
                             if path == "/health"
                                 || path == "/ws/health"
@@ -857,6 +862,7 @@ impl SCServer {
                                 || path == "/connections/oauth/callback"
                                 || path.starts_with("/frames/")
                                 || path == "/notify"
+                                || path.starts_with("/pipes/store")
                             {
                                 return next.run(req).await;
                             }

@@ -566,6 +566,7 @@ async fn main() {
                 permissions::check_screen_recording_permission,
                 permissions::check_accessibility_permission_cmd,
                 permissions::check_arc_installed,
+                permissions::check_coreaudio_process_tap_available,
                 permissions::check_arc_automation_permission,
                 permissions::request_arc_automation_permission,
                 permissions::get_installed_browsers,
@@ -854,6 +855,7 @@ async fn main() {
             permissions::reset_and_request_permission,
             permissions::get_missing_permissions,
             permissions::check_arc_installed,
+            permissions::check_coreaudio_process_tap_available,
             permissions::check_arc_automation_permission,
             permissions::request_arc_automation_permission,
             set_tray_unhealth_icon,
@@ -1466,6 +1468,27 @@ async fn main() {
                             .expect("Failed to create server runtime");
 
                         server_runtime.block_on(async move {
+                            // Resolve + seed the shared api_auth_key cache before building
+                            // the config. `to_recording_config` is sync and reads the
+                            // cache; without this step the server would start with
+                            // `api_auth_key = None` on the app-auto-start path and every
+                            // request would 403. Mirrors the path in `spawn_screenpipe`.
+                            if store_clone.recording.api_auth {
+                                let settings_key_opt = if store_clone.recording.api_key.is_empty() {
+                                    None
+                                } else {
+                                    Some(store_clone.recording.api_key.clone())
+                                };
+                                match screenpipe_engine::auth_key::resolve_api_auth_key(
+                                    &data_dir_clone,
+                                    settings_key_opt.as_deref(),
+                                )
+                                .await
+                                {
+                                    Ok(key) => crate::store::seed_api_auth_key(key),
+                                    Err(e) => tracing::error!("failed to resolve api auth key: {}", e),
+                                }
+                            }
                             let config = store_clone.to_recording_config(data_dir_clone.clone());
 
                             // Check if server already running

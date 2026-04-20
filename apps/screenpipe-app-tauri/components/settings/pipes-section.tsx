@@ -2690,6 +2690,31 @@ export function PipesSection() {
           if (!value) return;
           input.value = "";
 
+          // North-star funnel: mark the generation attempt so standalone-chat
+          // can fire `pipe_generation_completed` when a new pipe lands.
+          // Baseline captures the current installed list so we can detect the
+          // delta even if the user already has pipes installed.
+          const generationId = crypto.randomUUID();
+          const baseline = pipes.map((p: any) => p?.config?.name).filter(Boolean);
+          try {
+            sessionStorage.setItem(
+              "pipeGenerationContext",
+              JSON.stringify({
+                generation_id: generationId,
+                started_at: Date.now(),
+                prompt_length: value.length,
+                baseline_pipes: baseline,
+              })
+            );
+          } catch {
+            // sessionStorage unavailable — funnel will miss this attempt, not fatal
+          }
+          posthog.capture("pipe_generation_started", {
+            generation_id: generationId,
+            prompt_length: value.length,
+            baseline_pipe_count: baseline.length,
+          });
+
           navigateHomeAndPrefill({
             context: PIPE_CREATION_PROMPT,
             prompt: value,

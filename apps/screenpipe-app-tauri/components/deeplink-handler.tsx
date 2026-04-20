@@ -57,6 +57,33 @@ export function DeeplinkHandler() {
         }
       }
 
+      // Handle subscription activation deep link.
+      // Louis's email/success page can include:
+      //   screenpipe://subscription-success?purchase_token=<token>
+      // This lets existing app users activate pro without re-logging in.
+      if (
+        parsedUrl.host === "subscription-success" ||
+        parsedUrl.pathname?.includes("subscription-success")
+      ) {
+        const purchaseToken = parsedUrl.searchParams.get("purchase_token");
+        if (purchaseToken) {
+          try {
+            await loadUser(purchaseToken);
+            toast({
+              title: "welcome to screenpipe pro!",
+              description: "your subscription is now active",
+            });
+          } catch (error) {
+            const msg = error instanceof Error ? error.message : String(error);
+            toast({
+              title: "activation failed",
+              description: msg || "try logging out and back in",
+              variant: "destructive",
+            });
+          }
+        }
+      }
+
       // Handle Google Calendar OAuth callback
       if (
         parsedUrl.host === "auth" &&

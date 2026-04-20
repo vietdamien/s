@@ -393,26 +393,35 @@ pub async fn list_audio_devices() -> Result<Vec<AudioDevice>> {
         // remains stable regardless of which physical display anchors the stream.
         #[cfg(target_os = "macos")]
         {
-            match get_screen_capture_host().await {
-                Ok(screen_capture_host) => {
-                    // Check if ANY display is available — that's all we need
-                    let has_display = screen_capture_host
-                        .input_devices()
-                        .map(|mut d| d.next().is_some())
-                        .unwrap_or(false);
-                    if has_display {
-                        devices.push(AudioDevice::new(
-                            MACOS_OUTPUT_AUDIO_DEVICE_NAME.to_string(),
-                            DeviceType::Output,
-                        ));
+            // On macOS 14.4+, Process Tap always works for system audio —
+            // no SCK display enumeration needed.
+            if super::process_tap::is_process_tap_available() {
+                devices.push(AudioDevice::new(
+                    MACOS_OUTPUT_AUDIO_DEVICE_NAME.to_string(),
+                    DeviceType::Output,
+                ));
+            } else {
+                // Fallback: SCK display enumeration for macOS < 14.4
+                match get_screen_capture_host().await {
+                    Ok(screen_capture_host) => {
+                        let has_display = screen_capture_host
+                            .input_devices()
+                            .map(|mut d| d.next().is_some())
+                            .unwrap_or(false);
+                        if has_display {
+                            devices.push(AudioDevice::new(
+                                MACOS_OUTPUT_AUDIO_DEVICE_NAME.to_string(),
+                                DeviceType::Output,
+                            ));
+                        }
                     }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "ScreenCaptureKit unavailable when listing audio devices: {} — \
-                         output device list may be incomplete",
-                        e
-                    );
+                    Err(e) => {
+                        tracing::warn!(
+                            "ScreenCaptureKit unavailable when listing audio devices: {} — \
+                             output device list may be incomplete",
+                            e
+                        );
+                    }
                 }
             }
         }
@@ -583,13 +592,18 @@ pub async fn default_output_device() -> Result<AudioDevice> {
 
     #[cfg(target_os = "macos")]
     {
-        // On macOS, output audio capture works via ScreenCaptureKit display devices.
-        // The audio content is system-wide and identical across all displays.
-        // Return a canonical "System Audio" device — get_cpal_device_and_config()
-        // will resolve it to whichever display is currently available.
+        // On macOS 14.4+, Process Tap provides reliable system audio capture
+        // without needing SCK display enumeration.
+        if super::process_tap::is_process_tap_available() {
+            return Ok(AudioDevice::new(
+                MACOS_OUTPUT_AUDIO_DEVICE_NAME.to_string(),
+                DeviceType::Output,
+            ));
+        }
+
+        // Fallback: SCK display-based capture for macOS < 14.4
         match get_screen_capture_host().await {
             Ok(host) => {
-                // Verify at least one display exists
                 let has_display = host
                     .input_devices()
                     .map(|mut d| d.next().is_some())

@@ -124,6 +124,7 @@ samplerate = { version = "0.2.4" }
 libsamplerate-sys = "0.1.10"
 
 [target.'cfg(target_os = "macos")'.dependencies]
+cidre = { git = "https://github.com/yury/cidre.git" }
 once_cell = "1.17.1"
 objc = "0.2.7"
 ort = { version = "=2.0.0-rc.6", features = ["download-binaries"] }

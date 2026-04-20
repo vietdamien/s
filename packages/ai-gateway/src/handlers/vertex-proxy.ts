@@ -54,6 +54,7 @@ export async function handleVertexModels(env: Env): Promise<Response> {
 	const geminiModels = [
 		{ id: 'gemini-3.1-pro', object: 'model', created: 1747180800, owned_by: 'google' },
 		{ id: 'gemini-3-flash', object: 'model', created: 1747180800, owned_by: 'google' },
+		{ id: 'gemini-3.1-flash-lite', object: 'model', created: 1747180800, owned_by: 'google' },
 	];
 
 	// Claude models — fetch dynamically from Anthropic API

@@ -9,19 +9,21 @@ import { useToast } from "@/components/ui/use-toast";
 import OnboardingLogin from "@/components/onboarding/login-gate";
 import PermissionsStep from "@/components/onboarding/permissions-step";
 import EngineStartup from "@/components/onboarding/engine-startup";
+import ConnectApps from "@/components/onboarding/connect-apps";
 import PickPipe from "@/components/onboarding/pick-pipe";
 import { useOnboarding } from "@/lib/hooks/use-onboarding";
 import { useIsEnterpriseBuild } from "@/lib/hooks/use-is-enterprise-build";
 import posthog from "posthog-js";
 import { commands } from "@/lib/utils/tauri";
 
-type SlideKey = "login" | "permissions" | "engine" | "pipe";
+type SlideKey = "login" | "permissions" | "engine" | "connect-apps" | "pipe";
 
 const SLIDE_WINDOW_SIZES: Record<SlideKey, { width: number; height: number }> =
   {
     login: { width: 500, height: 480 },
     permissions: { width: 500, height: 560 },
     engine: { width: 500, height: 620 },
+    "connect-apps": { width: 500, height: 680 },
     pipe: { width: 500, height: 620 },
   };
 
@@ -63,6 +65,9 @@ export default function OnboardingPage() {
           login: "login",
           permissions: "permissions",
           engine: "engine",
+          "connect-apps": "connect-apps",
+          integrations: "connect-apps",
+          connections: "connect-apps",
           pipe: "pipe",
           // backwards compat with old onboarding
           read: "pipe",
@@ -112,6 +117,7 @@ export default function OnboardingPage() {
       "login",
       "permissions",
       "engine",
+      "connect-apps",
       "pipe",
     ];
     const currentIdx = stepOrder.indexOf(currentSlide);
@@ -163,6 +169,9 @@ export default function OnboardingPage() {
           )}
           {currentSlide === "engine" && (
             <EngineStartup handleNextSlide={handleNextSlide} />
+          )}
+          {currentSlide === "connect-apps" && (
+            <ConnectApps handleNextSlide={handleNextSlide} />
           )}
           {currentSlide === "pipe" && <PickPipe />}
         </div>

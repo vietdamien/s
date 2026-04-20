@@ -3,6 +3,7 @@ import { Message, RequestBody, ResponseFormat } from '../types';
 import OpenAI from 'openai';
 import type { ChatCompletionMessage, ChatCompletionCreateParams } from 'openai/resources/chat';
 import type { ResponseFormatJSONSchema } from 'openai/resources';
+import { captureException } from '@sentry/cloudflare';
 
 export class OpenAIProvider implements AIProvider {
 	supportsTools = true;
@@ -71,7 +72,12 @@ export class OpenAIProvider implements AIProvider {
 			response_format: this.formatResponseFormat(body.response_format),
 			tools: body.tools as ChatCompletionCreateParams['tools'],
 		});
-	
+
+		// Capture scope fields for the error path below — `this` inside the
+		// ReadableStream start() refers to the controller, not the provider.
+		const modelForTags = body.model;
+		const baseURLForTags = this.client.baseURL || 'openai-default';
+
 		return new ReadableStream({
 			async start(controller) {
 				try {
@@ -105,6 +111,22 @@ export class OpenAIProvider implements AIProvider {
 					controller.close();
 				} catch (error: any) {
 					console.error('Streaming error:', error);
+					// Record the error in Sentry with model/provider tags. This
+					// path is normally swallowed into an SSE `data: {error:…}`
+					// event, so without this the client sees "random error"
+					// and we have no server-side trace. Tags let you filter
+					// by model (e.g. gemma4-31b) or provider (e.g. tinfoil).
+					try {
+						captureException(error, {
+							tags: {
+								model: modelForTags,
+								base_url: baseURLForTags,
+								error_path: 'openai_streaming',
+								status: String(error?.status ?? 'unknown'),
+							},
+							level: 'warning',
+						});
+					} catch {}
 					const errorMessage = error?.message || 'Unknown streaming error';
 					const errorStatus = error?.status || 500;
 					try {

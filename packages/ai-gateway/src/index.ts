@@ -520,6 +520,65 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
 	}
 }
 
+// Strip PII from a Sentry event before send. The default @sentry/cloudflare
+// integration attaches request headers, URL, and (for traces) query string —
+// all of which regularly contain Clerk JWTs (user_id + email inside the
+// token payload) and device fingerprints. Error messages can also include
+// full prompts. We keep enough context to debug (method, path, status,
+// model, provider tags) while redacting anything that identifies a user.
+function scrubSentryEvent(event: any): any {
+	const REDACTED = '[REDACTED]';
+	const cap = (s: unknown, n = 512): string => {
+		if (typeof s !== 'string') return typeof s === 'undefined' ? '' : String(s);
+		return s.length > n ? s.slice(0, n) + '…[truncated]' : s;
+	};
+	const redactQs = (qs: string): string =>
+		qs
+			.replace(/(^|&)(id|user_id|email|token)=[^&]*/gi, '$1$2=' + REDACTED)
+			.replace(/user_[A-Za-z0-9]+/g, 'user_' + REDACTED);
+	const redactUrl = (url: string): string => {
+		if (!url) return url;
+		const [base, qs] = url.split('?');
+		return qs ? `${base}?${redactQs(qs)}` : base;
+	};
+
+	try {
+		if (event.request) {
+			if (event.request.headers) {
+				// Headers often contain Authorization: Bearer <JWT>, Cookie, X-Device-Id
+				for (const k of Object.keys(event.request.headers)) {
+					const lk = k.toLowerCase();
+					if (
+						lk === 'authorization' ||
+						lk === 'cookie' ||
+						lk === 'x-device-id' ||
+						lk === 'x-forwarded-for' ||
+						lk === 'cf-connecting-ip'
+					) {
+						event.request.headers[k] = REDACTED;
+					}
+				}
+			}
+			if (event.request.url) event.request.url = redactUrl(event.request.url);
+			if (event.request.query_string) event.request.query_string = redactQs(event.request.query_string);
+			// Request body can contain full prompt text — drop it. Error tags will
+			// carry the model/provider which is what we actually need to triage.
+			if (event.request.data) event.request.data = '[body redacted]';
+		}
+		// Truncate exception messages so a stack trace with leaked prompt text
+		// doesn't fill the event — stack frames themselves stay intact.
+		if (event.exception?.values) {
+			for (const v of event.exception.values) {
+				if (v.value) v.value = cap(v.value);
+			}
+		}
+		if (event.message) event.message = cap(event.message);
+	} catch {
+		// Never let the scrubber itself throw — it would mask the real error.
+	}
+	return event;
+}
+
 // Wrap with Sentry for error tracking
 export default {
 	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -528,6 +587,7 @@ export default {
 				options: {
 					dsn: env.SENTRY_DSN,
 					tracesSampleRate: 0.1,
+					beforeSend: scrubSentryEvent,
 				},
 				request: request as any,
 				context: ctx,

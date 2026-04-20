@@ -25,6 +25,49 @@ npx screenpipe@latest record
 
 this starts the screenpipe daemon in the background and continuously records your screen. data is stored in `~/.screenpipe/` on your local machine.
 
+### troubleshooting: "npx screenpipe record" not working
+
+if the command fails, try these fixes in order:
+
+**unsupported platform:**
+```bash
+node -p "process.platform + '-' + process.arch"
+```
+if the output is not `darwin-arm64`, `darwin-x64`, `linux-x64`, or `win32-x64`, your platform is not supported.
+
+**missing platform package (macOS/Windows/Linux):**
+```bash
+npm install screenpipe
+# or
+bun install screenpipe
+```
+the CLI needs the platform-specific binary. try a fresh install.
+
+**macOS: binary blocked by Gatekeeper:**
+if you see "app is damaged" or "permission denied", run:
+```bash
+xattr -d com.apple.quarantine ~/.npm/_npx/*/node_modules/screenpipe*/bin/screenpipe
+```
+or use the desktop app instead — it handles permissions automatically.
+
+**Linux: missing system libraries:**
+```bash
+sudo apt install libasound2-dev ffmpeg  # ubuntu/debian
+sudo dnf install alsa-lib ffmpeg         # fedora
+```
+
+**Windows: .NET runtime missing:**
+the screenpipe installer includes .NET, but if you're using the CLI only, install [.NET 8.0](https://dotnet.microsoft.com/en-us/download/dotnet/8.0).
+
+**port 3030 already in use:**
+if screenpipe is already running, the CLI will fail to bind. check for existing processes:
+```bash
+lsof -i :3030     # macOS/Linux
+netstat -ano | findstr :3030  # Windows
+```
+
+still stuck? [ask in Discord](https://discord.gg/screenpipe).
+
 ### access your recorded timeline
 
 after starting the CLI, you have three ways to access your screen history:

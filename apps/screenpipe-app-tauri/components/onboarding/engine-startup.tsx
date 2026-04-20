@@ -11,7 +11,7 @@ import { invoke } from "@tauri-apps/api/core";
 import posthog from "posthog-js";
 import { commands } from "@/lib/utils/tauri";
 import { motion, AnimatePresence } from "framer-motion";
-import { useSettings } from "@/lib/hooks/use-settings";
+import { useSettings, makeDefaultPresets } from "@/lib/hooks/use-settings";
 import { localFetch } from "@/lib/api";
 import { open as openUrl } from "@tauri-apps/plugin-shell";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
@@ -293,21 +293,10 @@ export default function EngineStartup({
 
   const ensureDefaultPreset = useCallback(async () => {
     if (settings.aiPresets.length === 0) {
-      await updateSettings({
-        aiPresets: [
-          {
-            id: "screenpipe-cloud",
-            provider: "screenpipe-cloud" as const,
-            url: "",
-            model: "auto",
-            maxContextChars: 200000,
-            defaultPreset: true,
-            prompt: "",
-          } as any,
-        ],
-      });
+      const isPro = settings.user?.cloud_subscribed === true;
+      await updateSettings({ aiPresets: makeDefaultPresets(isPro) as any });
     }
-  }, [settings.aiPresets.length, updateSettings]);
+  }, [settings.aiPresets.length, settings.user?.cloud_subscribed, updateSettings]);
 
   const handleContinue = async () => {
     posthog.capture("onboarding_livefeed_continued", {

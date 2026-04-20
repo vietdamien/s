@@ -100,24 +100,24 @@ export default function PermissionsStep({
     {
       id: "screen",
       icon: <Monitor className="w-3.5 h-3.5" strokeWidth={1.5} />,
-      title: "screen recording",
-      subtitle: "capture your display for visual context",
+      title: "Capture your screen",
+      subtitle: "Lets Screenpipe index what's on your screen — windows, docs, chats, code",
       check: () => commands.checkScreenRecordingPermission(),
       request: () => commands.requestPermission("screenRecording"),
     },
     {
       id: "mic",
       icon: <Mic className="w-3.5 h-3.5" strokeWidth={1.5} />,
-      title: "microphone",
-      subtitle: "transcribe audio from meetings & conversations",
+      title: "Capture what you say",
+      subtitle: "Lets Screenpipe transcribe your voice in meetings and calls",
       check: () => commands.checkMicrophonePermission(),
       request: () => commands.requestPermission("microphone"),
     },
     {
       id: "accessibility",
       icon: <Keyboard className="w-3.5 h-3.5" strokeWidth={1.5} />,
-      title: "accessibility",
-      subtitle: "read text from any app via the accessibility tree",
+      title: "Read on-screen text",
+      subtitle: "Lets Screenpipe understand app content without OCR",
       check: () => commands.checkAccessibilityPermissionCmd(),
       request: () => commands.requestPermission("accessibility"),
       macOnly: true,
@@ -125,8 +125,8 @@ export default function PermissionsStep({
     {
       id: "browsers",
       icon: <Globe className="w-3.5 h-3.5" strokeWidth={1.5} />,
-      title: "browser urls",
-      subtitle: "capture urls & detect private browsing",
+      title: "Capture browser URLs",
+      subtitle: "So Screenpipe knows what you were reading, not just what the pixels say",
       check: async () => {
         const granted = await commands.checkBrowsersAutomationPermission();
         return granted ? "granted" : "denied";
@@ -140,8 +140,8 @@ export default function PermissionsStep({
     {
       id: "keychain",
       icon: <Lock className="w-3.5 h-3.5" strokeWidth={1.5} />,
-      title: "secure storage",
-      subtitle: "encrypt api keys & credentials with your os keychain",
+      title: "Encrypt your secrets",
+      subtitle: "Stores API keys and tokens in the macOS Keychain, never on disk in plaintext",
       check: async () => {
         const res = await commands.getKeychainStatus();
         if (res.status === "ok" && res.data.state === "enabled") return "granted";
@@ -271,11 +271,10 @@ export default function PermissionsStep({
         {/* eslint-disable-next-line @next/next/no-img-element */}
         <img className="w-12 h-12 mb-2" src="/128x128.png" alt="screenpipe" />
         <h1 className="font-mono text-base font-bold text-foreground">
-          grant permissions
+          Unlock the full experience
         </h1>
         <p className="font-mono text-[10px] text-muted-foreground mt-1 text-center max-w-xs">
-          screenpipe needs these macos permissions to capture your screen, audio,
-          and app content
+          Enable these permissions to get the most out of Screenpipe
         </p>
       </div>
 

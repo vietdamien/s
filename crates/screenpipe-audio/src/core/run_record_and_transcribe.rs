@@ -215,11 +215,15 @@ async fn recv_audio_chunk(
                 return Ok(None);
             }
 
-            // On Windows, WASAPI loopback output devices produce NO callbacks
-            // when nothing is playing (unlike macOS ScreenCaptureKit which
-            // delivers continuous callbacks even during silence). Silence
-            // timeouts are expected and non-fatal — just keep waiting.
-            #[cfg(target_os = "windows")]
+            // Output devices may produce no callbacks when the system is silent:
+            // - Windows WASAPI loopback: silent = no callbacks (always has been).
+            // - macOS ScreenCaptureKit: observed on Sequoia 24.3+ that SCK may
+            //   also stop firing callbacks during prolonged silence with no
+            //   audio source, contrary to the earlier assumption of continuous
+            //   callbacks. Treat silence as non-fatal on both — the separate
+            //   device_monitor watchdog detects genuine device removal via the
+            //   OS device list.
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
             {
                 use crate::core::device::DeviceType;
                 if audio_stream.device.device_type == DeviceType::Output {
@@ -231,7 +235,7 @@ async fn recv_audio_chunk(
                 }
             }
 
-            // For input devices (all platforms) and output devices (macOS/Linux):
+            // For input devices (all platforms) and output devices (Linux):
             // a 30s timeout means the OS stream genuinely stopped producing data.
             warn!(
                 "no audio received from {} for {}s - stream dead, triggering reconnect",

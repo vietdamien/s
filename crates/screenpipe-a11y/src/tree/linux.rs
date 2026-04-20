@@ -1089,7 +1089,11 @@ mod tests {
     #[test]
     fn test_incognito_detection() {
         use crate::incognito::is_title_private;
-        assert!(is_title_private("Enter Password - Chrome"));
+        // is_title_private detects browser incognito/private-browsing windows,
+        // not password prompts — "Enter Password - Chrome" is a sign-in dialog
+        // and must NOT be flagged as private (that would be a false positive).
+        assert!(!is_title_private("Enter Password - Chrome"));
+        assert!(is_title_private("YouTube - Google Chrome (Incognito)"));
         assert!(is_title_private("Private Browsing - Firefox"));
         assert!(!is_title_private("Calculator"));
     }

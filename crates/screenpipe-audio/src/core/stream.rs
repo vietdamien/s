@@ -79,9 +79,18 @@ enum StreamControl {
 }
 
 impl AudioStream {
+    /// Build an AudioStream for `device`.
+    ///
+    /// `use_coreaudio_tap` is a user-level experimental flag. When true AND
+    /// the target is System Audio on macOS 14.4+, the stream is backed by a
+    /// CoreAudio Process Tap (no ScreenCaptureKit session). In every other
+    /// case (flag off, non-macOS, macOS <14.4, mic input, specific output)
+    /// the existing cpal/SCK path runs unchanged — existing users see no
+    /// behavior change.
     pub async fn from_device(
         device: Arc<AudioDevice>,
         is_running: Arc<AtomicBool>,
+        #[cfg_attr(not(target_os = "macos"), allow(unused_variables))] use_coreaudio_tap: bool,
     ) -> Result<Self> {
         let (tx, _) = broadcast::channel::<Vec<f32>>(1000);
         let tx_clone = tx.clone();
@@ -105,23 +114,62 @@ impl AudioStream {
 
         #[cfg(not(all(target_os = "linux", feature = "pulseaudio")))]
         let (audio_config, stream_thread) = {
-            let (cpal_audio_device, config) = get_cpal_device_and_config(&device).await?;
-            let audio_config = AudioStreamConfig::from(&config);
-            let channels = config.channels();
-            let is_running_weak = Arc::downgrade(&is_running);
+            // macOS 14.4+: try CoreAudio Process Tap for System Audio.
+            // Bypasses SCK display enumeration which fails after sleep/wake.
+            // Gated behind `use_coreaudio_tap` so the SCK path stays the
+            // default until the experimental flag is explicitly turned on.
+            #[cfg(target_os = "macos")]
+            let use_process_tap = {
+                use super::device::{DeviceType, MACOS_OUTPUT_AUDIO_DEVICE_NAME};
+                use_coreaudio_tap
+                    && device.device_type == DeviceType::Output
+                    && device.name == MACOS_OUTPUT_AUDIO_DEVICE_NAME
+                    && super::process_tap::is_process_tap_available()
+            };
+            #[cfg(not(target_os = "macos"))]
+            let use_process_tap = false;
 
-            let thread = Self::spawn_audio_thread(
-                cpal_audio_device,
-                config,
-                tx,
-                stream_control_rx,
-                channels,
-                is_running_weak,
-                is_disconnected.clone(),
-                stream_control_tx.clone(),
-            )
-            .await?;
-            (audio_config, thread)
+            if use_process_tap {
+                #[cfg(target_os = "macos")]
+                {
+                    match super::process_tap::spawn_process_tap_capture(
+                        tx.clone(),
+                        is_running.clone(),
+                        is_disconnected.clone(),
+                    ) {
+                        Ok((config, thread)) => {
+                            drop(stream_control_rx);
+                            (config, thread)
+                        }
+                        Err(e) => {
+                            tracing::warn!("Process Tap failed, falling back to SCK: {}", e);
+                            Self::start_cpal_stream(
+                                &device,
+                                tx,
+                                stream_control_rx,
+                                &is_running,
+                                &is_disconnected,
+                                &stream_control_tx,
+                            )
+                            .await?
+                        }
+                    }
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    unreachable!()
+                }
+            } else {
+                Self::start_cpal_stream(
+                    &device,
+                    tx,
+                    stream_control_rx,
+                    &is_running,
+                    &is_disconnected,
+                    &stream_control_tx,
+                )
+                .await?
+            }
         };
 
         Ok(AudioStream {
@@ -132,6 +180,36 @@ impl AudioStream {
             stream_thread: Some(Arc::new(tokio::sync::Mutex::new(Some(stream_thread)))),
             is_disconnected,
         })
+    }
+
+    /// Start the standard cpal/SCK audio stream. Shared by all platforms
+    /// and used as fallback when Process Tap is unavailable or fails.
+    #[cfg(not(all(target_os = "linux", feature = "pulseaudio")))]
+    async fn start_cpal_stream(
+        device: &Arc<AudioDevice>,
+        tx: broadcast::Sender<Vec<f32>>,
+        stream_control_rx: mpsc::Receiver<StreamControl>,
+        is_running: &Arc<AtomicBool>,
+        is_disconnected: &Arc<AtomicBool>,
+        stream_control_tx: &mpsc::Sender<StreamControl>,
+    ) -> Result<(AudioStreamConfig, tokio::task::JoinHandle<()>)> {
+        let (cpal_audio_device, config) = get_cpal_device_and_config(device).await?;
+        let audio_config = AudioStreamConfig::from(&config);
+        let channels = config.channels();
+        let is_running_weak = Arc::downgrade(is_running);
+
+        let thread = Self::spawn_audio_thread(
+            cpal_audio_device,
+            config,
+            tx,
+            stream_control_rx,
+            channels,
+            is_running_weak,
+            is_disconnected.clone(),
+            stream_control_tx.clone(),
+        )
+        .await?;
+        Ok((audio_config, thread))
     }
 
     #[cfg(not(all(target_os = "linux", feature = "pulseaudio")))]

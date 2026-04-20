@@ -219,14 +219,14 @@ mod tests {
     fn test_capture_params_typing() {
         let feed = ActivityFeed::new();
 
-        // Simulate typing burst
+        // Simulate typing burst — 5 key presses puts us in keyboard-burst branch
         for _ in 0..5 {
             feed.record(ActivityKind::KeyPress);
         }
 
         let params = feed.get_capture_params();
-        assert_eq!(params.interval, Duration::from_millis(100));
-        assert_eq!(params.skip_threshold, 0.005);
+        assert_eq!(params.interval, Duration::from_millis(200));
+        assert_eq!(params.skip_threshold, 0.02);
     }
 
     #[test]

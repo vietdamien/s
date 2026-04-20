@@ -117,7 +117,8 @@ pub struct CentralHandlerRestartResult {
 
 impl AudioManager {
     pub async fn new(options: AudioManagerOptions, db: Arc<DatabaseManager>) -> Result<Self> {
-        let device_manager = DeviceManager::new().await?;
+        let device_manager =
+            DeviceManager::new(options.experimental_coreaudio_system_audio).await?;
         let segmentation_manager = Arc::new(SegmentationManager::new(options.is_disabled).await?);
         let status = RwLock::new(AudioManagerStatus::Stopped);
         let vad_engine: Arc<Mutex<Box<dyn VadEngine + Send>>> = if options.is_disabled {
