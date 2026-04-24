@@ -8,7 +8,7 @@
 //! (database, screenshots, audio) when the user intentionally locks.
 //!
 //! # Usage
-//! ```no_run
+//! ```ignore
 //! use screenpipe_vault::VaultManager;
 //!
 //! # async fn example() -> anyhow::Result<()> {

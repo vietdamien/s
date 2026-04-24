@@ -45,7 +45,7 @@
       "entitlements": "entitlements.plist"
     },
     "windows": {
-      "signCommand": "powershell -ExecutionPolicy Bypass -File sign-enterprise.ps1 %1",
+      "signCommand": "powershell -ExecutionPolicy Bypass -File sign-ssl.ps1 %1",
       "nsis": {
         "installMode": "perMachine",
         "headerImage": "assets/nsis-header.bmp",

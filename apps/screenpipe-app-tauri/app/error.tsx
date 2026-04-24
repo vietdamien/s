@@ -14,7 +14,16 @@ export default function GlobalError({
   reset: () => void;
 }) {
   useEffect(() => {
-    console.error("global error boundary caught:", error);
+    // Explicitly extract Error fields — JSON.stringify(error) returns `{}` because
+    // `message`, `stack`, `name` are non-enumerable, so the Tauri log bridge
+    // was dropping every useful detail into the void.
+    const serialized = {
+      name: error?.name,
+      message: error?.message,
+      digest: error?.digest,
+      stack: error?.stack,
+    };
+    console.error("global error boundary caught:", serialized);
   }, [error]);
 
   return (

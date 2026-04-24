@@ -649,6 +649,12 @@ impl PiExecutor {
             cmd.env("SCREENPIPE_API_AUTH_KEY", key);
         }
 
+        // Auto-auth the agent's `curl localhost:3030/...` calls via a bash
+        // shim sourced from $BASH_ENV on every subshell. See bash_env.rs.
+        if let Ok(p) = crate::agents::bash_env::ensure_wrapper_in_default_dir() {
+            cmd.env("BASH_ENV", p);
+        }
+
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
 
@@ -764,6 +770,12 @@ impl PiExecutor {
         // Local server bearer token — unaffected by offline mode.
         if let Some(ref key) = self.api_auth_key {
             cmd.env("SCREENPIPE_API_AUTH_KEY", key);
+        }
+
+        // Auto-auth the agent's `curl localhost:3030/...` calls via a bash
+        // shim sourced from $BASH_ENV on every subshell. See bash_env.rs.
+        if let Ok(p) = crate::agents::bash_env::ensure_wrapper_in_default_dir() {
+            cmd.env("BASH_ENV", p);
         }
 
         cmd.stdout(std::process::Stdio::piped());

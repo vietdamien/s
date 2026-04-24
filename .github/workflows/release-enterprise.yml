@@ -241,7 +241,9 @@ jobs:
             $keyFile = Join-Path $env:RUNNER_TEMP "tauri-key.txt"
             Set-Content -Path $keyFile -Value $env:TAURI_SIGNING_PRIVATE_KEY -NoNewline
             Push-Location apps/screenpipe-app-tauri
-            bunx tauri signer sign $exe.FullName --private-key-path $keyFile --password $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD
+            # Tauri v2 CLI: --private-key auto-detects path-vs-contents.
+            # The legacy --private-key-path flag was removed in 2.x.
+            bunx tauri signer sign $exe.FullName --private-key $keyFile --password $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD
             Pop-Location
             Write-Host "Tauri signature regenerated"
           }

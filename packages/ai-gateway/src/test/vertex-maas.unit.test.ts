@@ -24,36 +24,41 @@ describe('isVertexMaasModel', () => {
 	it('should not match other models', () => {
 		expect(isVertexMaasModel('claude-haiku-4-5')).toBe(false);
 		expect(isVertexMaasModel('gemini-3-flash')).toBe(false);
+		// OpenRouter-style names with publisher prefix shouldn't be treated as Vertex MaaS.
 		expect(isVertexMaasModel('deepseek/deepseek-chat')).toBe(false);
-		expect(isVertexMaasModel('llama-4-scout')).toBe(false);
+		expect(isVertexMaasModel('meta-llama/llama-4-scout')).toBe(false);
 	});
 
-	it('should not false-positive on partial matches', () => {
-		// "glm" alone shouldn't match — needs "glm-4.7" or "glm-5"
-		expect(isVertexMaasModel('glm-3')).toBe(false);
-		expect(isVertexMaasModel('kimi-k1')).toBe(false);
+	it('matches by family-prefix substring (legacy compatibility)', () => {
+		// Substring fallback intentionally matches family prefixes — keeps
+		// older client model names routing to Vertex MaaS while we phase
+		// in canonical IDs. Not a bug.
+		expect(isVertexMaasModel('glm-3')).toBe(true);
+		expect(isVertexMaasModel('kimi-k1')).toBe(true);
 	});
 });
 
 describe('resolveVertexMaasModel', () => {
+	// Vertex MaaS expects the publisher-prefixed model ID per
+	// https://docs.cloud.google.com/vertex-ai/generative-ai/docs/maas/call-open-model-apis
 	it('should resolve GLM-4.7 to correct Vertex ID and region', () => {
 		const result = resolveVertexMaasModel('glm-4.7');
 		expect(result).not.toBeNull();
-		expect(result!.vertexId).toBe('glm-4.7-maas');
+		expect(result!.vertexId).toBe('zai-org/glm-4.7-maas');
 		expect(result!.region).toBe('global');
 	});
 
 	it('should resolve GLM-5 to correct Vertex ID and region', () => {
 		const result = resolveVertexMaasModel('glm-5');
 		expect(result).not.toBeNull();
-		expect(result!.vertexId).toBe('glm-5-maas');
+		expect(result!.vertexId).toBe('zai-org/glm-5-maas');
 		expect(result!.region).toBe('global');
 	});
 
 	it('should resolve Kimi K2.5 to correct Vertex ID and region', () => {
 		const result = resolveVertexMaasModel('kimi-k2.5');
 		expect(result).not.toBeNull();
-		expect(result!.vertexId).toBe('kimi-k2-thinking-maas');
+		expect(result!.vertexId).toBe('moonshotai/kimi-k2-thinking-maas');
 		expect(result!.region).toBe('global');
 	});
 

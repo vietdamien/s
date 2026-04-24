@@ -124,23 +124,33 @@ pub async fn handle_login_command() -> anyhow::Result<()> {
                     json!({})
                 };
 
-                // Navigate to state.settings.user, creating path if needed
-                if store.get("state").is_none() {
-                    store["state"] = json!({});
+                // Write to top-level `settings.user` — the canonical path the
+                // desktop app reads (see apps/screenpipe-app-tauri/src-tauri/src/store.rs
+                // where the tauri-plugin-store deserializes top-level "settings").
+                // Previously this wrote to `state.settings.user`, which CLI reads
+                // tolerated but the app never saw — leaving the menubar stuck on
+                // "Free plan" even after a successful CLI login.
+                if store.get("settings").is_none() {
+                    store["settings"] = json!({});
                 }
-                if store["state"].get("settings").is_none() {
-                    store["state"]["settings"] = json!({});
-                }
-                if store["state"]["settings"].get("user").is_none() {
-                    store["state"]["settings"]["user"] = json!({});
+                if store["settings"].get("user").is_none() {
+                    store["settings"]["user"] = json!({});
                 }
 
-                let user = &mut store["state"]["settings"]["user"];
+                let user = &mut store["settings"]["user"];
                 if !token.is_empty() {
                     user["token"] = json!(token);
                 }
                 if !email.is_empty() {
                     user["email"] = json!(email);
+                }
+
+                // Clean up the stale nested path if a previous CLI version
+                // wrote there, so the app and CLI never disagree on source of truth.
+                if let Some(state) = store.get_mut("state").and_then(|s| s.as_object_mut()) {
+                    if let Some(s) = state.get_mut("settings").and_then(|s| s.as_object_mut()) {
+                        s.remove("user");
+                    }
                 }
 
                 std::fs::write(&store_path, serde_json::to_string_pretty(&store)?)?;
@@ -163,6 +173,74 @@ pub async fn handle_login_command() -> anyhow::Result<()> {
             _ => {}
         }
     }
+}
+
+/// Handle `screenpipe logout` — clear cloud auth from store.bin.
+///
+/// Removes `settings.user.token` and any legacy `state.settings.user.token` so
+/// both the CLI and the desktop app agree the user is signed out. Leaves all
+/// other settings (AI presets, recording prefs, onboarding flags, etc.) intact.
+pub async fn handle_logout_command() -> anyhow::Result<()> {
+    let store_path = screenpipe_core::paths::default_screenpipe_data_dir().join("store.bin");
+
+    if !store_path.exists() {
+        println!();
+        println!("  not logged in (no store.bin found)");
+        println!();
+        return Ok(());
+    }
+
+    let content = std::fs::read_to_string(&store_path)?;
+    let mut store: Value = serde_json::from_str(&content).unwrap_or(json!({}));
+
+    // Capture email for the goodbye line before we wipe it.
+    let email = store
+        .pointer("/settings/user/email")
+        .or_else(|| store.pointer("/state/settings/user/email"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let had_token = store
+        .pointer("/settings/user/token")
+        .or_else(|| store.pointer("/state/settings/user/token"))
+        .and_then(|v| v.as_str())
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
+
+    // Clear token + email at both canonical and legacy paths.
+    if let Some(user) = store
+        .get_mut("settings")
+        .and_then(|s| s.get_mut("user"))
+        .and_then(|u| u.as_object_mut())
+    {
+        user.remove("token");
+        user.remove("email");
+    }
+    if let Some(user) = store
+        .get_mut("state")
+        .and_then(|s| s.get_mut("settings"))
+        .and_then(|s| s.get_mut("user"))
+        .and_then(|u| u.as_object_mut())
+    {
+        user.remove("token");
+        user.remove("email");
+    }
+
+    std::fs::write(&store_path, serde_json::to_string_pretty(&store)?)?;
+
+    println!();
+    if !had_token {
+        println!("  already signed out");
+    } else if let Some(email) = email {
+        println!("  signed out of {}", email);
+    } else {
+        println!("  signed out");
+    }
+    println!();
+    println!("  run `screenpipe login` to sign back in");
+    println!();
+
+    Ok(())
 }
 
 /// Handle `screenpipe whoami` — show current auth status.

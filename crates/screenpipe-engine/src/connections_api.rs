@@ -883,6 +883,9 @@ pub struct OAuthCallbackQuery {
     pub code: Option<String>,
     pub state: Option<String>,
     pub error: Option<String>,
+    // QuickBooks Online returns realmId (company ID) as a callback param alongside the code.
+    #[serde(rename = "realmId")]
+    pub realm_id: Option<String>,
 }
 
 /// GET /connections/oauth/callback — receives the provider redirect after user approves.
@@ -916,8 +919,14 @@ async fn oauth_callback(Query(params): Query<OAuthCallbackQuery>) -> (StatusCode
     };
 
     match sender {
-        Some(tx) => {
-            let _ = tx.send(code);
+        Some(pending) => {
+            // For providers that return extra callback params (e.g. QuickBooks realmId),
+            // encode them alongside the code as JSON so the Tauri command can extract both.
+            let payload = match params.realm_id {
+                Some(ref rid) => serde_json::json!({"code": code, "realmId": rid}).to_string(),
+                None => code,
+            };
+            let _ = pending.sender.send(payload);
             let html =
                 "<html><body style=\"font-family:system-ui;text-align:center;padding:60px\">\
                 <h2>Connected!</h2>\
@@ -949,15 +958,48 @@ enum ResolvedAuth {
     None,
 }
 
-/// Resolve base_url, replacing `{field}` placeholders with credential values.
+/// Fields in the OAuth token JSON that must never be allowed to fill a URL
+/// placeholder (tokens and lifecycle metadata). Everything else — `realmId`,
+/// `email`, `workspace_name`, etc. — is fair game.
+const OAUTH_URL_SKIP_FIELDS: &[&str] = &[
+    "access_token",
+    "refresh_token",
+    "id_token",
+    "token_type",
+    "expires_in",
+    "expires_at",
+    "scope",
+];
+
+/// Resolve base_url, replacing `{field}` placeholders with credential values
+/// and, as a fallback, non-secret fields from the OAuth token JSON (for
+/// providers like QuickBooks whose `{realmId}` comes from the callback, not
+/// from the credential store).
+///
 /// Returns an error if any placeholder remains unresolved.
-fn resolve_base_url(template: &str, creds: Option<&Map<String, Value>>) -> Result<String, String> {
+fn resolve_base_url(
+    template: &str,
+    creds: Option<&Map<String, Value>>,
+    oauth_extras: Option<&Value>,
+) -> Result<String, String> {
     let mut url = template.to_string();
     if url.contains('{') {
         if let Some(c) = creds {
             for (key, value) in c.iter() {
                 if let Some(s) = value.as_str() {
                     url = url.replace(&format!("{{{}}}", key), s);
+                }
+            }
+        }
+        if url.contains('{') {
+            if let Some(obj) = oauth_extras.and_then(|v| v.as_object()) {
+                for (key, value) in obj.iter() {
+                    if OAUTH_URL_SKIP_FIELDS.contains(&key.as_str()) {
+                        continue;
+                    }
+                    if let Some(s) = value.as_str() {
+                        url = url.replace(&format!("{{{}}}", key), s);
+                    }
                 }
             }
         }
@@ -1044,6 +1086,7 @@ fn resolve_auth(
 async fn connection_proxy(
     State(state): State<ConnectionsState>,
     axum::extract::Path((id, api_path)): axum::extract::Path<(String, String)>,
+    axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
     method: axum::http::Method,
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
@@ -1078,10 +1121,21 @@ async fn connection_proxy(
         }
     };
 
-    // Load credentials
+    // Load credentials (from connections.json) and the raw OAuth token JSON in parallel.
+    // OAuth JSON is passed separately to resolve_base_url so callback-only fields like
+    // QuickBooks' {realmId} can fill URL placeholders without polluting the credentials map.
     let creds = mgr.get_credentials(&id).await.ok().flatten();
-    let oauth_token = screenpipe_connect::oauth::read_oauth_token_instance(
+    let oauth_json =
+        screenpipe_connect::oauth::load_oauth_json(state.secret_store.as_deref(), &id, None).await;
+    // Use get_valid_token_instance (not read_oauth_token_instance) so expired
+    // access tokens are transparently refreshed via the stored refresh_token.
+    // Before this fix the proxy would surface "no credentials found" and 401
+    // for any connection with an expired token, even though the refresh was
+    // a single round-trip away.
+    let http_client = reqwest::Client::new();
+    let oauth_token = screenpipe_connect::oauth::get_valid_token_instance(
         state.secret_store.as_deref(),
+        &http_client,
         &id,
         None,
     );
@@ -1112,7 +1166,7 @@ async fn connection_proxy(
     }
 
     // Resolve dynamic base_url
-    let base_url = match resolve_base_url(proxy_cfg.base_url, creds.as_ref()) {
+    let base_url = match resolve_base_url(proxy_cfg.base_url, creds.as_ref(), oauth_json.as_ref()) {
         Ok(url) => url,
         Err(e) => {
             tracing::warn!("proxy: failed to resolve base_url for '{}': {}", id, e);
@@ -1122,8 +1176,16 @@ async fn connection_proxy(
 
     drop(mgr); // release lock before making external request
 
-    // Build the target URL
-    let target_url = format!("{}/{}", base_url, api_path.trim_start_matches('/'));
+    // Build the target URL. Query params from the caller (e.g.
+    // `?valueInputOption=USER_ENTERED` for Google Sheets appends) must be
+    // forwarded verbatim — without this, callers silently hit defaults and
+    // bad requests like 400s on `values:append`.
+    let target_url = match raw_query.as_deref() {
+        Some(q) if !q.is_empty() => {
+            format!("{}/{}?{}", base_url, api_path.trim_start_matches('/'), q)
+        }
+        _ => format!("{}/{}", base_url, api_path.trim_start_matches('/')),
+    };
 
     // Audit log
     tracing::info!(
@@ -1316,7 +1378,7 @@ mod tests {
 
     #[test]
     fn test_resolve_base_url_static() {
-        let result = resolve_base_url("https://api.notion.com", None);
+        let result = resolve_base_url("https://api.notion.com", None, None);
         assert_eq!(result.unwrap(), "https://api.notion.com");
     }
 
@@ -1324,7 +1386,7 @@ mod tests {
     fn test_resolve_base_url_with_placeholder() {
         let mut creds = Map::new();
         creds.insert("domain".into(), json!("mycompany.atlassian.net"));
-        let result = resolve_base_url("https://{domain}/rest/api/3", Some(&creds));
+        let result = resolve_base_url("https://{domain}/rest/api/3", Some(&creds), None);
         assert_eq!(
             result.unwrap(),
             "https://mycompany.atlassian.net/rest/api/3"
@@ -1336,22 +1398,65 @@ mod tests {
         let mut creds = Map::new();
         creds.insert("subdomain".into(), json!("acme"));
         creds.insert("region".into(), json!("us1"));
-        let result = resolve_base_url("https://{subdomain}.{region}.api.com", Some(&creds));
+        let result = resolve_base_url("https://{subdomain}.{region}.api.com", Some(&creds), None);
         assert_eq!(result.unwrap(), "https://acme.us1.api.com");
     }
 
     #[test]
     fn test_resolve_base_url_unresolved_placeholder_fails() {
         let creds = Map::new(); // empty — no "domain" field
-        let result = resolve_base_url("https://{domain}.zendesk.com/api/v2", Some(&creds));
+        let result = resolve_base_url("https://{domain}.zendesk.com/api/v2", Some(&creds), None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("{domain}"));
     }
 
     #[test]
     fn test_resolve_base_url_no_creds_with_placeholder_fails() {
-        let result = resolve_base_url("https://{domain}.example.com", None);
+        let result = resolve_base_url("https://{domain}.example.com", None, None);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_resolve_base_url_from_oauth_extras() {
+        // QuickBooks-style: {realmId} lives in the OAuth token JSON, not in creds.
+        let oauth = json!({
+            "access_token": "xxx",
+            "refresh_token": "yyy",
+            "realmId": "9341451956283849",
+        });
+        let result = resolve_base_url(
+            "https://quickbooks.api.intuit.com/v3/company/{realmId}",
+            None,
+            Some(&oauth),
+        );
+        assert_eq!(
+            result.unwrap(),
+            "https://quickbooks.api.intuit.com/v3/company/9341451956283849"
+        );
+    }
+
+    #[test]
+    fn test_resolve_base_url_creds_win_over_oauth_extras() {
+        // If both sources define the same key, creds wins (applied first).
+        let mut creds = Map::new();
+        creds.insert("region".into(), json!("eu"));
+        let oauth = json!({ "region": "us" });
+        let result = resolve_base_url(
+            "https://api.{region}.example.com",
+            Some(&creds),
+            Some(&oauth),
+        );
+        assert_eq!(result.unwrap(), "https://api.eu.example.com");
+    }
+
+    #[test]
+    fn test_resolve_base_url_rejects_token_fields_from_oauth() {
+        // Tokens must never be allowed to fill a URL placeholder even if a
+        // malicious/misconfigured integration tried to use {access_token}.
+        let oauth = json!({ "access_token": "secret-token-should-not-leak" });
+        let result = resolve_base_url("https://api.example.com/{access_token}", None, Some(&oauth));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("{access_token}"));
     }
 
     // -- resolve_auth -------------------------------------------------------

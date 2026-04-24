@@ -10,6 +10,7 @@
 //! parses configs, runs the scheduler, and delegates execution to an
 //! [`AgentExecutor`].
 
+pub mod favorites;
 pub mod permissions;
 pub mod preset_fallback;
 pub mod sync;
@@ -3295,13 +3296,31 @@ impl PipeManager {
                             ),
                         }
                     } else {
-                        (
-                            config.model.clone(),
-                            config.provider.clone(),
-                            None,
-                            None,
-                            None,
-                        )
+                        // No preset in pipe config — use the user's default preset
+                        // so scheduled pipes respect the user's AI settings instead
+                        // of silently falling through to screenpipe cloud.
+                        match resolve_preset(&pipes_dir, "default") {
+                            Some(resolved) => {
+                                info!(
+                                    "scheduler: pipe '{}' has no preset configured, using user's default preset → model={}, provider={:?}",
+                                    name, resolved.model, resolved.provider
+                                );
+                                (
+                                    resolved.model,
+                                    resolved.provider,
+                                    resolved.url,
+                                    resolved.api_key,
+                                    resolved.prompt,
+                                )
+                            }
+                            None => (
+                                config.model.clone(),
+                                config.provider.clone(),
+                                None,
+                                None,
+                                None,
+                            ),
+                        }
                     };
 
                     // Pre-configure pi with the pipe's provider
@@ -4617,7 +4636,7 @@ mod tests {
         let content = "---\nschedule: manual\n---\n\nBody";
         let (config, _) = parse_frontmatter(content).unwrap();
         assert_eq!(config.agent, "pi");
-        assert_eq!(config.model, "claude-haiku-4-5");
+        assert_eq!(config.model, "auto");
         assert!(config.enabled);
         assert!(config.provider.is_none());
     }

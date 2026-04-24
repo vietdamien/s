@@ -9,6 +9,7 @@
 
 pub mod airtable;
 pub mod asana;
+pub mod bitrix24;
 pub mod brex;
 pub mod calcom;
 pub mod calendly;
@@ -22,6 +23,8 @@ pub mod github_issues;
 pub mod glean;
 pub mod gmail;
 pub mod google_calendar;
+pub mod google_docs;
+pub mod google_sheets;
 pub mod granola;
 pub mod hubspot;
 pub mod intercom;
@@ -30,6 +33,7 @@ pub mod lexi;
 pub mod limitless;
 pub mod linear;
 pub mod logseq;
+pub mod loops;
 pub mod make;
 pub mod microsoft365;
 pub mod monday;
@@ -41,10 +45,13 @@ pub mod otter;
 pub mod perplexity;
 pub mod pipedrive;
 pub mod pushover;
+pub mod quickbooks;
+pub mod resend;
 pub mod salesforce;
 pub mod sentry;
 pub mod slack;
 pub mod stripe;
+pub mod supabase;
 pub mod teams;
 pub mod telegram;
 pub mod todoist;
@@ -180,6 +187,7 @@ pub fn all_integrations() -> Vec<Box<dyn Integration>> {
         Box::new(jira::Jira),
         Box::new(granola::Granola),
         Box::new(hubspot::HubSpot),
+        Box::new(bitrix24::Bitrix24),
         Box::new(limitless::Limitless),
         Box::new(airtable::Airtable),
         Box::new(logseq::Logseq),
@@ -209,6 +217,12 @@ pub fn all_integrations() -> Vec<Box<dyn Integration>> {
         Box::new(glean::Glean),
         Box::new(gmail::Gmail),
         Box::new(google_calendar::GoogleCalendar),
+        Box::new(google_docs::GoogleDocs),
+        Box::new(google_sheets::GoogleSheets),
+        Box::new(quickbooks::QuickBooks),
+        Box::new(loops::Loops),
+        Box::new(resend::Resend),
+        Box::new(supabase::Supabase),
     ]
 }
 

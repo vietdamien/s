@@ -178,14 +178,22 @@ export function configureApi(opts: {
   authEnabled?: boolean;
 }) {
   if (opts.port !== undefined) _port = opts.port;
-  if (opts.apiKey !== undefined) _apiKey = opts.apiKey || null;
+  // Only overwrite the cached key when the caller has a real value to set.
+  // settings.apiKey is empty for users on the auto-generated server key, and
+  // wiping _apiKey to null here would race with `ensureInitialized` and break
+  // every WS connection (cookie auth + ?token= both come from this same var).
+  if (opts.apiKey) _apiKey = opts.apiKey;
   if (opts.authEnabled !== undefined) _authEnabled = opts.authEnabled;
   _initialized = true;
 
-  // Update auth cookie
+  // Update auth cookie. Only clear when auth is explicitly disabled — if it's
+  // enabled but _apiKey is momentarily null (init not finished), leave any
+  // existing cookie alone so ensureInitialized can rewrite it once the IPC
+  // returns. Clearing on every settings reload was the root cause of the WS
+  // 403 storm reported by users on April 21 2026.
   if (_authEnabled && _apiKey) {
     document.cookie = `screenpipe_auth=${_apiKey}; path=/; SameSite=Strict`;
-  } else {
+  } else if (!_authEnabled) {
     document.cookie = "screenpipe_auth=; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT";
   }
 }

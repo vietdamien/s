@@ -118,6 +118,10 @@ const MODEL_WEIGHTS: Record<string, number> = {
   'glm-4.7': 0,
   'glm-5': 0,
   'kimi-k2.5': 0,
+  // Opus 4.7 is ~3× cheaper per token than 4.5/4.6 ($5/$25 vs $15/$75 per 1M),
+  // so it consumes proportionally less daily quota. Longest-prefix match in
+  // getModelWeight ensures this override beats the generic 'claude-opus' entry.
+  'claude-opus-4-7': 5,
   'claude-opus': 15,
   'claude-sonnet': 3,
   'claude-haiku': 1,
@@ -373,7 +377,11 @@ export async function trackUsage(
       dailyCount = weight;
     }
 
-    const allowed = dailyCount <= limits.dailyQueries;
+    // Free models (weight 0) are always allowed. Without this, an earlier
+    // paid-model run that pushed daily_count past the cap would make every
+    // subsequent auto/gemini-flash/kimi request look rejected here, even
+    // though weight=0 never increments the counter.
+    const allowed = weight === 0 || dailyCount <= limits.dailyQueries;
 
     return {
       used: dailyCount,

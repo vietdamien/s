@@ -7,7 +7,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 use tauri::AppHandle;
 use tauri_plugin_store::StoreBuilder;
-use tracing::error;
+use tracing::{error, warn};
 
 /// Process-lifetime cache for the resolved API auth key.
 ///
@@ -1077,7 +1077,11 @@ pub fn init_store(app: &AppHandle) -> Result<SettingsStore, String> {
 
     if should_save {
         if let Err(e) = store.save(app) {
-            error!("Failed to save initial settings store (non-fatal): {}", e);
+            // Non-fatal — logged as warn (not error) so Sentry doesn't pick it up.
+            // Common cause on Windows: antivirus / Controlled Folder Access / OneDrive
+            // blocks the first write; we retry on subsequent saves so the user isn't
+            // actually stuck. Not worth paging Louis about.
+            warn!("Failed to save initial settings store (non-fatal): {}", e);
         }
     }
     Ok(store)
@@ -1102,7 +1106,9 @@ pub fn init_onboarding_store(app: &AppHandle) -> Result<OnboardingStore, String>
 
     if should_save {
         if let Err(e) = onboarding.save(app) {
-            error!("Failed to save initial onboarding store (non-fatal): {}", e);
+            // Non-fatal — logged as warn (not error) so Sentry doesn't pick it up.
+            // See matching comment in init_settings_store.
+            warn!("Failed to save initial onboarding store (non-fatal): {}", e);
         }
     }
     Ok(onboarding)

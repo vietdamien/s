@@ -9,6 +9,7 @@
 //! [`AgentExecutor`] trait lets the pipe runtime stay agent-agnostic — swap
 //! implementations without touching any pipe code.
 
+pub mod bash_env;
 pub mod pi;
 
 use anyhow::Result;

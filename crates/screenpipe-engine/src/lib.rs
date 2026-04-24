@@ -15,6 +15,8 @@ pub mod connections_api;
 pub mod core;
 pub mod drm_detector;
 pub mod event_driven_capture;
+pub mod focus_aware_controller;
+pub mod focus_tracker;
 pub mod hot_frame_cache;
 pub mod logging;
 pub mod meeting_detector;
@@ -37,7 +39,10 @@ pub mod snapshot_compaction;
 mod sync_api;
 pub mod sync_provider;
 pub mod ui_recorder;
-mod video;
+// Exposed publicly so the commercial `screenpipe-sdk` (screenpipe/sdk repo)
+// can wrap `start_ffmpeg_process` / `write_frame_to_ffmpeg` /
+// `finish_ffmpeg_process` without re-implementing the encoder pipeline.
+pub mod video;
 pub mod video_cache;
 pub mod video_utils;
 pub mod vision_manager;

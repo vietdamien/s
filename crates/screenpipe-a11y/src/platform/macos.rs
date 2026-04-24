@@ -358,6 +358,7 @@ fn run_event_tap(
                     std::thread::sleep(std::time::Duration::from_millis(req.delay_ms));
                 }
                 let content = if req.capture_content {
+                    let _pool = cidre::objc::AutoreleasePoolPage::push();
                     get_clipboard().map(|s| {
                         let truncated = truncate(&s, 1000);
                         if req.apply_pii {

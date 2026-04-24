@@ -166,9 +166,12 @@ pub async fn process_transcription_result(
                     tokio::time::sleep(std::time::Duration::from_millis(500 * (retry as u64 + 1)))
                         .await;
                 } else {
+                    // device as a structured field so Sentry dedups across
+                    // different devices into a single issue.
                     error!(
-                        "Failed to insert audio chunk+transcription for device {} after 3 retries: {}",
-                        result.input.device, e
+                        device = %result.input.device,
+                        error = %e,
+                        "Failed to insert audio chunk+transcription after 3 retries"
                     );
                 }
             }

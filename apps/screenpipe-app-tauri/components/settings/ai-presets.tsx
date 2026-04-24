@@ -12,6 +12,12 @@ import {
   useSettings,
 } from "@/lib/hooks/use-settings";
 import {
+  useUsageStatus,
+  messagesLeftForModel,
+  shouldWarnLowQuota,
+  formatResetTime,
+} from "@/lib/hooks/use-usage-status";
+import {
   buildChatTestBody,
   shouldRetryWithMaxCompletionTokens,
 } from "@/lib/utils/chat-test-body";
@@ -177,6 +183,9 @@ export interface AIModel {
   cost_tier?: 'free' | 'low' | 'medium' | 'high' | 'very_high';
   recommended_for?: string[];
   warning?: string;
+  /** How many daily-quota units one message on this model consumes.
+   *  0 = free / doesn't count. Populated by the screenpipe worker. */
+  query_weight?: number;
 }
 
 export const AIProviderCard = ({
@@ -236,6 +245,9 @@ const AISection = ({
 }) => {
   const { settings, updateSettings } = useSettings();
   const isEnterprise = useIsEnterpriseBuild();
+  // Daily quota snapshot — drives the "N left today" chip on weighted
+  // models. Null on BYOK providers; we render nothing in that case.
+  const usage = useUsageStatus();
   const [settingsPreset, setSettingsPreset] = useState<
     Partial<AIPreset> | undefined
   >(preset);
@@ -1418,6 +1430,18 @@ const AISection = ({
                                 <div className="flex items-center gap-1 ml-2">
                                   {costLabel && <Badge variant="outline" className="text-[10px]">{costLabel}</Badge>}
                                   {model.speed === "fast" && <Badge variant="outline" className="text-[10px]">fast</Badge>}
+                                  {/* Low-quota warning — only renders when the user is within
+                                      ~30% of exhausting their daily cap for this specific model.
+                                      Silent otherwise (normal state = no extra clutter). */}
+                                  {shouldWarnLowQuota(usage, model.query_weight) && (
+                                    <Badge
+                                      variant="outline"
+                                      className="text-[10px] bg-yellow-500/10 text-yellow-700 border-yellow-500/40 dark:text-yellow-400"
+                                      title={`approaching daily limit${usage?.resets_at ? ` — resets ${formatResetTime(usage.resets_at)}` : ""}`}
+                                    >
+                                      ≈ {messagesLeftForModel(usage, model.query_weight)} left
+                                    </Badge>
+                                  )}
                                 </div>
                               </div>
                               <span className="text-xs text-muted-foreground">

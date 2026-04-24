@@ -11,6 +11,35 @@ use crate::{
 use tauri::{Emitter, Manager};
 use tracing::{debug, error, info, warn};
 
+/// Log a `WebviewWindowBuilder::build()` failure with structured context.
+///
+/// Why: Sentry events for webview build failures currently say only
+/// "failed to create webview: WebView2 error: …". Without knowing which
+/// window was being built (pipe-store, login, notifications, etc.) we
+/// can't triage.
+///
+/// Tracing's `sentry` layer (see `main.rs`) maps structured fields to
+/// Sentry tags, so `webview_label` and `webview_url` become filterable
+/// tags in the Sentry dashboard.
+///
+/// Call at every `WebviewWindowBuilder::build()` error site instead of
+/// a bare `error!(...)`. Return the error unchanged — this function is
+/// purely observability.
+fn log_webview_build_failure(
+    label: &str,
+    url_hint: &str,
+    err: &(impl std::fmt::Display + ?Sized),
+) {
+    tracing::error!(
+        webview_label = label,
+        webview_url = url_hint,
+        "failed to create webview (label={}, url={}): {}",
+        label,
+        url_hint,
+        err
+    );
+}
+
 /// Global app handle stored so the native notification action callback can emit events.
 #[cfg(target_os = "macos")]
 static GLOBAL_APP_HANDLE: std::sync::OnceLock<tauri::AppHandle> = std::sync::OnceLock::new();
@@ -28,32 +57,92 @@ extern "C" fn native_notif_action_callback(json_ptr: *const std::os::raw::c_char
         .to_string();
     info!("native notification action: {}", json);
 
-    if let Some(app) = GLOBAL_APP_HANDLE.get() {
-        // Handle "manage" directly in Rust — opens the Home window to notifications section.
-        // This avoids relying on JS event listeners which may not be active.
-        if json.contains("\"type\":\"manage\"") {
-            let app_clone = app.clone();
-            // Spawn a thread so we don't block the Swift main thread
-            std::thread::spawn(move || {
-                // Show the home window (needs main thread on macOS)
+    let Some(app) = GLOBAL_APP_HANDLE.get() else {
+        return;
+    };
+
+    // Parse once so downstream branches can dispatch on structured fields
+    // instead of doing fragile substring matches on the JSON string.
+    let parsed: Option<serde_json::Value> = serde_json::from_str(&json).ok();
+    let action_type = parsed
+        .as_ref()
+        .and_then(|v| v.get("type"))
+        .and_then(|v| v.as_str());
+
+    // "manage" — open the Home window to notifications settings. Handled in
+    // Rust rather than via JS emit so it works even when no React window is
+    // currently mounted.
+    if action_type == Some("manage") {
+        let app_clone = app.clone();
+        std::thread::spawn(move || {
+            let app_for_show = app_clone.clone();
+            let _ = app_clone.run_on_main_thread(move || {
+                if let Err(e) = (ShowRewindWindow::Home { page: None }).show(&app_for_show) {
+                    error!("failed to show home window for manage: {}", e);
+                }
+            });
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let _ = app_clone.emit(
+                "navigate",
+                serde_json::json!({ "url": "/home?section=notifications" }),
+            );
+        });
+        return;
+    }
+
+    // URL-opening actions. Two distinct semantics, explicit types so senders
+    // can't conflate them:
+    //   "link"      → external URL, opened in the user's default browser
+    //   "deeplink"  → screenpipe:// in-app route, dispatched to DeeplinkHandler
+    //
+    // Both are handled in Rust rather than via JS emit so clicks work even
+    // when the overlay window (which hosts the JS listener in
+    // `components/notification-handler.tsx`) isn't mounted. Previous
+    // implementation relied on that listener and silently did nothing when
+    // overlay wasn't running — which is the common case for a native
+    // notification shown over the desktop.
+    if action_type == Some("link") || action_type == Some("deeplink") {
+        let url = parsed
+            .as_ref()
+            .and_then(|v| v.get("url"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let Some(url) = url else {
+            warn!("{} notification action has no url: {}", action_type.unwrap(), json);
+            return;
+        };
+
+        // Guard against senders putting a browser URL into "deeplink" or a
+        // screenpipe:// URL into "link". We route on actual scheme, not on
+        // the declared type, so a typo doesn't break the click.
+        let is_in_app = url.starts_with("screenpipe://");
+        let app_clone = app.clone();
+        std::thread::spawn(move || {
+            if is_in_app {
+                // Show Main first so DeeplinkHandler is mounted, then emit.
                 let app_for_show = app_clone.clone();
                 let _ = app_clone.run_on_main_thread(move || {
-                    if let Err(e) = (ShowRewindWindow::Home { page: None }).show(&app_for_show) {
-                        error!("failed to show home window for manage: {}", e);
+                    if let Err(e) = ShowRewindWindow::Main.show(&app_for_show) {
+                        error!("failed to show Main window for deeplink: {}", e);
                     }
                 });
-                // Give the window time to mount its React listener
-                std::thread::sleep(std::time::Duration::from_millis(500));
-                let _ = app_clone.emit(
-                    "navigate",
-                    serde_json::json!({ "url": "/home?section=notifications" }),
-                );
-            });
-            return;
-        }
-
-        let _ = app.emit("native-notification-action", &json);
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                let _ = app_clone.emit("deep-link-received", url);
+            } else {
+                // External URL — hand off to the opener plugin.
+                use tauri_plugin_opener::OpenerExt;
+                if let Err(e) = app_clone.opener().open_url(&url, None::<&str>) {
+                    error!("failed to open url '{}' from notification: {}", url, e);
+                }
+            }
+        });
+        return;
     }
+
+    // Everything else (pipe, api, mute, dismiss, auto_dismiss, legacy string
+    // actions) still goes to the JS handler. The overlay window owns those
+    // because they need access to posthog / localforage / chat prefill.
+    let _ = app.emit("native-notification-action", &json);
 }
 
 /// Callback invoked from Swift when user clicks a shortcut reminder action.
@@ -549,12 +638,13 @@ pub async fn open_pipe_window(
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     }
 
+    let url = format!("http://localhost:{}", port);
     let window = match tauri::WebviewWindowBuilder::new(
         &app_handle,
         &title,
-        tauri::WebviewUrl::External(format!("http://localhost:{}", port).parse().unwrap()),
+        tauri::WebviewUrl::External(url.parse().unwrap()),
     )
-    .title(title)
+    .title(title.clone())
     .inner_size(1200.0, 850.0)
     .min_inner_size(600.0, 400.0)
     .focused(true)
@@ -564,7 +654,7 @@ pub async fn open_pipe_window(
     {
         Ok(window) => window,
         Err(e) => {
-            error!("failed to create window: {}", e);
+            log_webview_build_failure(&title, &url, &e);
             return Err(format!("failed to create window: {}", e));
         }
     };
@@ -670,10 +760,11 @@ pub async fn open_login_window(app_handle: tauri::AppHandle) -> Result<(), Strin
 
         let app_for_nav = app_handle.clone();
 
+        const LOGIN_URL: &str = "https://screenpi.pe/login";
         WebviewWindowBuilder::new(
             &app_handle,
             label,
-            WebviewUrl::External("https://screenpi.pe/login".parse().unwrap()),
+            WebviewUrl::External(LOGIN_URL.parse().unwrap()),
         )
         .title("sign in to screenpipe")
         .inner_size(460.0, 700.0)
@@ -694,7 +785,10 @@ pub async fn open_login_window(app_handle: tauri::AppHandle) -> Result<(), Strin
         })
         .build()
         .map(crate::window::finalize_webview_window)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| {
+            log_webview_build_failure(label, LOGIN_URL, &e);
+            e.to_string()
+        })?;
 
         Ok(())
     }
@@ -723,10 +817,13 @@ pub async fn open_google_calendar_auth_window(
 
     let app_for_nav = app_handle.clone();
 
+    let parsed_url = auth_url
+        .parse()
+        .map_err(|e| format!("invalid url: {e}"))?;
     WebviewWindowBuilder::new(
         &app_handle,
         label,
-        WebviewUrl::External(auth_url.parse().map_err(|e| format!("invalid url: {e}"))?),
+        WebviewUrl::External(parsed_url),
     )
     .title("connect google calendar")
     .inner_size(500.0, 700.0)
@@ -745,7 +842,10 @@ pub async fn open_google_calendar_auth_window(
     })
     .build()
     .map(crate::window::finalize_webview_window)
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| {
+        log_webview_build_failure(label, &auth_url, &e);
+        e.to_string()
+    })?;
 
     Ok(())
 }
@@ -778,6 +878,43 @@ pub async fn show_window(
 
     window.show(&app_handle).map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// Like `show_window` but forces macOS app activation first, so the target
+/// window actually comes to the foreground when the caller is a
+/// `NSNonactivatingPanelMask` panel (notifications, tray, etc.).
+///
+/// Without this, clicking "Open" in the notification panel on macOS often
+/// appears to do nothing: the non-activating panel style prevents the app
+/// from becoming active, and overlay/fullscreen main modes rely on an
+/// activate-aware `show_panel_visible(activate_app=true)` path that only
+/// fires for `overlay_mode == "window"`. The window technically shows but
+/// stays behind whatever app the user was in.
+///
+/// Callers that represent explicit user intent (clicking Open on a
+/// notification) should use this variant. Passive show-surface callers
+/// should keep using `show_window` to avoid stealing focus unnecessarily.
+#[tauri::command]
+#[specta::specta]
+pub async fn show_window_activated(
+    app_handle: tauri::AppHandle,
+    window: ShowRewindWindow,
+) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        app_handle
+            .run_on_main_thread(|| {
+                use objc::{msg_send, sel, sel_impl};
+                use tauri_nspanel::cocoa::base::id;
+                unsafe {
+                    let ns_app: id =
+                        msg_send![objc::class!(NSApplication), sharedApplication];
+                    let _: () = msg_send![ns_app, activateIgnoringOtherApps: true];
+                }
+            })
+            .map_err(|e| format!("failed to activate app: {}", e))?;
+    }
+    show_window(app_handle, window).await
 }
 
 /// Re-assert the WKWebView as first responder for the current key panel.
@@ -1342,7 +1479,10 @@ pub async fn show_shortcut_reminder(
     let window = builder
         .build()
         .map(crate::window::finalize_webview_window)
-        .map_err(|e| format!("Failed to create shortcut reminder window: {}", e))?;
+        .map_err(|e| {
+            log_webview_build_failure(label, "shortcut-reminder", &e);
+            format!("Failed to create shortcut reminder window: {}", e)
+        })?;
 
     info!("shortcut-reminder window created");
 
@@ -1624,7 +1764,10 @@ pub async fn show_notification_panel(
     let window = builder
         .build()
         .map(crate::window::finalize_webview_window)
-        .map_err(|e| format!("Failed to create notification panel window: {}", e))?;
+        .map_err(|e| {
+            log_webview_build_failure(label, "notification-panel", &e);
+            format!("Failed to create notification panel window: {}", e)
+        })?;
 
     info!("notification-panel window created");
 

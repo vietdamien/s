@@ -7,6 +7,7 @@
 // ============================================================================
 
 import { emit, listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { commands } from "@/lib/utils/tauri";
 
 // ============================================================================
@@ -23,6 +24,9 @@ export interface ChatPrefillData {
   useHomeChat?: boolean;
 }
 
+const CHAT_READY_TIMEOUT_MS = 2500;
+const CHAT_READY_MAX_ATTEMPTS = 3;
+
 /**
  * Show a chat window and reliably deliver a chat-prefill event.
  *
@@ -36,29 +40,72 @@ export interface ChatPrefillData {
  */
 export async function showChatWithPrefill(data: ChatPrefillData): Promise<void> {
   const targetWindow = data.useHomeChat ? "home" : "chat";
+  const currentWindowLabel = getCurrentWindow().label;
+
+  // If we're already in the Home window but on another route (e.g. /settings),
+  // route locally and pass prefill through sessionStorage so the embedded chat
+  // can consume it after /home mounts.
+  if (data.useHomeChat && currentWindowLabel === "home") {
+    const url = new URL(window.location.href);
+    const isHomeRoute = url.pathname === "/home";
+    const isHomeSection = url.searchParams.get("section") === "home";
+
+    if (!isHomeRoute || !isHomeSection) {
+      sessionStorage.setItem(
+        "pendingChatPrefill",
+        JSON.stringify({ ...data, targetWindow }),
+      );
+      window.location.assign("/home?section=home");
+      return;
+    }
+  }
 
   if (data.useHomeChat) {
-    await commands.showWindow({ Home: { page: null } });
+    // Home chat only mounts when section=home; focusing a non-home section can
+    // drop prefill events because no chat listener exists yet.
+    await commands.showWindow({ Home: { page: "home" } });
   } else {
     await commands.showWindow("Chat");
   }
 
-  // Wait for the chat component to signal readiness.
-  await new Promise<void>((resolve) => {
-    let resolved = false;
-    const done = () => {
-      if (resolved) return;
-      resolved = true;
-      clearTimeout(timeout);
-      unlistenPromise.then((fn) => fn());
-      resolve();
-    };
-    const timeout = setTimeout(done, 5000);
-    const unlistenPromise = listen("chat-ready", done);
-    // Ping in case chat is already mounted (won't re-emit "chat-ready" on its own).
-    // Small delay to ensure the listen call above has registered first.
-    setTimeout(() => emit("chat-ping", {}), 50);
-  });
+  let chatReady = false;
+  for (let attempt = 1; attempt <= CHAT_READY_MAX_ATTEMPTS; attempt++) {
+    // Wait for the chat component to signal readiness in the intended window.
+    chatReady = await new Promise<boolean>((resolve) => {
+      let resolved = false;
+      const done = (ready: boolean) => {
+        if (resolved) return;
+        resolved = true;
+        clearTimeout(timeout);
+        unlistenPromise.then((fn) => fn());
+        resolve(ready);
+      };
+
+      const timeout = setTimeout(() => done(false), CHAT_READY_TIMEOUT_MS);
+      const unlistenPromise = listen<{ windowLabel?: string }>(
+        "chat-ready",
+        (event) => {
+          const readyWindow = event.payload?.windowLabel;
+          if (readyWindow && readyWindow !== targetWindow) return;
+          done(true);
+        },
+      );
+
+      // Ping in case chat is already mounted and won't re-emit on its own.
+      setTimeout(() => {
+        emit("chat-ping", { targetWindow });
+      }, 50);
+    });
+
+    if (chatReady) {
+      break;
+    }
+  }
+
+  if (!chatReady) {
+    throw new Error(`chat did not become ready in ${targetWindow} window`);
+  }
+
   await emit("chat-prefill", { ...data, targetWindow });
 }
 

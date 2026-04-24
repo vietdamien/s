@@ -56,4 +56,11 @@ pub mod stream_invalidation {
     pub fn invalidate_streams() {
         sck_rs::stop_all_streams();
     }
+
+    /// Stop the persistent SCStream for a single monitor. Used when a monitor
+    /// goes Cold so `replayd` stops capturing frames we're not reading. The
+    /// stream is lazily recreated on the next capture call after focus returns.
+    pub fn invalidate_monitor_stream(monitor_id: u32) {
+        sck_rs::invalidate_monitor_stream(monitor_id);
+    }
 }

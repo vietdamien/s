@@ -294,6 +294,10 @@ async fn main() -> anyhow::Result<()> {
             screenpipe_engine::cli::login::handle_login_command().await?;
             return Ok(());
         }
+        Command::Logout => {
+            screenpipe_engine::cli::login::handle_logout_command().await?;
+            return Ok(());
+        }
         Command::Whoami => {
             screenpipe_engine::cli::login::handle_whoami_command().await?;
             return Ok(());

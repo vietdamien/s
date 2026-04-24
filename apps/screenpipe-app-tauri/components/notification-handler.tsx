@@ -180,8 +180,21 @@ const NotificationHandler: React.FC = () => {
           return;
         }
 
-        if (action.type === "deeplink" && action.url) {
-          if (action.url.startsWith("screenpipe://")) {
+        // URL-opening actions. Two explicit types so senders can't conflate
+        // them:
+        //   "link"      — external URL, opens in default browser
+        //   "deeplink"  — screenpipe:// in-app route
+        //
+        // Note: these are also handled in Rust inside `native_notif_action_callback`
+        // for the native macOS panel case (where this JS listener may not be
+        // alive). This JS branch remains for the webview notification panel.
+        // Routing is on URL scheme, not the declared type, so a mislabeled
+        // payload still works.
+        if ((action.type === "link" || action.type === "deeplink") && action.url) {
+          if (typeof action.url === "string" && action.url.startsWith("screenpipe://")) {
+            const { invoke } = await import("@tauri-apps/api/core");
+            await invoke("show_window_activated", { window: "Main" });
+            await new Promise((r) => setTimeout(r, 150));
             const { emit } = await import("@tauri-apps/api/event");
             await emit("deep-link-received", action.url);
           } else {
@@ -191,12 +204,15 @@ const NotificationHandler: React.FC = () => {
           return;
         }
 
-        // Legacy string actions
+        // Legacy string actions. Use `show_window_activated` rather than
+        // `show_window` — notifications can be clicked from outside the app's
+        // active space, and the NonActivating panel style prevents NSApp
+        // activation otherwise.
         const { invoke } = await import("@tauri-apps/api/core");
         if (action.action === "open_timeline") {
-          await invoke("show_window", { window: "Main" });
+          await invoke("show_window_activated", { window: "Main" });
         } else if (action.action === "open_chat") {
-          await invoke("show_window", { window: "Chat" });
+          await invoke("show_window_activated", { window: "Chat" });
         } else if (action.action === "open_pipe_suggestions") {
           await showChatWithPrefill({
             context: PIPE_SUGGESTION_PROMPT,

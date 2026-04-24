@@ -72,10 +72,20 @@ pub struct RecordingSettings {
 
     /// Experimental: capture System Audio via the CoreAudio Process Tap API
     /// (macOS 14.4+) instead of ScreenCaptureKit. Avoids SCK's display
-    /// enumeration failures after sleep/wake and the GPU/compositor wake
-    /// overhead. Off by default — existing users keep the SCK path.
-    /// Ignored on macOS <14.4 and on non-macOS platforms.
-    #[serde(rename = "experimentalCoreaudioSystemAudio", default)]
+    /// enumeration failures after sleep/wake, the GPU/compositor wake
+    /// overhead, and — most importantly — captures audio that's been
+    /// routed to a Bluetooth headset via HFP (which SCK can't see; see
+    /// Ruark Ferreira's 2026-04-24 Zoom call where AirPods-as-input
+    /// silently routed output away from the SCK-visible mixer).
+    ///
+    /// Default `true`: if tap creation fails for any reason (permission,
+    /// macOS <14.4, OS quirk), stream.rs falls back to the SCK path
+    /// automatically — so flipping the default on can't regress anyone.
+    /// Ignored on non-macOS platforms.
+    #[serde(
+        rename = "experimentalCoreaudioSystemAudio",
+        default = "default_experimental_coreaudio_system_audio"
+    )]
     pub experimental_coreaudio_system_audio: bool,
 
     /// Duration of each audio chunk in seconds before transcription.
@@ -277,6 +287,15 @@ pub struct RecordingSettings {
     /// Custom API key for remote authentication. If empty, a key is auto-generated.
     #[serde(rename = "apiKey", default)]
     pub api_key: String,
+
+    /// When true, the HTTP server binds to `0.0.0.0` so other devices on the
+    /// LAN can reach the screenpipe API. Off by default — the server binds
+    /// `127.0.0.1` (localhost only) which is the safe choice.
+    ///
+    /// `api_auth` is force-enabled whenever this is true; [`RecordingConfig::from_settings`]
+    /// overrides it, so a user can't accidentally expose the API unauthenticated on their network.
+    #[serde(rename = "listenOnLan", default)]
+    pub listen_on_lan: bool,
 }
 
 impl RecordingSettings {
@@ -354,11 +373,18 @@ impl Default for RecordingSettings {
             schedule_rules: vec![],
             api_auth: true,
             api_key: String::new(),
+            listen_on_lan: false,
         }
     }
 }
 
 fn default_true() -> bool {
+    true
+}
+
+/// Default `true` — stream.rs has an automatic fallback to SCK if the
+/// Process Tap can't start, so this is safe on every platform.
+fn default_experimental_coreaudio_system_audio() -> bool {
     true
 }
 

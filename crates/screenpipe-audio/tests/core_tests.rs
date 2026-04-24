@@ -65,7 +65,7 @@ mod tests {
         let is_running = Arc::new(AtomicBool::new(true));
         let is_running_clone = Arc::clone(&is_running);
 
-        let audio_stream = AudioStream::from_device(device_spec, is_running_clone)
+        let audio_stream = AudioStream::from_device(device_spec, is_running_clone, false)
             .await
             .unwrap();
 
@@ -126,7 +126,7 @@ mod tests {
         let is_running = Arc::new(AtomicBool::new(true));
         let is_running_clone = Arc::clone(&is_running);
 
-        let audio_stream = AudioStream::from_device(device_spec, is_running_clone.clone())
+        let audio_stream = AudioStream::from_device(device_spec, is_running_clone.clone(), false)
             .await
             .unwrap();
 

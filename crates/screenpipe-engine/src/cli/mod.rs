@@ -221,6 +221,9 @@ pub enum Command {
     /// Authenticate with screenpipe cloud
     Login,
 
+    /// Sign out of screenpipe cloud (clears the auth token from store.bin)
+    Logout,
+
     /// Show current auth status
     Whoami,
 
@@ -287,11 +290,13 @@ pub struct RecordArgs {
     #[arg(short = 'a', long, value_enum, default_value_t = default_audio_engine())]
     pub audio_transcription_engine: CliAudioTranscriptionEngine,
 
-    /// Monitor IDs to use
+    /// Monitor IDs to record. May be specified multiple times.
+    /// When set, only the listed monitors are recorded (implies
+    /// `--use-all-monitors=false`).
     #[arg(short = 'm', long)]
     pub monitor_id: Vec<u32>,
 
-    /// Automatically record all monitors
+    /// Automatically record all monitors. Ignored when `--monitor-id` is passed.
     #[arg(long, default_value_t = true)]
     pub use_all_monitors: bool,
 
@@ -376,6 +381,13 @@ pub struct RecordArgs {
     #[arg(long, default_value_t = true)]
     pub api_auth: bool,
 
+    /// Bind the HTTP server to 0.0.0.0 so other devices on the LAN can
+    /// reach it. Off by default — the server binds 127.0.0.1 only.
+    /// `--api-auth` is forced on whenever this flag is used; you can't
+    /// accidentally expose an unauthenticated API on your network.
+    #[arg(long, default_value_t = false)]
+    pub listen_on_lan: bool,
+
     /// Encrypt secrets (API keys, OAuth tokens) at rest using the OS keychain.
     /// Creates a keychain key if one doesn't exist. Without this flag, the CLI
     /// will use an existing key (created by the desktop app) but won't create one.
@@ -437,7 +449,11 @@ impl RecordArgs {
             use_system_default_audio: self.use_system_default_audio,
             experimental_coreaudio_system_audio: self.experimental_coreaudio_system_audio,
             monitor_ids: self.monitor_id.iter().map(|id| id.to_string()).collect(),
-            use_all_monitors: self.use_all_monitors,
+            // Explicit `--monitor-id` implies opting out of `--use-all-monitors`.
+            // `use_all_monitors` has `default_value_t = true`, so without this
+            // override the user-supplied `--monitor-id` list is ignored
+            // downstream (see `VisionManager::is_monitor_allowed`).
+            use_all_monitors: self.use_all_monitors && self.monitor_id.is_empty(),
             ignored_windows: self.ignored_windows.clone(),
             included_windows: self.included_windows.clone(),
             ignored_urls: self.ignored_urls.clone(),
@@ -451,6 +467,7 @@ impl RecordArgs {
             analytics_enabled: !self.disable_telemetry,
             ignore_incognito_windows: true,
             pause_on_drm_content: self.pause_on_drm_content,
+            listen_on_lan: self.listen_on_lan,
             ..screenpipe_config::RecordingSettings::default()
         }
     }
@@ -498,15 +515,16 @@ impl RecordArgs {
                         cli_engine_to_str(&self.audio_transcription_engine).to_string();
 
                     // Restore CLI monitor flags — user's explicit --use-all-monitors or -m
-                    // must win over tier defaults (fixes #2897)
-                    if cli_use_all_monitors {
-                        settings.use_all_monitors = true;
-                        settings.monitor_ids =
-                            cli_monitor_ids.iter().map(|id| id.to_string()).collect();
-                    } else if !cli_monitor_ids.is_empty() {
+                    // must win over tier defaults (fixes #2897).
+                    // Explicit `--monitor-id` implies `use_all_monitors=false`
+                    // so privacy-motivated filtering actually takes effect.
+                    if !cli_monitor_ids.is_empty() {
                         settings.use_all_monitors = false;
                         settings.monitor_ids =
                             cli_monitor_ids.iter().map(|id| id.to_string()).collect();
+                    } else if cli_use_all_monitors {
+                        settings.use_all_monitors = true;
+                        settings.monitor_ids = vec![];
                     }
                 }
                 settings.device_tier = Some(tier.as_str().to_string());
@@ -531,7 +549,16 @@ impl RecordArgs {
 
         let mut config =
             crate::recording_config::RecordingConfig::from_settings(&settings, data_dir, None);
-        config.api_auth = self.api_auth;
+        // Mirror the CLI flag, but never let the user turn auth OFF when
+        // the API is bound to the LAN — that would publish an unauthenticated
+        // service. `from_settings` already enforces this; we reapply it
+        // here so a `--no-api-auth --listen-on-lan` combo still authenticates.
+        config.api_auth = self.api_auth || self.listen_on_lan;
+        if self.listen_on_lan && !self.api_auth {
+            tracing::warn!(
+                "--listen-on-lan was set but --api-auth=false — forcing api_auth on for safety. Use `screenpipe auth token` to view your key."
+            );
+        }
         if config.api_auth {
             let settings_key = if settings.api_key.is_empty() {
                 None
@@ -849,6 +876,57 @@ mod tests {
                     !settings.pause_on_drm_content,
                     "absent flag should be false in settings"
                 );
+            }
+            _ => panic!("expected Record command"),
+        }
+    }
+
+    /// `--monitor-id` must override the `--use-all-monitors=true` default so
+    /// that users restricting capture for privacy actually get only the
+    /// monitors they listed. Regression test for Francesco's report
+    /// (Intercom 215473981910064, Windows 11, 3 monitors).
+    #[test]
+    fn test_monitor_id_disables_use_all_monitors_default() {
+        let cli = Cli::try_parse_from([
+            "screenpipe",
+            "record",
+            "--monitor-id",
+            "65539",
+            "--monitor-id",
+            "65541",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Record(args) => {
+                // The flag itself still shows as true because that is clap's
+                // default for the bool arg — but the resolved settings must
+                // flip it off once the user supplies explicit monitor IDs.
+                assert!(args.use_all_monitors);
+                assert_eq!(args.monitor_id, vec![65539, 65541]);
+                let settings = args.to_recording_settings();
+                assert!(
+                    !settings.use_all_monitors,
+                    "`--monitor-id` must override default `use_all_monitors=true`"
+                );
+                assert_eq!(
+                    settings.monitor_ids,
+                    vec!["65539".to_string(), "65541".to_string()]
+                );
+            }
+            _ => panic!("expected Record command"),
+        }
+    }
+
+    /// Without `--monitor-id`, `use_all_monitors` keeps its `true` default
+    /// so existing behaviour is unchanged.
+    #[test]
+    fn test_no_monitor_id_keeps_use_all_monitors_true() {
+        let cli = Cli::try_parse_from(["screenpipe", "record"]).unwrap();
+        match cli.command {
+            Command::Record(args) => {
+                let settings = args.to_recording_settings();
+                assert!(settings.use_all_monitors);
+                assert!(settings.monitor_ids.is_empty());
             }
             _ => panic!("expected Record command"),
         }

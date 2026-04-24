@@ -1054,6 +1054,33 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
   const { items: appItems } = useSqlAutocomplete("app");
   const { suggestions: autoSuggestions, refreshing: suggestionsRefreshing, forceRefresh: refreshSuggestions } = useAutoSuggestions();
   const { templatePipes, loading: pipesLoading } = usePipes();
+  // Connected integrations (gmail, google-sheets, slack, etc.) surfaced in the
+  // filter popover so users can mention them directly with @id — helps the
+  // agent pick the right connection for a query instead of having to guess.
+  const [connections, setConnections] = useState<
+    Array<{ id: string; name: string; category?: string }>
+  >([]);
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await localFetch("/connections");
+        if (!res.ok) return;
+        const json = (await res.json()) as {
+          data?: Array<{ id: string; name: string; connected: boolean; category?: string }>;
+        };
+        const list = (json.data ?? [])
+          .filter((c) => c.connected)
+          .map((c) => ({ id: c.id, name: c.name, category: c.category }));
+        if (!cancelled) setConnections(list);
+      } catch {
+        // silent — filter just won't surface connections, no UI regression
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // Custom summary templates (persisted in settings)
   const [customTemplates, setCustomTemplates] = useState<CustomTemplate[]>([]);
@@ -1089,6 +1116,61 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
   const [streamedCharCount, setStreamedCharCount] = useState(0);
   const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
   const [openMessageMenuId, setOpenMessageMenuId] = useState<string | null>(null);
+  // Cursor-style inline edit: click a sent user message to tweak and resend
+  const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
+  const [editDraft, setEditDraft] = useState<string>("");
+  // Character offset to seed the caret at when the textarea mounts. Computed
+  // from the click event so the cursor lands where the user pointed, not at
+  // the start of the text — matches Cursor / iMessage edit-in-place feel.
+  const pendingCaretRef = useRef<number | null>(null);
+  const editTextareaRef = useRef<HTMLTextAreaElement | null>(null);
+  // Tracks where mousedown landed on a user message bubble so the mouseup
+  // handler can distinguish a real click (enter edit mode) from a drag-
+  // select (let the browser select text — don't swallow it).
+  const pendingEditDownXYRef = useRef<{ x: number; y: number } | null>(null);
+
+  // Given a click on a rendered message bubble, compute the character offset
+  // into `content` that corresponds to where the user clicked. Falls back to
+  // end-of-text if the browser can't resolve a caret position (old Safari).
+  const caretOffsetFromClick = useCallback((e: React.MouseEvent, content: string): number => {
+    try {
+      // Firefox / WebView2: caretPositionFromPoint ; WebKit: caretRangeFromPoint.
+      const doc = document as Document & {
+        caretPositionFromPoint?: (x: number, y: number) => { offsetNode: Node; offset: number } | null;
+        caretRangeFromPoint?: (x: number, y: number) => Range | null;
+      };
+      let clickedNode: Node | null = null;
+      let clickedOffset = 0;
+      if (doc.caretPositionFromPoint) {
+        const pos = doc.caretPositionFromPoint(e.clientX, e.clientY);
+        if (pos) { clickedNode = pos.offsetNode; clickedOffset = pos.offset; }
+      } else if (doc.caretRangeFromPoint) {
+        const range = doc.caretRangeFromPoint(e.clientX, e.clientY);
+        if (range) { clickedNode = range.startContainer; clickedOffset = range.startOffset; }
+      }
+      if (!clickedNode) return content.length;
+
+      // Walk text nodes under the clicked bubble in document order, summing
+      // their lengths until we reach the clicked node. Gives a best-effort
+      // offset into the visible text — good enough for plain messages; for
+      // markdown it'll be off by the characters of any markup consumed by
+      // the rendered HTML, but the caret still lands near the click.
+      const bubble = (e.currentTarget as HTMLElement);
+      const walker = document.createTreeWalker(bubble, NodeFilter.SHOW_TEXT);
+      let offset = 0;
+      let n: Node | null;
+      while ((n = walker.nextNode())) {
+        if (n === clickedNode) {
+          offset += clickedOffset;
+          return Math.min(offset, content.length);
+        }
+        offset += (n.textContent || "").length;
+      }
+    } catch {
+      // Fall through to end-of-text fallback.
+    }
+    return content.length;
+  }, []);
   const [openConvMenuId, setOpenConvMenuId] = useState<string | null>(null);
   const [renamingConvId, setRenamingConvId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState("");
@@ -1113,6 +1195,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
   const [prefillContext, setPrefillContext] = useState<string | null>(null);
   const [prefillSource, setPrefillSource] = useState<string>("search");
   const [prefillFrameId, setPrefillFrameId] = useState<number | null>(null);
+  const [isPreparingPrefill, setIsPreparingPrefill] = useState(false);
   const [pastedImages, setPastedImages] = useState<string[]>([]); // Base64 data URLs
   const [imageViewer, setImageViewer] = useState<{ images: string[]; index: number } | null>(null);
   const [isDragging, setIsDragging] = useState(false);
@@ -1125,6 +1208,10 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
   const piStreamingTextRef = useRef<string>("");
   const piMessageIdRef = useRef<string | null>(null);
   const piContentBlocksRef = useRef<ContentBlock[]>([]);
+  // Last error text observed anywhere in the current Pi stream — used to surface
+  // quota / credits_exhausted errors when agent_end arrives with no content and
+  // no explicit stopReason=error on any message (some providers drop that flag).
+  const piLastErrorRef = useRef<string | null>(null);
   const piStartInFlightRef = useRef(false);
   const piFirstCallRetried = useRef(false);
   const piStoppedIntentionallyRef = useRef(false);
@@ -1133,7 +1220,18 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
   const piThinkingStartRef = useRef<number | null>(null);
   const piSessionSyncedRef = useRef(false);
   const piSessionIdRef = useRef<string>(crypto.randomUUID());
-  const piRunningConfigRef = useRef<{ provider: string; model: string; token: string | null } | null>(null);
+  // Tracks the config Pi is currently running with so `handlePiRestart` can
+  // decide between a hot-swap (`pi_set_model`) and a full respawn. Update
+  // this ref on every Pi start/restart/swap.
+  const piRunningConfigRef = useRef<{
+    provider: string;
+    model: string;
+    url: string;
+    apiKey: string | null;
+    maxTokens: number;
+    systemPrompt: string | null;
+    token: string | null;
+  } | null>(null);
 
   // Active pipe execution (when watching a running pipe)
   const [activePipeExecution, setActivePipeExecution] = useState<{
@@ -1334,20 +1432,26 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
   // Other windows wait for "chat-ready" before emitting "chat-prefill"
   // to avoid the event being lost when the chat webview is freshly created.
   useEffect(() => {
-    emit("chat-ready", {});
+    const windowLabel = getCurrentWindow().label;
+    emit("chat-ready", { windowLabel });
     // Also respond to "chat-ping" for when the chat is already open
-    const unlisten = listen("chat-ping", () => {
-      emit("chat-ready", {});
+    const unlisten = listen<{ targetWindow?: string }>("chat-ping", (event) => {
+      const targetWindow = event.payload?.targetWindow;
+      if (targetWindow && targetWindow !== windowLabel) return;
+      emit("chat-ready", { windowLabel });
     });
     // Check for pending prefill from same-window navigation (e.g. pipes → home)
     const pending = sessionStorage.getItem("pendingChatPrefill");
     if (pending) {
+      setIsPreparingPrefill(true);
       sessionStorage.removeItem("pendingChatPrefill");
       try {
         const data = JSON.parse(pending);
-        // Small delay to let the chat fully initialize
-        setTimeout(() => emit("chat-prefill", data), 500);
-      } catch {}
+        // Small delay to let the chat fully initialize without showing setup flashes.
+        setTimeout(() => emit("chat-prefill", data), 120);
+      } catch {
+        setIsPreparingPrefill(false);
+      }
     }
     // Clean up stale pipe-generation markers (>30 min old) so they don't
     // leak into a future unrelated chat session.
@@ -1435,13 +1539,15 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
       // Only process if this window is the intended target (or no target for backwards compat)
       if (targetWindow && getCurrentWindow().label !== targetWindow) return;
 
-      if (autoSend && prompt && context) {
+      if (autoSend && prompt) {
         // Deduplicate: skip if another listener instance is already handling this
         if (prefillInFlightRef.current) return;
         prefillInFlightRef.current = true;
+        setIsPreparingPrefill(true);
 
         // Auto-send: compose full message (context above, user text below) and send immediately
-        const fullMessage = `${context}\n\n${prompt}`;
+        const trimmedContext = context?.trim();
+        const fullMessage = trimmedContext ? `${trimmedContext}\n\n${prompt}` : prompt;
         // Start a new conversation then send
         (async () => {
           try {
@@ -1449,6 +1555,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
             piStreamingTextRef.current = "";
             piMessageIdRef.current = null;
             piContentBlocksRef.current = [];
+            piLastErrorRef.current = null;
             setIsLoading(false);
             setIsStreaming(false);
             setMessages([]);
@@ -1474,11 +1581,13 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
           } finally {
             autoSendBypassRef.current = false;
             prefillInFlightRef.current = false;
+            setIsPreparingPrefill(false);
           }
         })();
         return;
       }
 
+      setIsPreparingPrefill(false);
       setPrefillContext(context);
       setPrefillSource(source || "search");
       if (frameId) {
@@ -1892,11 +2001,69 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
     return () => clearInterval(interval);
   }, []);
 
-  // Restart Pi explicitly when user saves a preset — no useEffect, no debounce.
+  // Apply a preset change to the running Pi process.
+  //
+  // - If ONLY provider/model changed: `pi_set_model` — keeps the subprocess
+  //   alive and preserves the full conversation, so the user can switch
+  //   haiku ↔ sonnet ↔ opus mid-session without losing context.
+  // - If any other spawn-time field changed (url, apiKey, maxTokens, systemPrompt):
+  //   full restart via `pi_update_config` — those are baked into Pi's CLI args
+  //   and models.json, so the subprocess has to be respawned to see them.
+  //
   // Called directly from the AIPresetsSelector onPresetSaved callback.
   const handlePiRestart = useCallback((preset: AIPreset) => {
     const providerConfig = buildProviderConfig(preset);
-    console.log("[Pi] User saved preset, restarting:", providerConfig?.provider, providerConfig?.model);
+    if (!providerConfig) return;
+
+    // Compare against the currently-running config. If we only know
+    // provider+model (older ref shape), we can still decide on the hot-swap
+    // path as long as the non-tracked fields are unchanged from the last
+    // full restart — which is exactly the invariant we maintain here by
+    // updating the ref on every hot-swap/restart.
+    const running = piRunningConfigRef.current;
+    const providerChanged = !running || running.provider !== providerConfig.provider;
+    const modelChanged = !running || running.model !== providerConfig.model;
+    const spawnTimeFieldsChanged =
+      !running ||
+      running.url !== providerConfig.url ||
+      running.apiKey !== providerConfig.apiKey ||
+      running.maxTokens !== providerConfig.maxTokens ||
+      running.systemPrompt !== providerConfig.systemPrompt ||
+      running.token !== (settings.user?.token ?? null);
+
+    if (!providerChanged && !modelChanged && !spawnTimeFieldsChanged) {
+      // Preset save that didn't actually change anything Pi cares about.
+      return;
+    }
+
+    if (!spawnTimeFieldsChanged && (providerChanged || modelChanged)) {
+      // Hot-swap path — preserves conversation state.
+      console.log("[Pi] Hot-swap model:", providerConfig.provider, providerConfig.model);
+      commands
+        .piSetModel(piSessionIdRef.current, providerConfig)
+        .then(() => {
+          piRunningConfigRef.current = {
+            provider: providerConfig.provider,
+            model: providerConfig.model,
+            url: providerConfig.url,
+            apiKey: providerConfig.apiKey,
+            maxTokens: providerConfig.maxTokens,
+            systemPrompt: providerConfig.systemPrompt,
+            token: settings.user?.token ?? null,
+          };
+        })
+        .catch((e) => {
+          console.error("[Pi] Hot-swap failed, falling back to full restart:", e);
+          piSessionSyncedRef.current = false;
+          commands.piUpdateConfig(settings.user?.token ?? null, providerConfig).catch((err) => {
+            console.error("[Pi] Fallback restart also failed:", err);
+          });
+        });
+      return;
+    }
+
+    // Full restart — spawn-time field changed.
+    console.log("[Pi] Full restart (spawn-time field changed):", providerConfig.provider, providerConfig.model);
     piSessionSyncedRef.current = false;
     commands.piUpdateConfig(settings.user?.token ?? null, providerConfig).catch((e) => {
       console.error("[Pi] Preset switch failed:", e);
@@ -2035,6 +2202,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
           // Pi exhausted retries on a transient error (rate limit, overloaded, etc.)
           const errorStr = data.finalError || "Request failed after retries";
           console.error("[Pi] Auto-retry failed:", errorStr);
+          piLastErrorRef.current = errorStr;
 
           // Detect rate limit or daily limit from the error
           const quotaErrorType = classifyQuotaError(errorStr);
@@ -2070,6 +2238,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
           if (piMessageIdRef.current) {
             const msgId = piMessageIdRef.current;
             const fullError = `${reason} ${errorDetail}`.trim();
+            piLastErrorRef.current = fullError;
 
             const quotaErrorType = classifyQuotaError(fullError);
             if (quotaErrorType === "daily" || quotaErrorType === "rate") {
@@ -2105,6 +2274,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
           // LLM returned an error (credits_exhausted, rate limit, provider error, etc.)
           const errMsg = data.message.errorMessage || data.message.error || "Unknown error";
           console.error("[Pi] LLM error via", data.type, ":", errMsg);
+          piLastErrorRef.current = errMsg;
 
           if (piMessageIdRef.current) {
             const msgId = piMessageIdRef.current;
@@ -2130,6 +2300,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
             piStreamingTextRef.current = "";
             piMessageIdRef.current = null;
             piContentBlocksRef.current = [];
+            piLastErrorRef.current = null;
             setIsLoading(false);
             setIsStreaming(false);
           }
@@ -2205,14 +2376,32 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
               const contentBlocks = [...blocksSnapshot];
               // If no text content but we have tool/thinking blocks, don't show "no response"
               const hasNonTextBlocks = contentBlocks.some((b) => b.type === "tool" || b.type === "thinking");
+              let emptyResponseRetryPrompt: string | undefined;
               if (!content && hasNonTextBlocks) {
                 content = ""; // empty — tool/thinking blocks will render
               } else if (!content) {
-                const provider = activePreset?.provider;
-                if (provider === "native-ollama") {
-                  content = "No response — is Ollama running? Start it with `ollama serve` and make sure the model is pulled.";
+                // If any error text was observed during this stream (e.g. a 429
+                // credits_exhausted or daily_cost_limit_exceeded emitted as a
+                // message_update error or auto-retry failure) classify it
+                // before falling back to the generic "no response" string.
+                const lastErr = piLastErrorRef.current;
+                const lastErrKind = lastErr ? classifyQuotaError(lastErr) : "none";
+                if (lastErr && lastErrKind === "daily") {
+                  posthog.capture("wall_hit", { reason: "daily_limit", source: "chat" });
+                  content = buildDailyLimitMessage(lastErr);
+                } else if (lastErr && lastErrKind === "rate") {
+                  content = buildRateLimitMessage(lastErr);
+                } else if (lastErr) {
+                  content = `Error: ${lastErr}`;
+                  emptyResponseRetryPrompt = lastUserMessageRef.current || undefined;
                 } else {
-                  content = "No response from model — try again or check your AI preset in settings.";
+                  const provider = activePreset?.provider;
+                  if (provider === "native-ollama") {
+                    content = "No response — is Ollama running? Start it with `ollama serve` and make sure the model is pulled.";
+                  } else {
+                    content = "No response from model — try again or check your AI preset in settings.";
+                  }
+                  emptyResponseRetryPrompt = lastUserMessageRef.current || undefined;
                 }
               }
               // Add text as a content block if no text block exists yet
@@ -2220,7 +2409,9 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
               if (!streamedText && content && !hasTextBlock) {
                 contentBlocks.push({ type: "text", text: content });
               }
-              return prev.map((m) => m.id === msgId ? { ...m, content, contentBlocks } : m);
+              return prev.map((m) => m.id === msgId
+                ? { ...m, content, contentBlocks, ...(emptyResponseRetryPrompt ? { retryPrompt: emptyResponseRetryPrompt } : {}) }
+                : m);
             });
 
             if (!isPipeWatch) {
@@ -2236,6 +2427,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
             piStreamingTextRef.current = "";
             piMessageIdRef.current = null;
             piContentBlocksRef.current = [];
+            piLastErrorRef.current = null;
             piThinkingStartRef.current = null;
             followUpFiredRef.current = false;
             setIsLoading(false);
@@ -2331,6 +2523,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
             piStreamingTextRef.current = "";
             piMessageIdRef.current = null;
             piContentBlocksRef.current = [];
+            piLastErrorRef.current = null;
             piThinkingStartRef.current = null;
             setActivePipeExecution(null);
             setIsLoading(false);
@@ -2434,7 +2627,15 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
                 piSessionSyncedRef.current = false;
                 // Keep running-config ref in sync so preset watcher doesn't re-trigger
                 if (providerConfig) {
-                  piRunningConfigRef.current = { provider: providerConfig.provider, model: providerConfig.model, token: settings.user?.token ?? null };
+                  piRunningConfigRef.current = {
+                    provider: providerConfig.provider,
+                    model: providerConfig.model,
+                    url: providerConfig.url,
+                    apiKey: providerConfig.apiKey,
+                    maxTokens: providerConfig.maxTokens,
+                    systemPrompt: providerConfig.systemPrompt,
+                    token: settings.user?.token ?? null,
+                  };
                 }
               } else {
                 console.error("[Pi] Auto-restart failed:", result.error);
@@ -2571,6 +2772,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
             piStreamingTextRef.current = "";
             piMessageIdRef.current = null;
             piContentBlocksRef.current = [];
+            piLastErrorRef.current = null;
             piThinkingStartRef.current = null;
             setActivePipeExecution(null);
             setIsLoading(false);
@@ -2641,6 +2843,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
             piStreamingTextRef.current = "";
             piMessageIdRef.current = null;
             piContentBlocksRef.current = [];
+            piLastErrorRef.current = null;
             piThinkingStartRef.current = null;
             setActivePipeExecution(null);
             setIsLoading(false);
@@ -2770,7 +2973,15 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
             piCrashCountRef.current = 0; // reset crash loop counter on manual start
             // Keep running-config ref in sync so preset watcher doesn't re-trigger
             if (providerConfig) {
-              piRunningConfigRef.current = { provider: providerConfig.provider, model: providerConfig.model, token: settings.user?.token ?? null };
+              piRunningConfigRef.current = {
+                provider: providerConfig.provider,
+                model: providerConfig.model,
+                url: providerConfig.url,
+                apiKey: providerConfig.apiKey,
+                maxTokens: providerConfig.maxTokens,
+                systemPrompt: providerConfig.systemPrompt,
+                token: settings.user?.token ?? null,
+              };
             }
           } else {
             const providerLabel = providerConfig?.provider || "AI";
@@ -2931,11 +3142,39 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
       }
 
       // Send prompt — abort/new_session now await completion, so no retry needed
-      const result = await commands.piPrompt(
+      let result = await commands.piPrompt(
         piSessionIdRef.current,
         promptMessage,
         piImages.length > 0 ? piImages : null,
       );
+
+      // Race: user hit "+ NEW" before Pi finished registering the new session
+      // in the pool. Auto-spawn once and retry before surfacing the error.
+      if (result.status === "error" && result.error.includes("Pi not initialized")) {
+        console.log("[Pi] session not registered yet — auto-spawning and retrying");
+        try {
+          const home = await homeDir();
+          const dir = await join(home, ".screenpipe", "pi-chat");
+          const providerConfig = buildProviderConfig();
+          const startRes = await commands.piStart(
+            piSessionIdRef.current,
+            dir,
+            settings.user?.token ?? null,
+            providerConfig,
+          );
+          if (startRes.status === "ok" && startRes.data.running) {
+            setPiInfo(startRes.data);
+            piSessionSyncedRef.current = false;
+            result = await commands.piPrompt(
+              piSessionIdRef.current,
+              promptMessage,
+              piImages.length > 0 ? piImages : null,
+            );
+          }
+        } catch (e) {
+          console.error("[Pi] auto-spawn retry failed", e);
+        }
+      }
 
       if (result.status === "error") {
         if (timeoutId) clearTimeout(timeoutId);
@@ -2948,11 +3187,12 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
         if (rawError.includes("already processing")) {
           errorMsg = "The AI was mid-response when your message arrived.";
           retryPrompt = userMessage;
-        } else if (rawError.includes("Broken pipe") || rawError.includes("not running") || rawError.includes("has died")) {
+        } else if (rawError.includes("Broken pipe") || rawError.includes("not running") || rawError.includes("has died") || rawError.includes("Pi not initialized")) {
           const provider = activePreset?.provider;
           errorMsg = provider === "native-ollama"
             ? "Ollama is not running. Start it with: `ollama serve`"
             : "AI agent crashed — restarting automatically...";
+          retryPrompt = userMessage;
         } else if (rawError.includes("not found")) {
           errorMsg = `Model "${activePreset?.model}" not found. Check your AI preset in settings.`;
         } else {
@@ -3382,7 +3622,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
           }}
         >
         <div className="max-w-4xl mx-auto w-full p-4 space-y-4">
-        {messages.length === 0 && disabledReason && (!hasPresets || !hasValidModel || needsLogin) && (
+        {messages.length === 0 && !isPreparingPrefill && disabledReason && (!hasPresets || !hasValidModel || needsLogin) && (
           <div className="relative flex flex-col items-center justify-center py-12 space-y-4">
             <div className="relative p-6 rounded-2xl border bg-muted/50 border-border/50">
               {needsLogin ? (
@@ -3423,7 +3663,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
             )}
           </div>
         )}
-        {messages.length === 0 && hasPresets && hasValidModel && !needsLogin && (
+        {messages.length === 0 && !isPreparingPrefill && hasPresets && hasValidModel && !needsLogin && (
           <SummaryCards
             onSendMessage={sendMessage}
             autoSuggestions={autoSuggestions}
@@ -3475,14 +3715,80 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
               </div>
               <div className="group/message flex-1 flex flex-col min-w-0">
               <div
+                onMouseDown={(e) => {
+                  if (message.role !== "user" || isLoading || editingMessageId === message.id) return;
+                  // Stage caret position from the click coords (still on live
+                  // DOM), but defer entering edit mode to mouseup. Letting
+                  // the user drag-select text inside their own messages
+                  // requires NOT swallowing mousedown — otherwise the
+                  // textarea replaces the rendered text mid-drag and the
+                  // selection is lost.
+                  pendingCaretRef.current = caretOffsetFromClick(e, message.content);
+                  pendingEditDownXYRef.current = { x: e.clientX, y: e.clientY };
+                }}
+                onMouseUp={(e) => {
+                  if (message.role !== "user" || isLoading || editingMessageId === message.id) return;
+                  const down = pendingEditDownXYRef.current;
+                  pendingEditDownXYRef.current = null;
+                  // If the mouse moved more than ~3px between down and up,
+                  // treat it as a drag-select — don't enter edit mode.
+                  if (!down) return;
+                  const moved = Math.hypot(e.clientX - down.x, e.clientY - down.y);
+                  if (moved > 3) {
+                    pendingCaretRef.current = null;
+                    return;
+                  }
+                  // Real click — enter edit mode.
+                  setEditDraft(message.content);
+                  setEditingMessageId(message.id);
+                }}
                 className={cn(
                   "relative rounded-xl px-4 py-3 text-sm border overflow-hidden max-w-full",
                   message.role === "user"
                     ? "bg-foreground text-background border-foreground"
-                    : "bg-muted/30 border-border/50"
+                    : "bg-muted/30 border-border/50",
+                  message.role === "user" && !isLoading && editingMessageId !== message.id && "cursor-text"
                 )}
               >
-                <MessageContent message={message} onImageClick={(images, index) => setImageViewer({ images, index })} onRetry={(prompt) => sendMessage(prompt)} />
+                {editingMessageId === message.id ? (
+                  <textarea
+                    ref={(el) => {
+                      editTextareaRef.current = el;
+                      // Synchronous focus + caret placement BEFORE the browser
+                      // paints. Using the ref callback (instead of useEffect)
+                      // guarantees the cursor lands where the user clicked on
+                      // the very first frame — no flash-of-start-of-text.
+                      if (el && pendingCaretRef.current != null) {
+                        const pos = pendingCaretRef.current;
+                        pendingCaretRef.current = null;
+                        el.focus({ preventScroll: true });
+                        try { el.setSelectionRange(pos, pos); } catch { /* ignore */ }
+                      }
+                    }}
+                    value={editDraft}
+                    onChange={(e) => setEditDraft(e.target.value)}
+                    onBlur={() => {
+                      const trimmed = editDraft.trim();
+                      setEditingMessageId(null);
+                      if (!trimmed || trimmed === message.content) return;
+                      const idx = messages.findIndex((m) => m.id === message.id);
+                      if (idx === -1) return;
+                      setMessages((prev) => prev.slice(0, idx));
+                      sendMessage(trimmed);
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === "Escape") { e.preventDefault(); setEditingMessageId(null); }
+                      if (e.key === "Enter" && !e.shiftKey) {
+                        e.preventDefault();
+                        (e.currentTarget as HTMLTextAreaElement).blur();
+                      }
+                    }}
+                    rows={Math.min(8, Math.max(1, editDraft.split("\n").length))}
+                    className="w-full resize-none bg-transparent text-background placeholder:text-background/40 focus:outline-none"
+                  />
+                ) : (
+                  <MessageContent message={message} onImageClick={(images, index) => setImageViewer({ images, index })} onRetry={(prompt) => sendMessage(prompt)} />
+                )}
               </div>
                 {/* Action buttons - appear on hover, outside the message box */}
                 <div className="flex items-center gap-0.5 self-end mt-1 opacity-0 group-hover/message:opacity-100 transition-all duration-200">
@@ -3942,6 +4248,34 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
                     </button>
                   );
                 })
+              )}
+
+              {/* Connections — lets users mention their own integrations (gmail, slack, etc.) */}
+              {connections.length > 0 && (
+                <>
+                  <div className="px-2 py-1 text-[10px] font-medium uppercase tracking-wider text-muted-foreground bg-muted/30 border-b border-border/50 border-t">
+                    connections
+                  </div>
+                  {connections.map((c) => {
+                    const tag = `@${c.id}`;
+                    return (
+                      <button
+                        key={`conn-${c.id}`}
+                        type="button"
+                        onClick={() => {
+                          setInput((prev) => `${tag} ${prev.trim()}`.trim() + " ");
+                          setAppFilterOpen(false);
+                        }}
+                        className="w-full px-3 py-1.5 text-left text-xs font-mono hover:bg-muted/50 transition-colors flex items-center justify-between gap-2"
+                      >
+                        <span>{tag}</span>
+                        <span className="text-[10px] text-muted-foreground truncate">
+                          {c.name}
+                        </span>
+                      </button>
+                    );
+                  })}
+                </>
               )}
 
               {/* Speakers */}

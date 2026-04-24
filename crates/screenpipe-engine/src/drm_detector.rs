@@ -698,7 +698,11 @@ mod tests {
     }
 
     // ── pre_capture_drm_check unit tests ──────────────────────────────
+    // Gated to macOS: the non-macOS build provides a `false`-returning stub
+    // of `pre_capture_drm_check` (see definition above), so these tests
+    // would spuriously fail on Linux/Windows CI.
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn test_pre_capture_drm_check_disabled() {
         let _lock = DRM_FLAG_LOCK.lock().unwrap();
@@ -708,6 +712,7 @@ mod tests {
         assert!(!drm_content_paused(), "flag should remain unset");
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn test_pre_capture_drm_check_native_app() {
         let _lock = DRM_FLAG_LOCK.lock().unwrap();
@@ -719,6 +724,7 @@ mod tests {
         DRM_CONTENT_PAUSED.store(false, Ordering::SeqCst);
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn test_pre_capture_drm_check_non_drm_app() {
         let _lock = DRM_FLAG_LOCK.lock().unwrap();
@@ -728,6 +734,7 @@ mod tests {
         assert!(!drm_content_paused(), "flag should remain unset");
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn test_pre_capture_drm_check_already_paused() {
         let _lock = DRM_FLAG_LOCK.lock().unwrap();

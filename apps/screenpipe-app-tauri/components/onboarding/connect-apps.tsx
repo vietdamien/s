@@ -75,7 +75,32 @@ function CursorIcon({ className = "w-5 h-5" }: { className?: string }) {
 
 // ─── MCP helpers (shared pattern for Claude Desktop & Cursor) ────────────────
 
-const SCREENPIPE_MCP_CONFIG = { command: "npx", args: ["-y", "screenpipe-mcp"] };
+/**
+ * MCP install config for screenpipe.
+ *
+ * Prefers our bundled `bun` binary (always present when the desktop app
+ * is installed) over `npx`. Falls back to `npx` only if bun isn't found.
+ *
+ * Why: many users (incl. Louis's MBA, IT consultants like Brad) don't
+ * have Node/npx installed at all. Claude Desktop tries to spawn `npx`,
+ * gets "No such file or directory", and the MCP server never starts.
+ * Using the bun we ship sidesteps the entire Node dependency.
+ *
+ * `@latest` is pinned so npx/bunx don't lock onto a stale cached version.
+ *
+ * Keep this in sync with the same helper in
+ * `components/settings/connections-section.tsx` — both code paths must
+ * write identical configs.
+ */
+async function buildMcpConfig(): Promise<{ command: string; args: string[] }> {
+  try {
+    const res = await commands.bunCheck();
+    if (res.status === "ok" && res.data.available && res.data.path) {
+      return { command: res.data.path, args: ["x", "screenpipe-mcp@latest"] };
+    }
+  } catch { /* fall through to npx */ }
+  return { command: "npx", args: ["-y", "screenpipe-mcp@latest"] };
+}
 
 async function readMcpConfig(configPath: string): Promise<Record<string, unknown>> {
   try {
@@ -87,7 +112,7 @@ async function readMcpConfig(configPath: string): Promise<Record<string, unknown
 
 async function writeMcpConfig(configPath: string, config: Record<string, unknown>): Promise<void> {
   if (!config.mcpServers || typeof config.mcpServers !== "object") config.mcpServers = {};
-  (config.mcpServers as Record<string, unknown>).screenpipe = SCREENPIPE_MCP_CONFIG;
+  (config.mcpServers as Record<string, unknown>).screenpipe = await buildMcpConfig();
   // Ensure parent directory exists (Claude Desktop may not have created it yet)
   await mkdir(await dirname(configPath), { recursive: true });
   await writeFile(configPath, new TextEncoder().encode(JSON.stringify(config, null, 2)));

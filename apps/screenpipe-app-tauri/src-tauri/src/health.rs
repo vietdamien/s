@@ -27,6 +27,87 @@ const CONSECUTIVE_FAILURES_THRESHOLD: u32 = 30;
 /// actively confirming the problem, but still debounced to survive brief spikes.
 const CONSECUTIVE_UNHEALTHY_THRESHOLD: u32 = 10;
 
+// ─────────────────────────────────────────────────────────────────────────
+// Boot phase — tracks where we are inside ServerCore::start.
+//
+// The HTTP server only binds near the *end* of startup (after DB migration
+// and audio-manager build). That means /health is unreachable for the entire
+// window we care most about (e.g. 13.2s for Mike's 31.5GB DB migration). The
+// frontend and the spawn watchdog can't distinguish "server is migrating" from
+// "server is dead" via HTTP alone — so they both time out and retry, and the
+// retry races the still-running migration on the SQLite lock (see the Mike
+// Cloke incident 2026-04-22).
+//
+// Rather than refactor the HTTP server to bind early and serve /health while
+// the DB is offline, we expose boot phase via a process-local atomic and a
+// Tauri command. The watchdog polls the atomic; the UI polls the command.
+// Both become the source of truth during startup.
+// ─────────────────────────────────────────────────────────────────────────
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct BootPhaseSnapshot {
+    /// One of: idle | starting | migrating_database | building_audio |
+    /// starting_pipes | ready | error
+    pub phase: String,
+    /// Human-readable detail to show the user (may be long-running hint)
+    pub message: Option<String>,
+    /// Present only when phase == "error"
+    pub error: Option<String>,
+    /// Unix epoch seconds when the current phase was entered. Lets the UI
+    /// show "X minutes" on slow migrations.
+    pub since_epoch_secs: u64,
+}
+
+impl BootPhaseSnapshot {
+    pub fn idle() -> Self {
+        Self {
+            phase: "idle".to_string(),
+            message: None,
+            error: None,
+            since_epoch_secs: 0,
+        }
+    }
+}
+
+static BOOT_PHASE: Lazy<RwLock<BootPhaseSnapshot>> =
+    Lazy::new(|| RwLock::new(BootPhaseSnapshot::idle()));
+
+fn now_epoch() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+pub fn set_boot_phase(phase: &str, message: Option<&str>) {
+    let mut guard = BOOT_PHASE.write().unwrap_or_else(|e| e.into_inner());
+    // Don't reset since_epoch if the phase is unchanged (no-op writes)
+    if guard.phase != phase {
+        guard.since_epoch_secs = now_epoch();
+    }
+    guard.phase = phase.to_string();
+    guard.message = message.map(String::from);
+    guard.error = None;
+    info!("boot phase → {}{}", phase,
+        message.map(|m| format!(" ({})", m)).unwrap_or_default());
+}
+
+pub fn set_boot_error(err: &str) {
+    let mut guard = BOOT_PHASE.write().unwrap_or_else(|e| e.into_inner());
+    guard.phase = "error".to_string();
+    guard.error = Some(err.to_string());
+    guard.since_epoch_secs = now_epoch();
+    tracing::error!("boot phase → error: {}", err);
+}
+
+pub fn get_boot_phase_snapshot() -> BootPhaseSnapshot {
+    BOOT_PHASE
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
 // Shared recording status that can be read by the tray menu
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum RecordingStatus {

@@ -197,6 +197,14 @@ export type Settings = SettingsStore & {
 	}>;
 	apiAuth?: boolean;
 	apiKey?: string;
+	/**
+	 * When true the backend binds the HTTP API to 0.0.0.0 instead of 127.0.0.1
+	 * so other devices on the LAN can reach it. api_auth is force-enabled
+	 * whenever this is true — the backend mirrors the guard in
+	 * RecordingConfig::from_settings so the two flags stay consistent even
+	 * if someone edits the settings file by hand.
+	 */
+	listenOnLan?: boolean;
 	encryptStore?: boolean;
 }
 
@@ -371,7 +379,7 @@ let DEFAULT_SETTINGS: Settings = {
 			filterMusic: false,
 			ignoreIncognitoWindows: true,
 			pauseOnDrmContent: false,
-			experimentalCoreaudioSystemAudio: false,
+			experimentalCoreaudioSystemAudio: true,
 			recordWhileLocked: false,
 			appendTypedTextToMeetingNotes: true,
 			localRetentionEnabled: true,
@@ -451,6 +459,19 @@ function createSettingsStore() {
 		if (!(settings as any).restartNotificationsDefaultedOff) {
 			settings.showRestartNotifications = false;
 			(settings as any).restartNotificationsDefaultedOff = true;
+			needsUpdate = true;
+		}
+
+		// One-time migration: the CoreAudio Process Tap toggle used to default
+		// off (opt-in experimental flag). Existing installs therefore have
+		// `experimentalCoreaudioSystemAudio: false` persisted explicitly, which
+		// means just changing the static default doesn't reach them. Flip
+		// once, then record a marker so explicit opt-outs after this point
+		// are respected. Safe because stream.rs falls back to SCK if the tap
+		// can't start — see Ruark Ferreira's AirPods/HFP case (2026-04-24).
+		if (!(settings as any).coreaudioTapMigrationV1) {
+			settings.experimentalCoreaudioSystemAudio = true;
+			(settings as any).coreaudioTapMigrationV1 = true;
 			needsUpdate = true;
 		}
 
@@ -677,11 +698,18 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 				setIsSettingsLoaded(true);
 				setLoadingError(null);
 
-				// Configure the API module — single source of truth for port + auth
+				// Configure the API module — single source of truth for port + auth.
+				// `apiKey` is intentionally NOT passed: `ensureInitialized` in
+				// lib/api.ts loads the canonical key from the server via IPC
+				// (`get_local_api_config`). settings.apiKey is a user preference
+				// fed to the server's auth resolver; the server then exposes the
+				// resolved key via that IPC. Passing it here would race with the
+				// IPC and overwrite a good key with `null` for the majority of
+				// users (who never set a custom api key) — which silently breaks
+				// every WebSocket auth path.
 				const { configureApi } = await import("@/lib/api");
 				configureApi({
 					port: loadedSettings.port ?? 3030,
-					apiKey: loadedSettings.apiKey || null,
 					authEnabled: loadedSettings.apiAuth ?? true,
 				});
 			} catch (error) {
@@ -845,13 +873,18 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 		await settingsStore.set(updates);
 		// Settings will be updated via the listener
 
-		// Reconfigure API module if auth/port settings changed
+		// Reconfigure API module if auth/port settings changed.
+		// `apiKey` deliberately omitted: the server is the source of truth and
+		// the frontend learns the key via IPC (`get_local_api_config`). When
+		// the user changes their api_key preference here, the server picks it
+		// up on its next restart and the frontend will re-fetch the resolved
+		// value — passing `apiKey: null` here when settings.apiKey is empty
+		// would race with that IPC and wipe the cached key.
 		if ("port" in updates || "apiKey" in updates || "apiAuth" in updates) {
 			const { configureApi } = await import("@/lib/api");
 			const merged = { ...settings, ...updates };
 			configureApi({
 				port: merged.port ?? 3030,
-				apiKey: merged.apiKey || null,
 				authEnabled: merged.apiAuth ?? true,
 			});
 		}

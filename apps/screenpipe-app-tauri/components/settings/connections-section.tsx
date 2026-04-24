@@ -26,6 +26,7 @@ import { join, homeDir, tempDir, dirname } from "@tauri-apps/api/path";
 import { AppleIntelligenceCard } from "./apple-intelligence-card";
 import { CalendarCard } from "./calendar-card";
 import { GoogleCalendarCard } from "./google-calendar-card";
+import { GoogleDocsCard } from "./google-docs-card";
 import { GmailCard } from "./gmail-card";
 import { IcsCalendarCard } from "./ics-calendar-card";
 import { OpenClawCard } from "./openclaw-card";
@@ -114,12 +115,41 @@ async function isCursorMcpInstalled(): Promise<boolean> {
   } catch { return false; }
 }
 
+type McpCommand = { command: string; args: string[] };
+
+/**
+ * MCP install config for screenpipe.
+ *
+ * Prefers the `bun` binary we ship with the desktop app over `npx`:
+ *  - no Node.js dependency (many Claude Desktop users don't have node)
+ *  - ~3× faster cold start than npx (avoids first-run download stalling
+ *    Claude's MCP startup timeout)
+ *  - absolute path → no PATH lookup races
+ *
+ * Falls back to `npx` for copy-paste configs targeting users without our
+ * desktop app installed (Claude Code CLI block, AnythingLLM, MstyStudio).
+ *
+ * Always pins `@latest` so npx/bunx don't lock onto a stale cached
+ * version forever — without `@latest`, the first install caches and
+ * never updates.
+ */
+async function buildMcpConfig(opts?: { forceNpx?: boolean }): Promise<McpCommand> {
+  if (opts?.forceNpx) return { command: "npx", args: ["-y", "screenpipe-mcp@latest"] };
+  try {
+    const res = await commands.bunCheck();
+    if (res.status === "ok" && res.data.available && res.data.path) {
+      return { command: res.data.path, args: ["x", "screenpipe-mcp@latest"] };
+    }
+  } catch { /* fall through to npx */ }
+  return { command: "npx", args: ["-y", "screenpipe-mcp@latest"] };
+}
+
 async function installCursorMcp(): Promise<void> {
   const configPath = await getCursorMcpConfigPath();
   let config: Record<string, unknown> = {};
   try { config = JSON.parse(await readTextFile(configPath)); } catch { /* fresh */ }
   if (!config.mcpServers || typeof config.mcpServers !== "object") config.mcpServers = {};
-  (config.mcpServers as Record<string, unknown>).screenpipe = { command: "npx", args: ["-y", "screenpipe-mcp"] };
+  (config.mcpServers as Record<string, unknown>).screenpipe = await buildMcpConfig();
   await writeFile(configPath, new TextEncoder().encode(JSON.stringify(config, null, 2)));
 }
 
@@ -200,6 +230,7 @@ export function IntegrationIcon({ icon }: { icon: string }) {
     "apple-calendar": <img src="/images/apple.svg" alt="Apple" className="w-5 h-5 dark:invert" />,
     "windows-calendar": <CalendarIcon className="h-5 w-5 text-muted-foreground" />,
     "google-calendar": <img src="/images/google-calendar.svg" alt="Google Calendar" className="w-5 h-5" />,
+    "google-docs": <img src="/images/google-docs.svg" alt="Google Docs" className="w-5 h-5" />,
     "ics-calendar": <CalendarIcon className="h-5 w-5 text-muted-foreground" />,
     openclaw: <img src="/images/openclaw.png" alt="OpenClaw" className="w-5 h-5" />,
     email: <Send className="h-5 w-5 text-muted-foreground" />,
@@ -226,6 +257,8 @@ export function IntegrationIcon({ icon }: { icon: string }) {
         <path d="M19.355 18.538a68.967 68.959 0 0 0 1.858-2.954.81.81 0 0 0-.062-.9c-.516-.685-1.504-2.075-2.042-3.362-.553-1.321-.636-3.375-.64-4.377a1.707 1.707 0 0 0-.358-1.05l-3.198-4.064a3.744 3.744 0 0 1-.076.543c-.106.503-.307 1.004-.536 1.5-.134.29-.29.6-.446.914l-.31.626c-.516 1.068-.997 2.227-1.132 3.59-.124 1.26.046 2.73.815 4.481.128.011.257.025.386.044a6.363 6.363 0 0 1 3.326 1.505c.916.79 1.744 1.922 2.415 3.5zM8.199 22.569c.073.012.146.02.22.02.78.024 2.095.092 3.16.29.87.16 2.593.64 4.01 1.055 1.083.316 2.198-.548 2.355-1.664.114-.814.33-1.735.725-2.58l-.01.005c-.67-1.87-1.522-3.078-2.416-3.849a5.295 5.295 0 0 0-2.778-1.257c-1.54-.216-2.952.19-3.84.45.532 2.218.368 4.829-1.425 7.531zM5.533 9.938c-.023.1-.056.197-.098.29L2.82 16.059a1.602 1.602 0 0 0 .313 1.772l4.116 4.24c2.103-3.101 1.796-6.02.836-8.3-.728-1.73-1.832-3.081-2.55-3.831zM9.32 14.01c.615-.183 1.606-.465 2.745-.534-.683-1.725-.848-3.233-.716-4.577.154-1.552.7-2.847 1.235-3.95.113-.235.223-.454.328-.664.149-.297.288-.577.419-.86.217-.47.379-.885.46-1.27.08-.38.08-.72-.014-1.043-.095-.325-.297-.675-.68-1.06a1.6 1.6 0 0 0-1.475.36l-4.95 4.452a1.602 1.602 0 0 0-.513.952l-.427 2.83c.672.59 2.328 2.316 3.335 4.711.09.21.175.43.253.653z"/>
       </svg>
     ),
+    quickbooks: <img src="/images/quickbooks.svg" alt="QuickBooks Online" className="w-5 h-5" />,
+    "google-sheets": <img src="/images/google-sheets.svg" alt="Google Sheets" className="w-5 h-5" />,
     notion: <img src="/images/notion.svg" alt="Notion" className="w-5 h-5 dark:invert" />,
     linear: <img src="/images/linear.svg" alt="Linear" className="w-5 h-5" />,
     perplexity: <img src="/images/perplexity.svg" alt="Perplexity" className="w-5 h-5" />,
@@ -237,6 +270,7 @@ export function IntegrationIcon({ icon }: { icon: string }) {
     jira: <img src="/images/jira.png" alt="Jira" className="w-5 h-5 rounded" />,
     granola: <img src="/images/granola.png" alt="Granola" className="w-5 h-5 rounded" />,
     hubspot: <img src="/images/hubspot.png" alt="HubSpot" className="w-5 h-5 rounded" />,
+    bitrix24: <img src="/images/bitrix24.png" alt="Bitrix24" className="w-5 h-5 rounded" />,
     airtable: <img src="/images/airtable.png" alt="Airtable" className="w-5 h-5 rounded" />,
     limitless: <img src="/images/limitless.svg" alt="Limitless" className="w-5 h-5" />,
     logseq: <img src="/images/logseq.png" alt="Logseq" className="w-5 h-5 rounded" />,
@@ -331,6 +365,25 @@ export function IntegrationIcon({ icon }: { icon: string }) {
         <text x="12" y="17" textAnchor="middle" fill="#fff" fontSize="16" fontWeight="bold" fontFamily="sans-serif">P</text>
       </svg>
     ),
+    fireflies: <img src="/images/fireflies.png" alt="Fireflies.ai" className="w-5 h-5 rounded" />,
+    otter: <img src="/images/otter.png" alt="Otter.ai" className="w-5 h-5 rounded" />,
+    lexi: <img src="/images/lexi.png" alt="Leexi" className="w-5 h-5 rounded" />,
+    financialsense: <img src="/images/financialsense.png" alt="Financial Sense" className="w-5 h-5 rounded" />,
+    loops: (
+      <svg viewBox="0 0 24 24" className="w-5 h-5" fill="currentColor" aria-hidden>
+        <path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zm-1.2 14.5v-9l6.3 4.5-6.3 4.5z"/>
+      </svg>
+    ),
+    resend: (
+      <svg viewBox="0 0 24 24" className="w-5 h-5" fill="currentColor" aria-hidden>
+        <path d="M3 4h18v3l-9 6-9-6V4zm0 5.2 9 6 9-6V20H3V9.2z"/>
+      </svg>
+    ),
+    supabase: (
+      <svg viewBox="0 0 24 24" className="w-5 h-5" fill="#3ECF8E" aria-hidden>
+        <path d="M13.4 22.6c-.6.7-1.7.3-1.7-.6V14H6.3c-1.1 0-1.7-1.3-1-2.1L10.6 1.4c.6-.7 1.7-.3 1.7.6V10h5.4c1.1 0 1.7 1.3 1 2.1l-5.3 10.5z"/>
+      </svg>
+    ),
     intercom: (
       <svg viewBox="0 0 24 24" className="w-5 h-5" fill="#1F8DED">
         <path d="M21 0H3C1.343 0 0 1.343 0 3v18c0 1.658 1.343 3 3 3h18c1.658 0 3-1.342 3-3V3c0-1.657-1.342-3-3-3zm-5.801 4.399c0-.44.36-.8.802-.8.44 0 .8.36.8.8v10.688c0 .442-.36.801-.8.801-.443 0-.802-.359-.802-.801V4.399zM11.2 3.994c0-.44.357-.799.8-.799s.8.359.8.799v11.602c0 .44-.357.8-.8.8s-.8-.36-.8-.8V3.994zm-4 .405c0-.44.359-.8.799-.8.443 0 .802.36.802.8v10.688c0 .442-.36.801-.802.801-.44 0-.799-.359-.799-.801V4.399zM3.199 6c0-.442.36-.8.802-.8.44 0 .799.358.799.8v7.195c0 .441-.359.8-.799.8-.443 0-.802-.36-.802-.8V6zM20.52 18.202c-.123.105-3.086 2.593-8.52 2.593-5.433 0-8.397-2.486-8.521-2.593-.335-.288-.375-.792-.086-1.128.285-.334.79-.375 1.125-.09.047.041 2.693 2.211 7.481 2.211 4.848 0 7.456-2.186 7.479-2.207.334-.289.839-.25 1.128.086.289.336.25.84-.086 1.128zm.281-5.007c0 .441-.36.8-.801.8-.441 0-.801-.36-.801-.8V6c0-.442.361-.8.801-.8.441 0 .801.357.801.8v7.195z"/>
@@ -420,7 +473,7 @@ function ClaudePanel({ onConnected, onDisconnected }: { onConnected?: () => void
       let config: Record<string, unknown> = {};
       try { config = JSON.parse(await readTextFile(configPath)); } catch { /* fresh */ }
       if (!config.mcpServers || typeof config.mcpServers !== "object") config.mcpServers = {};
-      (config.mcpServers as Record<string, unknown>).screenpipe = { command: "npx", args: ["-y", "screenpipe-mcp"] };
+      (config.mcpServers as Record<string, unknown>).screenpipe = await buildMcpConfig();
       await mkdir(await dirname(configPath), { recursive: true });
       await writeFile(configPath, new TextEncoder().encode(JSON.stringify(config, null, 2)));
       setState("connected");
@@ -495,7 +548,7 @@ function CursorPanel({ onConnected, onDisconnected }: { onConnected?: () => void
       console.error("failed to install cursor mcp:", error);
       await message(
         "Failed to write Cursor MCP config.\n\nManually add to ~/.cursor/mcp.json:\n\n" +
-        JSON.stringify({ mcpServers: { screenpipe: { command: "npx", args: ["-y", "screenpipe-mcp"] } } }, null, 2),
+        JSON.stringify({ mcpServers: { screenpipe: { command: "npx", args: ["-y", "screenpipe-mcp@latest"] } } }, null, 2),
         { title: "Cursor MCP Setup", kind: "error" }
       );
       setState("idle");
@@ -540,7 +593,7 @@ function CursorPanel({ onConnected, onDisconnected }: { onConnected?: () => void
 
 function ClaudeCodePanel() {
   const [copied, setCopied] = useState(false);
-  const cmd = "claude mcp add screenpipe -- npx -y screenpipe-mcp";
+  const cmd = "claude mcp add screenpipe -- npx -y screenpipe-mcp@latest";
   const handleCopy = useCallback(async () => {
     try {
       await navigator.clipboard.writeText(cmd);
@@ -568,7 +621,7 @@ function AnythingLLMPanel() {
     mcpServers: {
       screenpipe: {
         command: "npx",
-        args: ["-y", "screenpipe-mcp"],
+        args: ["-y", "screenpipe-mcp@latest"],
       },
     },
   }, null, 2);
@@ -608,7 +661,7 @@ function MstyPanel() {
   const [copied, setCopied] = useState(false);
   const config = JSON.stringify({
     command: "npx",
-    args: ["-y", "screenpipe-mcp"],
+    args: ["-y", "screenpipe-mcp@latest"],
   }, null, 2);
   const handleCopy = useCallback(async () => {
     try {
@@ -887,10 +940,14 @@ function WhatsAppPanel() {
     setQr(null);
     setError(null);
     try {
+      // `bun_path` is sent empty so the backend runs its full resolver
+      // (bundled sidecar → common install dirs → PATH). Advanced users can
+      // set SCREENPIPE_BUN_PATH — hardcoding "bun" here used to break
+      // fresh Macs that didn't have bun on their shell PATH.
       const res = await localFetch("/connections/whatsapp/pair", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ bun_path: "bun" }),
+        body: JSON.stringify({ bun_path: "" }),
       });
       if (!res.ok) {
         const data = await res.json();
@@ -914,7 +971,7 @@ function WhatsAppPanel() {
   return (
     <div className="space-y-3">
       <p className="text-xs text-muted-foreground">
-        Connect your personal WhatsApp by scanning a QR code, just like WhatsApp Web. Requires <a href="https://nodejs.org" target="_blank" rel="noopener noreferrer" className="underline">Node.js</a> installed.
+        Connect your personal WhatsApp by scanning a QR code, just like WhatsApp Web.
       </p>
       <p className="text-xs text-destructive">
         ⚠️ WhatsApp may ban accounts using unofficial integrations. Use at your own risk.
@@ -1016,6 +1073,8 @@ function OAuthPanel({ integrationId, integrationName }: { integrationId: string;
   const isPro = !!settings.user?.cloud_subscribed;
   const [status, setStatus] = useState<"idle" | "loading" | "connected">("idle");
   const [displayName, setDisplayName] = useState<string | null>(null);
+  // Ref guard so a cancelled or timed-out connect attempt doesn't update state after cancel.
+  const connectingRef = useRef(false);
 
   const fetchStatus = useCallback(async () => {
     try {
@@ -1040,8 +1099,10 @@ function OAuthPanel({ integrationId, integrationName }: { integrationId: string;
 
   const handleConnect = async () => {
     setStatus("loading");
+    connectingRef.current = true;
     try {
       const res = await commands.oauthConnect(integrationId, null);
+      if (!connectingRef.current) return; // cancelled — handleCancel owns the UI
       if (res.status === "ok" && res.data.connected) {
         setStatus("connected");
         await fetchStatus();
@@ -1049,8 +1110,21 @@ function OAuthPanel({ integrationId, integrationName }: { integrationId: string;
         setStatus("idle");
       }
     } catch {
-      setStatus("idle");
+      if (connectingRef.current) setStatus("idle");
+    } finally {
+      connectingRef.current = false;
     }
+  };
+
+  const handleCancel = async () => {
+    connectingRef.current = false;
+    // Stay in "loading" (cancel button visible, connect button hidden) until the
+    // backend has actually dropped the pending sender. Otherwise a quick
+    // cancel→connect sequence can race: a late-arriving oauth_cancel would
+    // retain-drop the new flow's entry by integration_id. Keeping the connect
+    // button hidden during the cancel IPC eliminates that window.
+    try { await commands.oauthCancel(integrationId); } catch { /* ignore */ }
+    setStatus("idle");
   };
 
   const handleDisconnect = async () => {
@@ -1081,11 +1155,18 @@ function OAuthPanel({ integrationId, integrationName }: { integrationId: string;
               upgrade to pro to connect
             </button>
           </div>
+        ) : status === "loading" ? (
+          <div className="flex gap-2 items-center">
+            <Button disabled size="sm" className="gap-1.5 h-7 text-xs normal-case font-sans tracking-normal whitespace-nowrap">
+              <Loader2 className="h-3 w-3 animate-spin" />connecting...
+            </Button>
+            <Button onClick={handleCancel} variant="outline" size="sm" className="h-7 text-xs normal-case font-sans tracking-normal">
+              cancel
+            </Button>
+          </div>
         ) : (
-          <Button onClick={handleConnect} disabled={status === "loading"} size="sm" className="gap-1.5 h-7 text-xs normal-case font-sans tracking-normal whitespace-nowrap">
-            {status === "loading"
-              ? (<><Loader2 className="h-3 w-3 animate-spin" />connecting...</>)
-              : (<><LogIn className="h-3 w-3" />connect with {integrationName}</>)}
+          <Button onClick={handleConnect} size="sm" className="gap-1.5 h-7 text-xs normal-case font-sans tracking-normal whitespace-nowrap">
+            <LogIn className="h-3 w-3" />connect with {integrationName}
           </Button>
         )}
       </div>
@@ -1542,6 +1623,7 @@ export function ConnectionsSection() {
       { id: "apple-intelligence", name: "Apple Intelligence", icon: "apple-intelligence", connected: false },
       { id: "apple-calendar", name: os === "windows" ? "Windows Calendar" : "Apple Calendar", icon: os === "windows" ? "windows-calendar" : "apple-calendar", connected: false },
       { id: "google-calendar", name: "Google Calendar", icon: "google-calendar", connected: false },
+      { id: "google-docs", name: "Google Docs", icon: "google-docs", connected: false },
       { id: "gmail", name: "Gmail", icon: "gmail", connected: false },
       { id: "ics-calendar", name: "ICS Calendar", icon: "ics-calendar", connected: false },
       { id: "openclaw", name: "OpenClaw", icon: "openclaw", connected: false },
@@ -1598,6 +1680,7 @@ export function ConnectionsSection() {
       case "apple-intelligence": return <AppleIntelligenceCard />;
       case "apple-calendar": return <CalendarCard onConnectionChange={refreshCalendarTile} />;
       case "google-calendar": return <GoogleCalendarCard />;
+      case "google-docs": return <GoogleDocsCard />;
       case "gmail": return <GmailCard />;
       case "ics-calendar": return <IcsCalendarCard />;
       case "openclaw": return <OpenClawCard />;
@@ -1667,7 +1750,7 @@ export function ConnectionsSection() {
 
       {/* Expanded panel */}
       {selected && selectedTile && (() => {
-        const standaloneIds = ["browser-url", "voice-memos", "apple-intelligence", "apple-calendar", "google-calendar", "gmail", "ics-calendar", "openclaw"];
+        const standaloneIds = ["browser-url", "voice-memos", "apple-intelligence", "apple-calendar", "google-calendar", "google-docs", "gmail", "ics-calendar", "openclaw"];
         if (standaloneIds.includes(selected)) {
           // These components render their own Card
           return <div ref={panelRef}>{renderPanel()}</div>;

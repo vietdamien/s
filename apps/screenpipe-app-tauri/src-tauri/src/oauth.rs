@@ -11,7 +11,7 @@
 use crate::store::SettingsStore;
 use base64::Engine;
 use screenpipe_connect::connections::all_integrations;
-use screenpipe_connect::oauth::{self, OAUTH_REDIRECT_URI, PENDING_OAUTH};
+use screenpipe_connect::oauth::{self, PendingOAuth, OAUTH_REDIRECT_URI, PENDING_OAUTH};
 use serde::{Deserialize, Serialize};
 use tauri::AppHandle;
 use tauri_plugin_opener::OpenerExt;
@@ -87,7 +87,13 @@ pub async fn oauth_connect(
     let (tx, rx) = oneshot::channel::<String>();
     {
         let mut map = PENDING_OAUTH.lock().unwrap();
-        map.insert(state.clone(), tx);
+        map.insert(
+            state.clone(),
+            PendingOAuth {
+                integration_id: integration_id.clone(),
+                sender: tx,
+            },
+        );
     }
 
     let redirect_uri = config.redirect_uri_override.unwrap_or(OAUTH_REDIRECT_URI);
@@ -126,7 +132,7 @@ pub async fn oauth_connect(
         integration_id, instance
     );
 
-    let code = tokio::time::timeout(std::time::Duration::from_secs(120), rx)
+    let raw = tokio::time::timeout(std::time::Duration::from_secs(120), rx)
         .await
         .map_err(|_| {
             let mut map = PENDING_OAUTH.lock().unwrap();
@@ -134,6 +140,21 @@ pub async fn oauth_connect(
             format!("{} OAuth timed out (120s)", integration_id)
         })?
         .map_err(|_| "OAuth channel closed before code was received".to_string())?;
+
+    // Some providers (e.g. QuickBooks) send extra callback params alongside the code.
+    // The callback handler encodes them as JSON: {"code":"...","realmId":"..."}.
+    // Plain strings are treated as a bare authorization code for backward compatibility.
+    let (code, callback_extras): (String, Option<serde_json::Value>) = if raw.starts_with('{') {
+        match serde_json::from_str::<serde_json::Value>(&raw) {
+            Ok(v) => {
+                let c = v["code"].as_str().unwrap_or(&raw).to_string();
+                (c, Some(v))
+            }
+            Err(_) => (raw, None),
+        }
+    } else {
+        (raw, None)
+    };
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
@@ -146,6 +167,48 @@ pub async fn oauth_connect(
             error!("token exchange failed for {}: {}", integration_id, e);
             format!("token exchange failed: {}", e)
         })?;
+
+    // Merge extra callback params (e.g. realmId for QuickBooks) into the stored token data.
+    if let Some(ref extras) = callback_extras {
+        if let Some(obj) = extras.as_object() {
+            for (k, v) in obj {
+                if k != "code" && token_data[k].is_null() {
+                    token_data[k] = v.clone();
+                }
+            }
+        }
+    }
+
+    // QuickBooks: fetch the company name to use as the workspace display name.
+    if integration_id == "quickbooks" {
+        if let (Some(realm_id), Some(access_token)) = (
+            token_data["realmId"].as_str().map(String::from),
+            token_data["access_token"].as_str().map(String::from),
+        ) {
+            let url = format!(
+                "https://quickbooks.api.intuit.com/v3/company/{}/companyinfo/{}",
+                realm_id, realm_id
+            );
+            if let Ok(resp) = client
+                .get(&url)
+                .bearer_auth(&access_token)
+                .header("Accept", "application/json")
+                .send()
+                .await
+            {
+                if let Ok(body) = resp.json::<serde_json::Value>().await {
+                    if let Some(name) = body["CompanyInfo"]["CompanyName"].as_str() {
+                        token_data["workspace_name"] = serde_json::Value::String(name.to_string());
+                    }
+                }
+            }
+            // Fallback: use the realm_id itself so multi-instance is still distinguishable.
+            if token_data["workspace_name"].is_null() {
+                token_data["workspace_name"] =
+                    serde_json::Value::String(format!("QBO-{}", realm_id));
+            }
+        }
+    }
 
     // Extract email from id_token JWT if not already at the root (Google puts it in the JWT)
     if token_data["email"].is_null() {
@@ -201,6 +264,26 @@ pub async fn oauth_connect(
         connected: true,
         display_name,
     })
+}
+
+/// Cancel any in-flight OAuth flow(s) for the given integration.
+/// Dropping the stored sender makes the awaiting `oauth_connect` call fail fast
+/// with "OAuth channel closed before code was received" instead of hanging for
+/// the full 120s timeout.
+#[tauri::command]
+#[specta::specta]
+pub fn oauth_cancel(integration_id: String) -> Result<(), String> {
+    let mut map = PENDING_OAUTH.lock().unwrap();
+    let before = map.len();
+    map.retain(|_, pending| pending.integration_id != integration_id);
+    let dropped = before - map.len();
+    if dropped > 0 {
+        info!(
+            "oauth_cancel: dropped {} pending flow(s) for {}",
+            dropped, integration_id
+        );
+    }
+    Ok(())
 }
 
 /// Check whether a valid (non-expired) OAuth token exists for the given integration.

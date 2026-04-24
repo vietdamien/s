@@ -118,6 +118,7 @@ impl Drop for ImmediateTx {
                 // If ROLLBACK fails, we detach as a last resort (better to leak one
                 // slot than poison the pool with a stuck transaction).
                 warn!("ImmediateTx dropped without commit — rolling back");
+                let permit = self._write_permit.take(); // Hold permit until rollback completes
                 tokio::spawn(async move {
                     match sqlx::query("ROLLBACK").execute(&mut *conn).await {
                         Ok(_) => {
@@ -132,8 +133,8 @@ impl Drop for ImmediateTx {
                             let _raw = conn.detach();
                         }
                     }
+                    drop(permit); // Release the write permit so other writers can proceed
                 });
-                // Release the write permit so other writers can proceed
             }
         }
     }
@@ -1083,7 +1084,7 @@ impl DatabaseManager {
         {
             debug!(
                 "Skipping duplicate transcription (cross-device): {:?}",
-                &trimmed[..trimmed.len().min(50)]
+                trimmed.chars().take(50).collect::<String>()
             );
             return Ok(0);
         }
@@ -1142,7 +1143,7 @@ impl DatabaseManager {
         if is_duplicate {
             debug!(
                 "Skipping duplicate transcription (cross-device): {:?}",
-                &trimmed[..trimmed.len().min(50)]
+                trimmed.chars().take(50).collect::<String>()
             );
         }
 
@@ -6871,7 +6872,10 @@ LIMIT ? OFFSET ?
         }
 
         let display = if all_text.len() > 5000 {
-            format!("{}… (truncated)", &all_text[..5000])
+            format!(
+                "{}… (truncated)",
+                all_text.chars().take(5000).collect::<String>()
+            )
         } else {
             all_text
         };
@@ -7849,5 +7853,17 @@ mod tests {
         assert_eq!(groups[0].representative.frame_id, 2); // highest confidence
         assert_eq!(groups[1].group_size, 2); // Gmail group
         assert_eq!(groups[2].group_size, 1); // Maps group 2 (separate visit)
+    }
+}
+
+#[cfg(test)]
+mod truncation_tests {
+    #[test]
+    fn test_multibyte_truncation_panic_fix() {
+        let trimmed = "восхитителен, то так бы прямо тебе и сказал. Но, по-моему, ты именно что великолепен. Ни больше, ни меньше.";
+        // Previous code: &trimmed[..trimmed.len().min(50)] would panic at byte 50
+        // New code works safely with char boundaries:
+        let safe = trimmed.chars().take(50).collect::<String>();
+        assert_eq!(safe.chars().count(), 50);
     }
 }

@@ -328,7 +328,7 @@ export function MeetingsSection() {
     }
   };
 
-  const summarizeMeeting = (meeting: MeetingRecord) => {
+  const summarizeMeeting = async (meeting: MeetingRecord) => {
     const start = new Date(meeting.meeting_start);
     const end = meeting.meeting_end ? new Date(meeting.meeting_end) : null;
     const duration = end
@@ -345,13 +345,22 @@ export function MeetingsSection() {
 
     const prompt = `search screenpipe for what happened during this meeting and summarize it: key topics, decisions, action items. then suggest which of my connected integrations would be useful to share this with and draft a message for each.\n\nmeeting:\n${parts.join("\n")}`;
 
-    showChatWithPrefill({
-      context: "",
-      prompt,
-      autoSend: true,
-      source: "meeting-summarize",
-      useHomeChat: true,
-    });
+    try {
+      await showChatWithPrefill({
+        context: "",
+        prompt,
+        autoSend: true,
+        source: "meeting-summarize",
+        useHomeChat: true,
+      });
+    } catch (err) {
+      console.error("failed to launch meeting summary chat", err);
+      toast({
+        title: "failed to summarize meeting",
+        description: "could not open home chat. please try again.",
+        variant: "destructive",
+      });
+    }
   };
 
   const cancelEdit = () => {

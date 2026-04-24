@@ -31,7 +31,9 @@ import {
   MessageSquare,
   AlertCircle,
   Copy,
+  Star,
 } from "lucide-react";
+import { usePipeFavorites } from "@/lib/hooks/use-pipe-favorites";
 import { Textarea } from "@/components/ui/textarea";
 import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
@@ -741,6 +743,9 @@ export function PipesSection() {
   });
   const [searchQuery, setSearchQuery] = useState("");
   const [pipeTypeFilter, setPipeTypeFilter] = useState<"scheduled" | "triggered" | "manual">("scheduled");
+  // Favorites — per-machine preference persisted via /pipes/favorites.
+  // `showOnly` toggles a filter that hides non-starred pipes.
+  const pipeFavorites = usePipeFavorites();
   const [availableConnections, setAvailableConnections] = useState<AvailableConnection[]>([]);
   const [connectionModal, setConnectionModal] = useState<{ pipeName: string; connections: string[] } | null>(null);
   const [availableUpdates, setAvailableUpdates] = useState<Record<string, { latest_version: number; installed_version: number; locally_modified: boolean }>>({});
@@ -785,10 +790,17 @@ export function PipesSection() {
       if (pipeTypeFilter === "triggered" && !isTriggeredPipe(p)) return false;
       if (pipeTypeFilter === "manual" && !isManualPipe(p)) return false;
 
+      // Favorites filter — only applied when the user has toggled the star chip on.
+      if (pipeFavorites.showOnly && !pipeFavorites.isFavorite(p.config.name)) return false;
+
       return true;
     })
     .sort((a, b) => {
-      // Running first
+      // Starred first — explicit user intent beats everything else
+      const aFav = pipeFavorites.isFavorite(a.config.name);
+      const bFav = pipeFavorites.isFavorite(b.config.name);
+      if (aFav !== bFav) return aFav ? -1 : 1;
+      // Then running
       if (a.is_running !== b.is_running) return a.is_running ? -1 : 1;
       // Then by most recent execution from DB (matches the "Xm ago" display)
       const aExecs = pipeExecutions[a.config.name] || [];
@@ -1506,6 +1518,25 @@ export function PipesSection() {
             </button>
           );
         })}
+        {/* Favorites filter — pushed right; composes with the type tabs. */}
+        <button
+          onClick={() => pipeFavorites.setShowOnly(!pipeFavorites.showOnly)}
+          className={cn(
+            "pb-2 text-sm transition-colors duration-150 border-b-2 -mb-px inline-flex items-center gap-1 ml-auto",
+            pipeFavorites.showOnly
+              ? "border-foreground text-foreground font-medium"
+              : "border-transparent text-muted-foreground hover:text-foreground"
+          )}
+          title={pipeFavorites.showOnly ? "show all pipes" : "show only starred pipes"}
+        >
+          <Star
+            className={cn(
+              "h-3.5 w-3.5",
+              pipeFavorites.showOnly && "fill-foreground"
+            )}
+          />
+          favorites ({pipeFavorites.favorites.size})
+        </button>
       </div>
 
       {/* Search + filter chips */}
@@ -1650,6 +1681,30 @@ export function PipesSection() {
                   )}
                   title={lastStatus}
                 />
+
+                {/* Favorite toggle — per-machine preference persisted via /pipes/favorites */}
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    pipeFavorites.toggle(pipe.config.name);
+                  }}
+                  className={cn(
+                    "shrink-0 p-0.5 rounded hover:bg-accent/60 transition-colors",
+                    pipeFavorites.isFavorite(pipe.config.name)
+                      ? "text-foreground"
+                      : "text-muted-foreground/40 hover:text-muted-foreground"
+                  )}
+                  title={pipeFavorites.isFavorite(pipe.config.name) ? "unstar" : "star this pipe"}
+                  aria-pressed={pipeFavorites.isFavorite(pipe.config.name)}
+                >
+                  <Star
+                    className={cn(
+                      "h-3.5 w-3.5",
+                      pipeFavorites.isFavorite(pipe.config.name) && "fill-foreground"
+                    )}
+                  />
+                </button>
 
                 {/* Pipe name — click to expand */}
                 <button

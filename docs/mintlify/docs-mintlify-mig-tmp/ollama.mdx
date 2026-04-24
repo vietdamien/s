@@ -79,4 +79,64 @@ example: a Qwen server on `http://localhost:5000` with OpenAI-compatible API sho
 - close other GPU-heavy apps
 - ensure you have enough free RAM (model size + ~2 GB overhead)
 
+## troubleshooting Azure & custom OpenAI endpoints
+
+### Error: "unsupported tool use" or "does not support more than one tool call"
+
+screenpipe sends multiple tool calls to the LLM for agentic features. some models (especially older Azure-hosted models like Phi-4, older Llama versions) don't support this.
+
+**fixes:**
+- use a model that supports tool use: `gpt-4`, `gpt-4-turbo`, `claude-3-5-sonnet`, `gpt-oss-120b`
+- or disable agentic features in your pipe prompts (remove tool calls, just ask for text summaries)
+- on Azure, try switching to the latest model version available
+
+### Error: "max tokens is not supported"
+
+your endpoint doesn't recognize the `max_tokens` parameter that screenpipe sends.
+
+**fixes:**
+1. verify your endpoint supports OpenAI-compatible API: `curl -H "Authorization: Bearer YOUR_KEY" https://your-endpoint/v1/models`
+2. if using Azure, ensure you're using the OpenAI-compatible endpoint format (not the old REST API format)
+3. try a custom endpoint URL wrapper if your server needs parameter translation
+
+### API key not being passed to screenpipe API
+
+if screenpipe says "unauthorized" when accessing the local API, but your custom LLM endpoint is configured:
+
+**cause:** screenpipe CLI doesn't automatically share API credentials with the local REST API server.
+
+**fix:** configure your pipe or app to use the API key explicitly:
+```bash
+curl "http://localhost:3030/search?limit=5" \
+  -H "Authorization: Bearer YOUR_SCREENPIPE_API_KEY"
+```
+
+or set the API key in screenpipe settings → API security → enable API key auth, then provide that key in your requests.
+
+### Custom endpoint not responding / models not detected
+
+screenpipe tries both OpenAI and Ollama formats. if neither works:
+
+1. **test your endpoint manually:**
+   ```bash
+   curl https://your-endpoint/v1/models
+   curl https://your-endpoint/api/tags
+   ```
+   (one should return a model list; if neither does, your server may use a different path)
+
+2. **check authorization:**
+   ```bash
+   curl -H "Authorization: Bearer YOUR_KEY" https://your-endpoint/v1/models
+   ```
+
+3. **verify TLS/SSL:** if using https, ensure your certificate is valid (self-signed certs need special config)
+
+4. **common endpoint paths:**
+   - OpenAI-compatible: `/v1/models`, `/v1/chat/completions`
+   - Ollama-compatible: `/api/tags`, `/api/generate`
+   - vLLM: `/v1/models` (OpenAI-compatible)
+   - Text Generation WebUI: `/api/v1/models` (may vary)
+
+if stuck, [join our Discord](https://discord.gg/screenpipe) — share your endpoint URL structure and error logs.
+
 need help? [join our discord](https://discord.gg/screenpipe) — get recommendations on models and configs from the community.

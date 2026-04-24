@@ -140,6 +140,21 @@ export function CalendarCard({ onConnectionChange }: { onConnectionChange?: () =
     }
   }, [os, checkStatus]);
 
+  // Re-check status when the app regains focus — covers the case where the
+  // user toggled calendar access in System Settings and came back.
+  useEffect(() => {
+    if (os !== "macos" && os !== "windows") return;
+    const onVisible = () => {
+      if (document.visibilityState === "visible") checkStatus();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("focus", checkStatus);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("focus", checkStatus);
+    };
+  }, [os, checkStatus]);
+
   // Fetch events when authorized + enabled
   useEffect(() => {
     if (authorized && enabled) {
@@ -237,31 +252,38 @@ export function CalendarCard({ onConnectionChange }: { onConnectionChange?: () =
                   variant="outline"
                   size="sm"
                   onClick={authDenied ? async () => {
-                    // Open System Settings to Calendar privacy pane
-                    // Try multiple URL schemes for different macOS versions
+                    setIsAuthorizing(true);
+                    // Re-trigger the OS request first. This forces macOS to
+                    // register screenpipe in Privacy & Security → Calendars
+                    // (even if it was missing from the list), so the user can
+                    // actually toggle access when Settings opens.
                     try {
-                      const { Command } = await import("@tauri-apps/plugin-shell");
-                      await Command.create("open", [
-                        "x-apple.systempreferences:com.apple.preference.security?Privacy_Calendars",
-                      ]).execute();
+                      await invoke<string>("calendar_authorize");
                     } catch {
+                      // ignore — still try to open Settings
+                    }
+                    // Give the OS a moment to update TCC state
+                    await new Promise((r) => setTimeout(r, 400));
+
+                    // Open System Settings to Calendar privacy pane
+                    const { Command } = await import("@tauri-apps/plugin-shell");
+                    const urls = [
+                      "x-apple.systempreferences:com.apple.preference.security?Privacy_Calendars",
+                      "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_Calendars",
+                      "x-apple.systempreferences:com.apple.preference.security?Privacy",
+                    ];
+                    for (const url of urls) {
                       try {
-                        const { Command } = await import("@tauri-apps/plugin-shell");
-                        await Command.create("open", [
-                          "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_Calendars",
-                        ]).execute();
+                        await Command.create("open", [url]).execute();
+                        break;
                       } catch {
-                        // Last resort: open general Privacy settings
-                        try {
-                          const { Command } = await import("@tauri-apps/plugin-shell");
-                          await Command.create("open", [
-                            "x-apple.systempreferences:com.apple.preference.security?Privacy",
-                          ]).execute();
-                        } catch {
-                          // ignore
-                        }
+                        // try next
                       }
                     }
+
+                    setIsAuthorizing(false);
+                    // Re-check after user has had time to toggle
+                    setTimeout(checkStatus, 3000);
                   } : authorizeCalendar}
                   disabled={isAuthorizing}
                   className="text-xs"
@@ -273,18 +295,28 @@ export function CalendarCard({ onConnectionChange }: { onConnectionChange?: () =
                   ) : (
                     <Calendar className="h-3 w-3 mr-1.5" />
                   )}
-                  {authDenied ? "Open Calendar Settings" : "Connect Calendar"}
+                  {authDenied ? "Fix Calendar Permission" : "Connect Calendar"}
                 </Button>
 
                 {authDenied && (
-                  <p className="text-xs text-muted-foreground">
-                    Calendar access was denied. Click the button above to open System Settings,
-                    enable screenpipe under{" "}
-                    <span className="font-medium">
-                      Privacy &amp; Security &rarr; Calendars
-                    </span>
-                    , then restart the app.
-                  </p>
+                  <div className="space-y-1.5">
+                    <p className="text-xs text-muted-foreground leading-relaxed">
+                      Calendar access was denied. Click the button above — it
+                      re-registers screenpipe in{" "}
+                      <span className="font-medium">
+                        Privacy &amp; Security &rarr; Calendars
+                      </span>{" "}
+                      and opens System Settings. Toggle screenpipe ON there,
+                      then come back.
+                    </p>
+                    <p className="text-xs text-muted-foreground/70 leading-relaxed">
+                      Still not showing up? Quit screenpipe, run{" "}
+                      <code className="font-mono bg-muted px-1 rounded text-[10px]">
+                        tccutil reset Calendars screenpi.pe
+                      </code>{" "}
+                      in Terminal, relaunch, then try again.
+                    </p>
+                  </div>
                 )}
               </div>
             ) : (

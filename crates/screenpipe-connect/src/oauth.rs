@@ -8,9 +8,18 @@
 //!
 //! Every public function that reads or writes tokens accepts an optional
 //! `store: Option<&screenpipe_secrets::SecretStore>` as its first parameter.
-//! When `Some`, SecretStore is tried first (falls back to file for reads).
-//! When `None`, file-only (CLI mode).  Writes always go to **both** stores
-//! for backward compatibility during the migration.
+//!
+//! **Writes**: when `store` is `Some`, the token is written *only* to the
+//! SecretStore — no plaintext shadow on disk. If the write fails, the error
+//! is propagated (we do not silently downgrade to plaintext — that would
+//! defeat the point of the keychain). When `store` is `None` (CLI / tests),
+//! the token is written to a `0o600` plaintext file as a fallback.
+//!
+//! **Reads**: SecretStore is tried first; on miss, the plaintext file is
+//! tried. When a legacy plaintext file is loaded and a SecretStore *is*
+//! available, a one-shot migration copies the value into SecretStore and
+//! removes the plaintext. This is idempotent and safe across concurrent
+//! processes.
 //!
 //! ## How the callback works
 //!
@@ -58,7 +67,14 @@ pub const OAUTH_REDIRECT_URI: &str = "http://localhost:3030/connections/oauth/ca
 // /connections/oauth/callback HTTP handler (screenpipe-engine)
 // ---------------------------------------------------------------------------
 
-pub static PENDING_OAUTH: Lazy<Mutex<HashMap<String, oneshot::Sender<String>>>> =
+/// A pending OAuth flow: the sender that delivers the callback payload,
+/// tagged with its `integration_id` so `oauth_cancel` can find and drop it.
+pub struct PendingOAuth {
+    pub integration_id: String,
+    pub sender: oneshot::Sender<String>,
+}
+
+pub static PENDING_OAUTH: Lazy<Mutex<HashMap<String, PendingOAuth>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
 // ---------------------------------------------------------------------------
@@ -96,7 +112,10 @@ fn store_key(integration_id: &str, instance: Option<&str>) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Token file storage  (~/.screenpipe/{id}-oauth.json)
+// Legacy plaintext file location  (~/.screenpipe/{id}-oauth.json)
+//
+// Only used as a fallback when no SecretStore is available (CLI) or for
+// one-shot migration of pre-existing files into SecretStore.
 // ---------------------------------------------------------------------------
 
 pub fn oauth_token_path(integration_id: &str) -> PathBuf {
@@ -111,6 +130,31 @@ pub fn oauth_token_path_instance(integration_id: &str, instance: Option<&str>) -
     screenpipe_core::paths::default_screenpipe_data_dir().join(name)
 }
 
+/// Write `value` to a `0o600` plaintext file at `path`. The parent directory
+/// is created if missing. Unix-only permission tightening is best-effort.
+fn write_plaintext_0600(path: &std::path::Path, value: &Value) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, serde_json::to_string_pretty(value)?)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
+}
+
+/// Delete `path` if it exists. Treats "already gone" as success (e.g. from
+/// a concurrent migration in another process).
+fn remove_plaintext_if_exists(path: &std::path::Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -123,7 +167,12 @@ fn unix_now() -> u64 {
 // ---------------------------------------------------------------------------
 
 /// Load the raw OAuth JSON from SecretStore (if provided), falling back to
-/// the legacy file on disk.
+/// the legacy plaintext file on disk.
+///
+/// If the value is served from the plaintext file *and* a SecretStore is
+/// available, the value is migrated into the SecretStore and the plaintext
+/// file is deleted. Migration is best-effort: the loaded value is always
+/// returned to the caller even if migration fails, and a failure is logged.
 pub async fn load_oauth_json(
     store: Option<&SecretStore>,
     integration_id: &str,
@@ -137,10 +186,45 @@ pub async fn load_oauth_json(
         }
     }
 
-    // Fall back to legacy file
+    // Fall back to legacy plaintext file
     let path = oauth_token_path_instance(integration_id, instance);
-    let content = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&content).ok()
+    let content = std::fs::read_to_string(&path).ok()?;
+    let value: Value = serde_json::from_str(&content).ok()?;
+
+    // Passive migration: if we have a SecretStore available, move the
+    // plaintext value into it and delete the file. Runs at most once per
+    // integration+instance because on the next call the SecretStore hit
+    // above short-circuits before we ever read the file.
+    if let Some(s) = store {
+        let key = store_key(integration_id, instance);
+        match s.set_json(&key, &value).await {
+            Ok(()) => {
+                if let Err(e) = remove_plaintext_if_exists(&path) {
+                    tracing::warn!(
+                        "oauth: migrated {} (instance={:?}) to SecretStore but failed to remove plaintext at {}: {e:#}",
+                        integration_id,
+                        instance,
+                        path.display(),
+                    );
+                } else {
+                    tracing::info!(
+                        "oauth: migrated {} (instance={:?}) from plaintext to SecretStore",
+                        integration_id,
+                        instance,
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "oauth: failed to migrate {} (instance={:?}) to SecretStore, serving from plaintext: {e:#}",
+                    integration_id,
+                    instance,
+                );
+            }
+        }
+    }
+
+    Some(value)
 }
 
 /// Read the stored access token, returning `None` if the file is missing
@@ -194,7 +278,12 @@ pub async fn is_oauth_instance_connected(
 
 /// Write the raw provider token response, augmenting it with a computed
 /// `expires_at` unix timestamp if `expires_in` is present.
-/// Writes to **both** SecretStore (if provided) and the legacy file.
+///
+/// Routing rules:
+/// - If `store` is `Some`: written only to the SecretStore. On success, any
+///   legacy plaintext file is opportunistically removed. On failure, the
+///   error is propagated — we do not silently fall back to plaintext.
+/// - If `store` is `None`: written to a `0o600` plaintext file (CLI path).
 pub async fn write_oauth_token(integration_id: &str, data: &Value) -> Result<()> {
     write_oauth_token_instance(None, integration_id, None, data).await
 }
@@ -210,27 +299,31 @@ pub async fn write_oauth_token_instance(
         stored["expires_at"] = Value::from(unix_now() + expires_in);
     }
 
-    // Write to SecretStore if available
+    // SecretStore path — no plaintext shadow on disk.
     if let Some(s) = store {
         let key = store_key(integration_id, instance);
-        if let Err(e) = s.set_json(&key, &stored).await {
-            tracing::warn!("failed to write oauth token to SecretStore: {e:#}");
+        s.set_json(&key, &stored)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to write oauth token to SecretStore: {e:#}"))?;
+
+        // Sweep any leftover plaintext from a previous version or a prior
+        // no-store write. Best-effort: SecretStore already has the token
+        // so we never fail the caller on cleanup errors.
+        let path = oauth_token_path_instance(integration_id, instance);
+        if let Err(e) = remove_plaintext_if_exists(&path) {
+            tracing::warn!(
+                "oauth: {} (instance={:?}) written to SecretStore but failed to remove stale plaintext at {}: {e:#}",
+                integration_id,
+                instance,
+                path.display(),
+            );
         }
+        return Ok(());
     }
 
-    // Always write to file for backward compatibility
+    // Fallback: no SecretStore available — `0o600` plaintext file.
     let path = oauth_token_path_instance(integration_id, instance);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&path, serde_json::to_string_pretty(&stored)?)?;
-    // Restrict permissions — file contains OAuth credentials
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-    }
-    Ok(())
+    write_plaintext_0600(&path, &stored)
 }
 
 pub async fn delete_oauth_token(integration_id: &str) -> Result<()> {
@@ -242,17 +335,19 @@ pub async fn delete_oauth_token_instance(
     integration_id: &str,
     instance: Option<&str>,
 ) -> Result<()> {
-    // Delete from SecretStore if available
+    // Delete from SecretStore if available. Errors are swallowed: the key
+    // may legitimately not exist (e.g. fresh install, already deleted), and
+    // a store error here must not block removal of any plaintext shadow.
     if let Some(s) = store {
         let key = store_key(integration_id, instance);
         let _ = s.delete(&key).await;
     }
 
-    // Delete from file
+    // Always try to sweep the plaintext file — it may exist even when we
+    // wrote via SecretStore (legacy data, or a concurrent no-store write).
+    // Race-safe: NotFound is not an error.
     let path = oauth_token_path_instance(integration_id, instance);
-    if path.exists() {
-        std::fs::remove_file(path)?;
-    }
+    remove_plaintext_if_exists(&path)?;
     Ok(())
 }
 
@@ -341,7 +436,7 @@ pub async fn refresh_token_instance(
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("no refresh_token stored for {}", integration_id))?;
 
-    let resp: Value = client
+    let raw = client
         .post(EXCHANGE_PROXY_URL)
         .json(&serde_json::json!({
             "integration_id": integration_id,
@@ -349,10 +444,19 @@ pub async fn refresh_token_instance(
             "refresh_token": refresh_tok,
         }))
         .send()
-        .await?
-        .error_for_status()?
-        .json()
         .await?;
+    let status = raw.status();
+    let body = raw.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(anyhow::anyhow!(
+            "oauth refresh for {} returned {}: {}",
+            integration_id,
+            status,
+            body
+        ));
+    }
+    let resp: Value = serde_json::from_str(&body)
+        .map_err(|e| anyhow::anyhow!("oauth refresh returned non-JSON body: {e}: {body}"))?;
 
     write_oauth_token_instance(store, integration_id, instance, &resp).await?;
 
@@ -399,6 +503,11 @@ const EXCHANGE_PROXY_URL: &str = "https://screenpi.pe/api/oauth/exchange";
 /// Exchange an authorization `code` for tokens via the screenpipe backend
 /// proxy at `screenpi.pe`.  The backend holds `client_secret` — the desktop
 /// app never sees it.
+///
+/// On failure, includes the raw response body in the error so callers can
+/// surface the upstream provider message (AADSTS, invalid_grant, …) instead
+/// of just the HTTP status. Without this, every OAuth failure logged the
+/// same opaque `400 Bad Request` and we had no way to tell the cause.
 pub async fn exchange_code(
     client: &reqwest::Client,
     integration_id: &str,
@@ -413,9 +522,18 @@ pub async fn exchange_code(
             "redirect_uri":   redirect_uri,
         }))
         .send()
-        .await?
-        .error_for_status()?
-        .json()
         .await?;
-    Ok(resp)
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(anyhow::anyhow!(
+            "oauth exchange for {} returned {}: {}",
+            integration_id,
+            status,
+            body
+        ));
+    }
+    let json: Value = serde_json::from_str(&body)
+        .map_err(|e| anyhow::anyhow!("oauth exchange returned non-JSON body: {e}: {body}"))?;
+    Ok(json)
 }

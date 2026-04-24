@@ -632,11 +632,21 @@ impl SCServer {
                     "/install",
                     axum::routing::post(crate::pipes_api::install_pipe),
                 )
+                // Favorites — register before `/:id` so axum doesn't match
+                // "favorites" as a pipe id.
+                .route(
+                    "/favorites",
+                    axum::routing::get(crate::pipes_api::list_favorites),
+                )
                 .route("/:id", axum::routing::get(crate::pipes_api::get_pipe))
                 .route("/:id", axum::routing::delete(crate::pipes_api::delete_pipe))
                 .route(
                     "/:id/enable",
                     axum::routing::post(crate::pipes_api::enable_pipe),
+                )
+                .route(
+                    "/:id/favorite",
+                    axum::routing::post(crate::pipes_api::set_pipe_favorite),
                 )
                 .route(
                     "/:id/run",
@@ -723,14 +733,14 @@ impl SCServer {
             screenpipe_connect::whatsapp::WhatsAppGateway::new(self.screenpipe_dir.clone()),
         ));
 
-        // Auto-reconnect WhatsApp if a previous session exists on disk
+        // Auto-reconnect WhatsApp if a previous session exists on disk.
+        // We pass an empty hint so `start_pairing` runs its full resolver
+        // (bundled sidecar → install dirs → PATH).
         {
             let wa_lock = wa.lock().await;
             if wa_lock.has_session() {
                 tracing::info!("whatsapp: found existing session, auto-reconnecting...");
-                let bun_path =
-                    screenpipe_connect::whatsapp::which_bun().unwrap_or_else(|| "bun".to_string());
-                if let Err(e) = wa_lock.start_pairing(&bun_path).await {
+                if let Err(e) = wa_lock.start_pairing("").await {
                     tracing::warn!("whatsapp: auto-reconnect failed: {:?}", e);
                 }
             }

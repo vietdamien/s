@@ -17,6 +17,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
 use crate::event_driven_capture::{CaptureTrigger, TriggerSender};
+use crate::focus_aware_controller::FocusAwareController;
 use crate::hot_frame_cache::HotFrameCache;
 use crate::power::PowerProfile;
 
@@ -66,6 +67,12 @@ pub struct VisionManager {
     hot_frame_cache: Option<Arc<HotFrameCache>>,
     /// Power profile receiver — each monitor gets a clone.
     power_profile_rx: Option<watch::Receiver<PowerProfile>>,
+    /// Focus-aware capture controller — always constructed.
+    /// If focus resolution fails on a given platform (Linux Wayland, permission
+    /// denied, etc.) the NullFocusTracker + Unknown event path makes the
+    /// controller report Active for all monitors, preserving the pre-feature
+    /// behaviour for those users.
+    focus_controller: Arc<FocusAwareController>,
 }
 
 impl VisionManager {
@@ -77,6 +84,18 @@ impl VisionManager {
     ) -> Self {
         // Single broadcast channel shared across all monitors + UI recorder.
         let (trigger_tx, _rx) = tokio::sync::broadcast::channel::<CaptureTrigger>(64);
+
+        // Focus-aware capture is always on. `new_tracker()` always succeeds —
+        // returns a null tracker on platforms without a native impl. Controller
+        // fallback handles `Unknown` events by treating all monitors as Active,
+        // so users whose systems can't report focus still get the pre-feature
+        // behaviour (every monitor captured at full rate).
+        let focus_controller = {
+            let _guard = vision_handle.enter();
+            let tracker = crate::focus_tracker::new_tracker();
+            FocusAwareController::new(tracker)
+        };
+
         Self {
             config,
             db,
@@ -86,6 +105,7 @@ impl VisionManager {
             trigger_tx,
             hot_frame_cache: None,
             power_profile_rx: None,
+            focus_controller,
         }
     }
 
@@ -148,6 +168,7 @@ impl VisionManager {
 
         // Get all monitors and start recording on each (filtered by user selection)
         let monitors = list_monitors().await;
+        let total_monitors = monitors.len();
         for monitor in monitors {
             if !self.is_monitor_allowed(&monitor) {
                 info!(
@@ -166,6 +187,27 @@ impl VisionManager {
             }
         }
 
+        let task_count = self.recording_tasks.len();
+        if task_count == 0 {
+            // Roll status back so the next .start() attempt isn't blocked by the
+            // idempotency guard above.
+            *self.status.write().await = VisionManagerStatus::Stopped;
+            warn!(
+                "VisionManager: no monitors matched the allowed list \
+                 ({} enumerated, 0 started) — stale monitor_ids?",
+                total_monitors
+            );
+            return Err(anyhow::anyhow!(
+                "no monitors matched the allowed list (monitorIds may be stale: \
+                 {} enumerated, 0 started)",
+                total_monitors
+            ));
+        }
+
+        info!(
+            "VisionManager started with {}/{} monitor(s)",
+            task_count, total_monitors
+        );
         Ok(())
     }
 
@@ -206,6 +248,9 @@ impl VisionManager {
             // and the purple recording dot disappears.
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
+
+        // Shut down the focus controller.
+        self.focus_controller.shutdown();
 
         let mut status = self.status.write().await;
         *status = VisionManagerStatus::Stopped;
@@ -301,6 +346,7 @@ impl VisionManager {
         let pause_on_drm_content = self.config.pause_on_drm_content;
         let languages = self.config.languages.clone();
         let power_profile_rx = self.power_profile_rx.clone();
+        let focus_controller = self.focus_controller.clone();
 
         info!(
             "Starting event-driven capture for monitor {} (device: {})",
@@ -327,6 +373,7 @@ impl VisionManager {
                 pause_on_drm_content,
                 languages,
                 power_profile_rx,
+                focus_controller,
             )
             .await
             {
@@ -418,6 +465,68 @@ impl VisionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use screenpipe_core::Language;
+    use screenpipe_db::DatabaseManager;
+    use screenpipe_screen::PipelineMetrics;
+
+    async fn make_vm_with_monitor_ids(monitor_ids: Vec<String>) -> VisionManager {
+        let db = Arc::new(
+            DatabaseManager::new("sqlite::memory:", Default::default())
+                .await
+                .expect("in-memory db"),
+        );
+        let config = VisionManagerConfig {
+            output_path: std::env::temp_dir().to_string_lossy().into_owned(),
+            ignored_windows: vec![],
+            included_windows: vec![],
+            vision_metrics: Arc::new(PipelineMetrics::default()),
+            use_pii_removal: false,
+            monitor_ids,
+            use_all_monitors: false,
+            ignore_incognito_windows: false,
+            pause_on_drm_content: false,
+            languages: vec![Language::English],
+            max_snapshot_width: 0,
+        };
+        VisionManager::new(config, db, Handle::current())
+    }
+
+    /// Regression: with an allowlist that matches zero physical monitors,
+    /// `start()` must return `Err` and leave status as `Stopped`, so the
+    /// outer `CaptureSession::start` stays None and the tray can retry.
+    ///
+    /// Before the fix: `start()` returned `Ok(())` silently with zero tasks,
+    /// and the outer detached spawn swallowed the no-op — leaving a "dead"
+    /// `CaptureSession` parked in `RecordingState.capture`. Every subsequent
+    /// tray click then hit the `is_some()` short-circuit in `recording.rs`.
+    #[tokio::test]
+    async fn start_with_no_allowed_monitors_returns_err() {
+        // A stable_id prefix that cannot exist on any real host.
+        let stale = vec!["Display 999_9999x9999_0,0".to_string()];
+        let vm = make_vm_with_monitor_ids(stale).await;
+
+        let result = vm.start().await;
+        assert!(
+            result.is_err(),
+            "expected Err when allowlist matches zero monitors, got: {:?}",
+            result
+        );
+
+        // Status must be rolled back to Stopped so a subsequent retry
+        // (with a corrected allowlist) isn't blocked by the idempotency guard.
+        assert_eq!(
+            vm.status().await,
+            VisionManagerStatus::Stopped,
+            "status must be rolled back to Stopped on Err, otherwise retry is blocked"
+        );
+
+        // Recording tasks map must stay empty — nothing was spawned.
+        assert_eq!(
+            vm.recording_tasks.len(),
+            0,
+            "no tasks should exist after failed start"
+        );
+    }
 
     /// Verify that stop_monitor completes promptly when the task finishes normally.
     #[tokio::test]

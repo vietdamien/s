@@ -221,9 +221,19 @@ impl RecordingConfig {
             schedule_enabled: settings.schedule_enabled,
             schedule_rules: settings.schedule_rules.clone(),
             max_snapshot_width: settings.max_snapshot_width,
-            api_auth: settings.api_auth,
+            // LAN exposure is opt-in. We force `api_auth` on whenever
+            // `listen_on_lan` is true so a user can never accidentally
+            // publish an unauthenticated API on their local network. The
+            // UI makes the dependency explicit; this guard is the safety
+            // net if someone edits the settings JSON by hand or flips the
+            // field via an older frontend that doesn't know about it.
+            api_auth: settings.api_auth || settings.listen_on_lan,
             api_auth_key: None,
-            listen_address: std::net::Ipv4Addr::LOCALHOST,
+            listen_address: if settings.listen_on_lan {
+                std::net::Ipv4Addr::UNSPECIFIED // 0.0.0.0 — all interfaces
+            } else {
+                std::net::Ipv4Addr::LOCALHOST
+            },
             encrypt_secrets: false, // desktop app handles keychain via Tauri commands
         }
     }
@@ -287,5 +297,57 @@ impl RecordingConfig {
             languages: self.languages.clone(),
             max_snapshot_width: self.max_snapshot_width,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    fn settings_with(lan: bool, api_auth: bool) -> screenpipe_config::RecordingSettings {
+        let mut s = screenpipe_config::RecordingSettings::default();
+        s.listen_on_lan = lan;
+        s.api_auth = api_auth;
+        s
+    }
+
+    fn build(s: &screenpipe_config::RecordingSettings) -> RecordingConfig {
+        RecordingConfig::from_settings(s, std::path::PathBuf::from("/tmp/sp_test"), None)
+    }
+
+    #[test]
+    fn defaults_to_loopback() {
+        let c = build(&screenpipe_config::RecordingSettings::default());
+        assert_eq!(c.listen_address, Ipv4Addr::LOCALHOST);
+        assert!(c.api_auth, "api_auth defaults to true for safety");
+    }
+
+    #[test]
+    fn listen_on_lan_binds_unspecified() {
+        let c = build(&settings_with(true, true));
+        assert_eq!(c.listen_address, Ipv4Addr::UNSPECIFIED);
+        assert!(c.api_auth);
+    }
+
+    #[test]
+    fn listen_on_lan_forces_api_auth_on_even_if_disabled() {
+        // The UI or a hand-edited settings file might flip api_auth off
+        // while listen_on_lan is on — we refuse to let that combo ship.
+        let c = build(&settings_with(true, false));
+        assert_eq!(c.listen_address, Ipv4Addr::UNSPECIFIED);
+        assert!(
+            c.api_auth,
+            "api_auth must be forced on when LAN access is enabled"
+        );
+    }
+
+    #[test]
+    fn listen_on_lan_off_respects_api_auth_off() {
+        // If the user has explicitly disabled auth AND kept the bind on
+        // loopback, leave them alone — localhost-only is already safe.
+        let c = build(&settings_with(false, false));
+        assert_eq!(c.listen_address, Ipv4Addr::LOCALHOST);
+        assert!(!c.api_auth);
     }
 }

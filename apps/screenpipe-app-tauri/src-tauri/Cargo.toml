@@ -1,6 +1,6 @@
 [package]
 name = "screenpipe-app"
-version = "2.4.12"
+version = "2.4.44"
 description = "24/7 memory for your desktop. 100% local."
 authors = ["you"]
 license = ""
@@ -166,6 +166,7 @@ windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
     "Win32_Graphics_Dwm",
+    "Win32_Security_Cryptography",
 ] }
 
 [target.'cfg(target_os = "linux")'.dependencies]

@@ -70,7 +70,6 @@ impl CaptureSession {
 
             capture_trigger_tx = Some(vision_manager.trigger_sender());
 
-            let vm_clone = vision_manager.clone();
             let shutdown_rx = shutdown_tx.subscribe();
             let audio_manager_for_drm = if !config.disable_audio {
                 Some((*server.audio_manager).clone())
@@ -78,16 +77,26 @@ impl CaptureSession {
                 None
             };
 
+            // Await VisionManager::start inline so its Err can propagate back to
+            // start_capture. Previously this was inside a detached `tokio::spawn`,
+            // which returned the outer `Ok(Self)` before the spawn even ran — so
+            // a silent failure (e.g. stale allowlist matching zero monitors) left
+            // a "dead" CaptureSession parked in RecordingState.capture and every
+            // subsequent tray click short-circuited on is_some().
+            vision_manager.start().await.map_err(|e| {
+                error!("Failed to start VisionManager: {:?}", e);
+                format!("Failed to start VisionManager: {e}")
+            })?;
+            info!("VisionManager started successfully");
+
+            // Long-running parts (monitor watcher + shutdown handler) stay in the
+            // spawn — they're fire-and-forget by design.
+            let vm_spawn = vision_manager.clone();
             tokio::spawn(async move {
                 let mut shutdown_rx = shutdown_rx;
 
-                if let Err(e) = vm_clone.start().await {
-                    error!("Failed to start VisionManager: {:?}", e);
-                    return;
-                }
-                info!("VisionManager started successfully");
-
-                if let Err(e) = start_monitor_watcher(vm_clone.clone(), audio_manager_for_drm).await
+                if let Err(e) =
+                    start_monitor_watcher(vm_spawn.clone(), audio_manager_for_drm).await
                 {
                     error!("Failed to start monitor watcher: {:?}", e);
                 }
@@ -97,7 +106,7 @@ impl CaptureSession {
                 info!("Received shutdown signal for VisionManager");
 
                 let _ = stop_monitor_watcher().await;
-                if let Err(e) = vm_clone.shutdown().await {
+                if let Err(e) = vm_spawn.shutdown().await {
                     error!("Error shutting down VisionManager: {:?}", e);
                 }
             });

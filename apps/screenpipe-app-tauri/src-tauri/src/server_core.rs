@@ -57,6 +57,7 @@ impl ServerCore {
         on_pipe_output: Option<screenpipe_core::pipes::OnPipeOutputLine>,
     ) -> Result<Self, String> {
         info!("Starting server core on port {}", config.port);
+        crate::health::set_boot_phase("starting", Some("starting server"));
 
         // --- Environment setup ---
         std::env::set_var("SCREENPIPE_FD_LIMIT", "8192");
@@ -96,11 +97,96 @@ impl ServerCore {
             .map_err(|e| format!("Failed to create data dir: {}", e))?;
 
         let db_path = format!("{}/db.sqlite", local_data_dir.to_string_lossy());
-        let db = Arc::new(
-            DatabaseManager::new(&db_path, config.db_config.clone())
-                .await
-                .map_err(|e| format!("Failed to initialize database: {}", e))?,
+        crate::health::set_boot_phase(
+            "migrating_database",
+            Some("updating database — this may take several minutes on large installs"),
         );
+
+        // DB init with bounded retry on lock contention.
+        //
+        // Context: user `pmp` on v2.4.37 hit "database is locked" the same
+        // second the server started, before any migration could run. Most
+        // plausible causes are another process briefly touching the file
+        // (Spotlight indexing, Time Machine, antivirus, iCloud/OneDrive
+        // sync, or a stale advisory lock from a crashed prior screenpipe
+        // process). All of those clear within a few seconds.
+        //
+        // A short backoff retry absorbs these without looping through the
+        // outer watchdog, which would otherwise re-run migrations and
+        // other setup. The outer watchdog in recording.rs still covers
+        // the catastrophic case where every inner retry fails.
+        //
+        // Non-lock errors (permissions, corruption, bad path) bail out
+        // immediately — retrying would just delay the user-visible error.
+        const DB_LOCK_RETRY_DELAYS_SECS: &[u64] = &[0, 2, 5];
+        let db = {
+            let mut last_err: Option<String> = None;
+            let mut built = None;
+            for (attempt_idx, delay) in DB_LOCK_RETRY_DELAYS_SECS.iter().enumerate() {
+                if *delay > 0 {
+                    info!(
+                        "retrying database init after {}s (attempt {}/{})",
+                        delay,
+                        attempt_idx + 1,
+                        DB_LOCK_RETRY_DELAYS_SECS.len()
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(*delay)).await;
+                }
+                match DatabaseManager::new(&db_path, config.db_config.clone()).await {
+                    Ok(db) => {
+                        built = Some(db);
+                        break;
+                    }
+                    Err(e) => {
+                        let s = e.to_string();
+                        let is_lock =
+                            s.contains("database is locked") || s.contains("database is busy");
+                        if is_lock && attempt_idx + 1 < DB_LOCK_RETRY_DELAYS_SECS.len() {
+                            // warn, not error — expected transient condition
+                            warn!(
+                                "database locked on startup (attempt {}/{}): {}",
+                                attempt_idx + 1,
+                                DB_LOCK_RETRY_DELAYS_SECS.len(),
+                                e
+                            );
+                            last_err = Some(s);
+                            continue;
+                        }
+                        // Final failure — either non-lock error or exhausted retries
+                        let msg = if is_lock {
+                            format!(
+                                "Database is locked by another process (likely Spotlight, \
+                                 Time Machine, antivirus, or iCloud/OneDrive sync). After \
+                                 {} attempts the lock did not clear. Close backup/sync tools \
+                                 and relaunch. Underlying error: {}",
+                                DB_LOCK_RETRY_DELAYS_SECS.len(),
+                                e
+                            )
+                        } else {
+                            format!("Failed to initialize database: {}", e)
+                        };
+                        crate::health::set_boot_error(&msg);
+                        return Err(msg);
+                    }
+                }
+            }
+            match built {
+                Some(db) => Arc::new(db),
+                None => {
+                    // All attempts returned lock errors and we exhausted the loop.
+                    // The branch above handles the last-attempt case, but defensively
+                    // handle the case where the loop exited without a match.
+                    let e = last_err.unwrap_or_else(|| "unknown error".to_string());
+                    let msg = format!(
+                        "Database is locked — exhausted all {} retry attempts. {}",
+                        DB_LOCK_RETRY_DELAYS_SECS.len(),
+                        e
+                    );
+                    crate::health::set_boot_error(&msg);
+                    return Err(msg);
+                }
+            }
+        };
         info!("Database initialized at {}", db_path);
 
         // --- Audio devices + manager (built but NOT started) ---
@@ -162,10 +248,15 @@ impl ServerCore {
             audio_manager_builder = audio_manager_builder.meeting_detector(detector.clone());
         }
 
+        crate::health::set_boot_phase("building_audio", Some("starting audio pipeline"));
         let mut audio_manager = audio_manager_builder
             .build(db.clone())
             .await
-            .map_err(|e| format!("Failed to build audio manager: {}", e))?;
+            .map_err(|e| {
+                let msg = format!("Failed to build audio manager: {}", e);
+                crate::health::set_boot_error(&msg);
+                msg
+            })?;
 
         // Wire audio → hot cache
         {
@@ -273,6 +364,7 @@ impl ServerCore {
         }
 
         // --- Pipe manager ---
+        crate::health::set_boot_phase("starting_pipes", Some("loading pipes"));
         let pipes_dir = config.data_dir.join("pipes");
         std::fs::create_dir_all(&pipes_dir).ok();
 
@@ -342,7 +434,11 @@ impl ServerCore {
             config.port,
         ))
         .await
-        .map_err(|e| format!("Failed to bind port {}: {}", config.port, e))?;
+        .map_err(|e| {
+            let msg = format!("Failed to bind port {}: {}", config.port, e);
+            crate::health::set_boot_error(&msg);
+            msg
+        })?;
 
         info!("HTTP server bound to port {}", config.port);
 
@@ -354,6 +450,7 @@ impl ServerCore {
         });
 
         info!("Server core started successfully");
+        crate::health::set_boot_phase("ready", None);
 
         // mDNS
         if let Err(e) = screenpipe_connect::mdns::advertise(config.port) {

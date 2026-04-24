@@ -22,13 +22,25 @@ import { VertexAIProvider } from './vertex';
 const MAX_RETRIES = 3;
 const BASE_DELAY_MS = 1000;
 
+/**
+ * Upstream error with HTTP status preserved — lets the cascade logic in
+ * chat.ts inspect `.status` instead of regex-matching the message string,
+ * which was missing 524 timeouts and routing them through the slow path.
+ */
+export class UpstreamError extends Error {
+	status: number;
+	constructor(message: string, status: number) {
+		super(message);
+		this.name = 'UpstreamError';
+		this.status = status;
+	}
+}
+
 async function fetchWithRetry(url: string, init: RequestInit, label: string): Promise<Response> {
-	let lastError: Error | null = null;
 	for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
 		const response = await fetch(url, init);
 		if (response.status !== 429) return response;
 
-		lastError = new Error(`429 on attempt ${attempt + 1}`);
 		const retryAfter = response.headers.get('retry-after');
 		const delayMs = retryAfter
 			? Math.min(parseInt(retryAfter, 10) * 1000, 10000)
@@ -40,14 +52,22 @@ async function fetchWithRetry(url: string, init: RequestInit, label: string): Pr
 	return fetch(url, init);
 }
 
-// Vertex MaaS model IDs — short name → Vertex publisher/model ID + region
+// Vertex MaaS model IDs — short name → Vertex publisher/model ID + region.
+// Verified against Vertex Model Garden docs 2026-04-21:
+//   https://docs.cloud.google.com/vertex-ai/generative-ai/docs/maas/{publisher}
+// Re-add `glm-5.1` once GLM-5.1 (released Apr 7 on HuggingFace) lands in
+// Vertex MaaS — currently only on Z.ai's own API.
 const VERTEX_MAAS_MODELS: Record<string, { vertexId: string; region: string }> = {
 	'glm-4.7': { vertexId: 'zai-org/glm-4.7-maas', region: 'global' },
 	'glm-5': { vertexId: 'zai-org/glm-5-maas', region: 'global' },
-	// 'glm-5.1' and 'minimax-m2.7' removed 2026-04-17 — Vertex returns
-	// 404 "Publisher Model not found" for their configured IDs. Re-add
-	// once we verify the real publisher/model path via Model Garden.
 	'kimi-k2.5': { vertexId: 'moonshotai/kimi-k2-thinking-maas', region: 'global' },
+	// MiniMax M2 not enabled — Vertex's openapi endpoint requires
+	// `<publisher>/<model>` format but rejects both `minimax/minimax-m2-maas`
+	// (404 "Publisher Model not found") and `minimax-m2-maas` alone (400
+	// "Malformed publisher model … expected '<publisher>/<model>'").
+	// The MiniMax MaaS docs list `minimax-m2-maas` as the model param but
+	// it must be a different endpoint shape — needs investigation in
+	// Vertex Model Garden console before re-adding.
 	'llama-4-maverick': { vertexId: 'meta/llama-4-maverick-17b-128e-instruct-maas', region: 'us-east5' },
 	'llama-4-scout': { vertexId: 'meta/llama-4-scout-17b-16e-instruct-maas', region: 'us-east5' },
 	'deepseek-r1': { vertexId: 'deepseek-ai/deepseek-r1-0528-maas', region: 'global' },
@@ -62,7 +82,7 @@ export function isVertexMaasModel(model: string): boolean {
 	// Exact match first (e.g. "llama-4-maverick"), then substring for legacy names.
 	// This prevents "meta-llama/llama-4-maverick" (OpenRouter) from matching.
 	return Object.keys(VERTEX_MAAS_MODELS).some((key) => lower === key) ||
-		['glm-', 'kimi-', 'qwen3-coder', 'qwen3-next', 'minimax'].some((prefix) => lower.includes(prefix));
+		['glm-', 'kimi-', 'qwen3-coder', 'qwen3-next', 'minimax-m'].some((prefix) => lower.includes(prefix));
 }
 
 export function resolveVertexMaasModel(model: string): { vertexId: string; region: string } | null {
@@ -126,8 +146,11 @@ export class VertexMaasProvider implements AIProvider {
 
 		if (!response.ok) {
 			const error = await response.text();
-			console.error(`Vertex MaaS error (${resolved.vertexId}):`, error);
-			throw new Error(`Vertex MaaS request failed: ${response.status} ${error}`);
+			console.error(`Vertex MaaS error (${resolved.vertexId}):`, response.status, error);
+			throw new UpstreamError(
+				`Vertex MaaS request failed: ${response.status} ${error}`,
+				response.status,
+			);
 		}
 
 		const result = await response.json();
@@ -166,8 +189,11 @@ export class VertexMaasProvider implements AIProvider {
 
 		if (!response.ok) {
 			const error = await response.text();
-			console.error(`Vertex MaaS streaming error (${resolved.vertexId}):`, error);
-			throw new Error(`Vertex MaaS streaming failed: ${response.status} ${error}`);
+			console.error(`Vertex MaaS streaming error (${resolved.vertexId}):`, response.status, error);
+			throw new UpstreamError(
+				`Vertex MaaS streaming failed: ${response.status} ${error}`,
+				response.status,
+			);
 		}
 
 		// The endpoint returns standard OpenAI SSE — pass through directly
@@ -210,7 +236,6 @@ export class VertexMaasProvider implements AIProvider {
 		return [
 			{ id: 'glm-4.7', name: 'GLM-4.7 (best coding, 200K ctx)', provider: 'vertex-maas' },
 			{ id: 'glm-5', name: 'GLM-5 (reasoning, 745B)', provider: 'vertex-maas' },
-			// glm-5.1 and minimax-m2.7 hidden 2026-04-17 — Vertex 404 on their IDs.
 			{ id: 'kimi-k2.5', name: 'Kimi K2.5 (strong all-rounder)', provider: 'vertex-maas' },
 			{ id: 'llama-4-maverick', name: 'Llama 4 Maverick (vision, 400B MoE)', provider: 'vertex-maas' },
 			{ id: 'llama-4-scout', name: 'Llama 4 Scout (vision, 109B MoE)', provider: 'vertex-maas' },

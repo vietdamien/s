@@ -214,9 +214,24 @@ jobs:
         # pattern across both layouts, and force a fresh install if nothing
         # is on disk at all.
         find_openblas_so() {
+          # Prefer the versioned SONAME (e.g. libopenblas.so.0 — the
+          # actual library file) over the unversioned libopenblas.so
+          # (typically managed by update-alternatives, points at the
+          # versioned file). If we pick the unversioned form as REAL_SO,
+          # the SONAME-based `ln -sf $REAL_SO /usr/.../$SONAME` below
+          # becomes `ln -sf X X` which removes X and creates a dangling
+          # symlink-to-self — `test -e` then fails the sanity check.
+          local versioned
+          versioned="$(find /usr/lib /usr/local/lib /lib 2>/dev/null \
+            -name 'libopenblas.so.*' -print 2>/dev/null | head -1)"
+          if [ -n "$versioned" ]; then
+            printf '%s\n' "$versioned"
+            return
+          fi
+          # Fallback: unversioned name. Rare on standard Ubuntu images
+          # but defended against self-symlinks below.
           find /usr/lib /usr/local/lib /lib 2>/dev/null \
-            \( -name 'libopenblas.so' -o -name 'libopenblas.so.*' \) \
-            -print 2>/dev/null | head -1
+            -name 'libopenblas.so' -print 2>/dev/null | head -1
         }
 
         REAL_SO="$(find_openblas_so)"
@@ -254,8 +269,20 @@ jobs:
         # "error while loading shared libraries: libopenblas.so.0". Symlink the
         # SONAME and the unsuffixed name into the default path.
         SONAME="$(basename "$REAL_SO")"  # e.g. libopenblas.so.0
-        sudo ln -sf "$REAL_SO" "/usr/lib/x86_64-linux-gnu/${SONAME}"
-        sudo ln -sf "$REAL_SO" /usr/lib/x86_64-linux-gnu/libopenblas.so
+        # Defensive: only create the SONAME / unversioned symlinks if
+        # the destination differs from REAL_SO. ln -sf to self removes
+        # the file before creating the link, leaving a dangling symlink
+        # — silent breakage that surfaces 100ms later as `test -e`
+        # exits 1. Belt-and-suspenders with the find_openblas_so fix
+        # above which already prefers the versioned file.
+        SONAME_DEST="/usr/lib/x86_64-linux-gnu/${SONAME}"
+        if [ "$REAL_SO" != "$SONAME_DEST" ]; then
+          sudo ln -sf "$REAL_SO" "$SONAME_DEST"
+        fi
+        UNVER_DEST="/usr/lib/x86_64-linux-gnu/libopenblas.so"
+        if [ "$REAL_SO" != "$UNVER_DEST" ]; then
+          sudo ln -sf "$REAL_SO" "$UNVER_DEST"
+        fi
         sudo ldconfig
 
         # Sanity check: the symlinks must be non-dangling (-e follows links).

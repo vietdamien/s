@@ -42,6 +42,26 @@ const STUCK_TIMEOUT_MS = 15000;
 const LIVE_FEED_MIN_MS = 8000; // minimum time to show live feed before enabling continue
 const LIVE_FEED_POLL_MS = 3000; // poll search every 3s
 
+// Boot phases emitted by the Rust backend — see src-tauri/src/health.rs.
+// We use these to show actionable copy during long migrations (Mike Cloke
+// 2026-04-22 had a 31.5GB db, migration took 13.2s, old UI flipped to
+// "stuck" after 15s and told user to send logs instead of waiting).
+type BootPhaseSnapshot = {
+  phase:
+    | "idle"
+    | "starting"
+    | "migrating_database"
+    | "building_audio"
+    | "starting_pipes"
+    | "ready"
+    | "error";
+  message: string | null;
+  error: string | null;
+  sinceEpochSecs: number;
+};
+
+const BOOT_PHASE_POLL_MS = 500;
+
 export default function EngineStartup({
   handleNextSlide,
 }: EngineStartupProps) {
@@ -59,6 +79,9 @@ export default function EngineStartup({
   const [feedSeconds, setFeedSeconds] = useState(0);
   const [canContinue, setCanContinue] = useState(false);
   const [showSkip, setShowSkip] = useState(false);
+
+  // Boot phase — polled via Tauri IPC, available before HTTP server binds
+  const [bootPhase, setBootPhase] = useState<BootPhaseSnapshot | null>(null);
 
   const hasAdvancedRef = useRef(false);
   const mountTimeRef = useRef(Date.now());
@@ -140,6 +163,29 @@ export default function EngineStartup({
     const interval = setInterval(poll, 500);
     poll();
     return () => clearInterval(interval);
+  }, [state]);
+
+  // Poll boot phase via Tauri IPC — available before HTTP server binds.
+  // Crucial on large-db migrations where /health is unreachable for minutes.
+  useEffect(() => {
+    if (state === "running" || state === "live-feed") return;
+
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const phase = await invoke<BootPhaseSnapshot>("get_boot_phase");
+        if (!cancelled) setBootPhase(phase);
+      } catch {
+        // command not available (shouldn't happen in a shipped build) — ignore
+      }
+    };
+
+    poll();
+    const interval = setInterval(poll, BOOT_PHASE_POLL_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
   }, [state]);
 
   // Transition from "running" to "live-feed" instead of auto-advancing
@@ -266,30 +312,58 @@ export default function EngineStartup({
     return () => clearTimeout(timer);
   }, [state]);
 
-  // Timers for taking-longer and stuck
+  // Timers for taking-longer and stuck.
+  //
+  // The stuck timer used to fire unconditionally after 15s. That was wrong
+  // for users with large databases: their migration takes 13-60+ seconds
+  // (Mike Cloke had a 31.5GB db), and the UI flipped to "stuck" telling
+  // them to send logs while the migration was still running fine.
+  //
+  // We now re-arm the stuck timer every time a genuine progress signal
+  // arrives (new boot phase), so it only fires when nothing has changed
+  // for STUCK_TIMEOUT_MS.
   useEffect(() => {
     const longerTimer = setTimeout(
       () => setIsTakingLonger(true),
       TAKING_LONGER_MS
     );
+    return () => clearTimeout(longerTimer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    if (state === "running" || state === "live-feed" || state === "stuck") return;
+    // If backend is actively progressing (or reports error explicitly) we
+    // don't want to fire the generic "stuck" path on a timer. The backend's
+    // own error path will set phase=error, which we handle separately.
+    if (bootPhase?.phase === "error") return;
     const stuckTimer = setTimeout(() => {
-      if (state !== "running" && state !== "live-feed") {
-        setState("stuck");
+      // Re-check at fire time — state or phase may have advanced.
+      setState((current) => {
+        if (current === "running" || current === "live-feed") return current;
+        const activePhases: BootPhaseSnapshot["phase"][] = [
+          "migrating_database",
+          "building_audio",
+          "starting_pipes",
+        ];
+        if (bootPhase && activePhases.includes(bootPhase.phase)) {
+          // Progress is happening — don't flip to stuck. Timer will re-arm
+          // when bootPhase updates.
+          return current;
+        }
         posthog.capture("onboarding_engine_stuck", {
           time_spent_ms: Date.now() - mountTimeRef.current,
           serverStarted,
           audioReady,
           visionReady,
+          boot_phase: bootPhase?.phase ?? "unknown",
         });
-      }
+        return "stuck";
+      });
     }, STUCK_TIMEOUT_MS);
-
-    return () => {
-      clearTimeout(longerTimer);
-      clearTimeout(stuckTimer);
-    };
+    return () => clearTimeout(stuckTimer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [state, bootPhase?.phase]);
 
   const ensureDefaultPreset = useCallback(async () => {
     if (settings.aiPresets.length === 0) {
@@ -517,7 +591,14 @@ export default function EngineStartup({
 
           {/* Privacy reassurance */}
           <p className="font-mono text-[10px] text-muted-foreground/50 text-center">
-            all data stays on your device. nothing leaves your machine.
+            zero retention on cloud features ·{" "}
+            <button
+              type="button"
+              onClick={() => openUrl("https://screenpi.pe/security")}
+              className="underline hover:text-muted-foreground transition-colors"
+            >
+              whitepaper ↗
+            </button>
           </p>
 
           {/* Continue button */}
@@ -586,18 +667,22 @@ export default function EngineStartup({
 
         <ProgressSteps steps={progressSteps} className="mt-3" />
 
-        {/* Taking longer hint */}
+        {/* Phase-aware status line — prefer backend-provided message when
+            present (e.g. "updating database — may take several minutes on
+            large installs"), else the generic "starting engine..." hint. */}
         <AnimatePresence>
-          {isTakingLonger && state === "starting" && (
-            <motion.p
-              className="font-mono text-[10px] text-muted-foreground/60 mt-3"
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              exit={{ opacity: 0 }}
-            >
-              starting engine...
-            </motion.p>
-          )}
+          {state === "starting" &&
+            (bootPhase?.message || isTakingLonger) && (
+              <motion.p
+                key={bootPhase?.phase ?? "taking-longer"}
+                className="font-mono text-[10px] text-muted-foreground/60 mt-3 max-w-[360px] text-center"
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+              >
+                {bootPhase?.message ?? "starting engine..."}
+              </motion.p>
+            )}
         </AnimatePresence>
 
         {/* Stuck UI */}

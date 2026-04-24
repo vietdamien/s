@@ -161,16 +161,27 @@ export default function NotificationPanelPage() {
             case "deeplink": {
               if (actionObj.url) {
                 if (actionObj.url.startsWith("screenpipe://")) {
-                  // Emit to main window's DeeplinkHandler which knows how to
-                  // route screenpipe:// URLs (timeline, frame, settings, etc.)
+                  // Show the Main window FIRST — its DeeplinkHandler only
+                  // routes events once mounted, and on macOS the window
+                  // won't actually come to the foreground unless we activate
+                  // the app (see show_window_activated for the rationale).
+                  // Then give React ~150ms to mount the listener before
+                  // emitting. Without this ordering, the emit fires into a
+                  // handler that hasn't subscribed yet and the click silently
+                  // does nothing.
+                  await invoke("show_window_activated", { window: "Main" });
+                  await new Promise((r) => setTimeout(r, 150));
                   await emit("deep-link-received", actionObj.url);
                 } else {
                   // External URL — open in system browser
                   try {
                     const { open } = await import("@tauri-apps/plugin-shell");
                     await open(actionObj.url);
-                  } catch {
-                    // shell plugin not available in this window
+                  } catch (e) {
+                    console.error(
+                      "notification open: shell plugin unavailable",
+                      e
+                    );
                   }
                 }
               }
@@ -183,11 +194,16 @@ export default function NotificationPanelPage() {
           return;
         }
 
-        // Legacy string-based action handlers
+        // Legacy string-based action handlers. The notification panel is a
+        // NonActivating NSPanel on macOS, so regular `show_window` completes
+        // successfully without actually bringing the target window to the
+        // foreground — use `show_window_activated` so explicit user clicks
+        // from the notification panel always surface the window above other
+        // apps, regardless of overlay_mode.
         if (actionStr === "open_timeline") {
-          await invoke("show_window", { window: "Main" });
+          await invoke("show_window_activated", { window: "Main" });
         } else if (actionStr === "open_chat") {
-          await invoke("show_window", { window: "Chat" });
+          await invoke("show_window_activated", { window: "Chat" });
         } else if (actionStr === "open_pipe_suggestions") {
           await showChatWithPrefill({
             context: PIPE_SUGGESTION_PROMPT,
@@ -244,8 +260,24 @@ export default function NotificationPanelPage() {
           }
           return; // don't auto-hide on error so user sees the message
         }
-      } catch {
-        // ignore
+      } catch (e) {
+        // Log loudly instead of swallowing silently — this is the place a
+        // bug like "click Open does nothing" used to vanish. We still hide
+        // the panel so the user isn't left with a stuck UI, but the failure
+        // now shows up in DevTools + ~/.screenpipe/logs (via tracing from
+        // any Tauri command that errored) + PostHog as a distinct event.
+        console.error(
+          "notification action failed",
+          { action: actionStr, type: actionObj?.type },
+          e
+        );
+        posthog.capture("notification_action_error", {
+          type: payload?.type,
+          id: payload?.id,
+          action: actionStr,
+          actionType: actionObj?.type,
+          error: String(e),
+        });
       }
 
       await hide(false);

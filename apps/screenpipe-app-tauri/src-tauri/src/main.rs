@@ -73,6 +73,7 @@ mod tray;
 mod updates;
 mod voice_training;
 mod window;
+mod windows_ca_bundle;
 #[cfg(target_os = "windows")]
 mod windows_overlay;
 
@@ -315,6 +316,14 @@ async fn is_server_running(app: AppHandle) -> Result<bool, String> {
 #[tokio::main]
 async fn main() {
     let _ = fix_path_env::fix();
+
+    // Export the Windows root/CA cert stores to a PEM file and set
+    // NODE_EXTRA_CA_CERTS before any bun/node subprocess can spawn. Fixes
+    // "unable to verify the first certificate" on corporate networks where
+    // antivirus (ESET, Zscaler, etc.) injects a private root CA. No-op on
+    // macOS/Linux. Must run before Pi, PortableGit download, and pipe
+    // subprocesses are touched.
+    windows_ca_bundle::install();
 
     // Handle --check-arc-automation / --trigger-arc-automation flags early,
     // before any Tauri initialization. Used by the permission system to run
@@ -589,6 +598,7 @@ async fn main() {
                 recording::stop_capture,
                 recording::get_monitors,
                 recording::get_audio_devices,
+                recording::get_boot_phase,
                 // Commands from commands.rs
                 commands::is_enterprise_build_cmd,
                 commands::get_enterprise_license_key,
@@ -600,6 +610,7 @@ async fn main() {
                 commands::open_pipe_window,
                 commands::update_show_screenpipe_shortcut,
                 commands::show_window,
+                commands::show_window_activated,
                 commands::open_login_window,
                 commands::open_google_calendar_auth_window,
                 commands::ensure_webview_focus,
@@ -659,7 +670,9 @@ async fn main() {
                 pi::pi_prompt,
                 pi::pi_abort,
                 pi::pi_new_session,
+                pi::pi_set_model,
                 pi::pi_update_config,
+                pi::bun_check,
                 // ChatGPT OAuth commands
                 chatgpt_oauth::chatgpt_oauth_login,
                 chatgpt_oauth::chatgpt_oauth_status,
@@ -668,6 +681,7 @@ async fn main() {
                 chatgpt_oauth::chatgpt_oauth_models,
                 // Generic OAuth commands (works for any OAuth integration)
                 oauth::oauth_connect,
+                oauth::oauth_cancel,
                 oauth::oauth_status,
                 oauth::oauth_disconnect,
                 oauth::oauth_list_instances,
@@ -846,6 +860,7 @@ async fn main() {
             recording::stop_capture,
             recording::get_monitors,
             recording::get_audio_devices,
+            recording::get_boot_phase,
             permissions::open_permission_settings,
             permissions::request_permission,
             permissions::do_permissions_check,
@@ -868,6 +883,7 @@ async fn main() {
             commands::delete_cache_files,
             commands::open_pipe_window,
             commands::show_window,
+            commands::show_window_activated,
             commands::open_login_window,
             commands::ensure_webview_focus,
             commands::close_window,
@@ -935,7 +951,9 @@ async fn main() {
             pi::pi_prompt,
             pi::pi_abort,
             pi::pi_new_session,
+            pi::pi_set_model,
             pi::pi_update_config,
+            pi::bun_check,
             // ChatGPT OAuth commands
             chatgpt_oauth::chatgpt_oauth_login,
             chatgpt_oauth::chatgpt_oauth_status,
@@ -944,6 +962,7 @@ async fn main() {
             chatgpt_oauth::chatgpt_oauth_models,
             // Generic OAuth commands (works for any OAuth integration)
             oauth::oauth_connect,
+            oauth::oauth_cancel,
             oauth::oauth_status,
             oauth::oauth_disconnect,
             oauth::oauth_list_instances,

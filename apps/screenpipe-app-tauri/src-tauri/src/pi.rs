@@ -1284,6 +1284,13 @@ pub async fn pi_start_inner(
         }
     }
 
+    // Auto-auth the agent's `curl localhost:3030/...` calls via a bash
+    // shim sourced from $BASH_ENV on every subshell. See bash_env.rs in
+    // screenpipe-core.
+    if let Ok(p) = screenpipe_core::agents::bash_env::ensure_wrapper_in_default_dir() {
+        cmd.env("BASH_ENV", p);
+    }
+
     // Pass the user's API key as env var for non-screenpipe providers
     if let Some(ref config) = provider_config {
         // ChatGPT OAuth: inject token from secret store (no api_key in config)
@@ -1697,8 +1704,88 @@ pub async fn pi_check() -> Result<PiCheckResult, String> {
     })
 }
 
+/// Locate the bundled bun binary so the frontend can write absolute-path
+/// MCP configs (e.g. `{ command: <bun>, args: ["x", "screenpipe-mcp@latest"] }`)
+/// instead of `npx -y screenpipe-mcp`. npx requires a global Node install
+/// — many Claude Desktop users don't have it, and the silent first-run
+/// `npx` download often blows past Claude's MCP startup timeout. Using
+/// the bun we already ship sidesteps both failure modes.
+#[tauri::command]
+#[specta::specta]
+pub async fn bun_check() -> Result<PiCheckResult, String> {
+    let path = find_bun_executable();
+    Ok(PiCheckResult {
+        available: path.is_some(),
+        path,
+    })
+}
+
+/// Hot-swap Pi's active model without killing the subprocess. Preserves the
+/// full conversation state in-place — the user can switch haiku ↔ sonnet ↔ opus
+/// mid-session and the new model sees the real threaded history, not a
+/// glued-transcript workaround.
+///
+/// Pi's RPC `set_model` is the right path for provider+model changes only. If
+/// other preset fields change (url, apiKey, maxTokens, systemPrompt) the
+/// caller should fall back to `pi_update_config` which does a full restart
+/// because those are spawn-time args baked into models.json / CLI flags.
+#[tauri::command]
+#[specta::specta]
+pub async fn pi_set_model(
+    state: State<'_, PiState>,
+    session_id: Option<String>,
+    provider_config: PiProviderConfig,
+) -> Result<(), String> {
+    let sid = session_id.unwrap_or_else(|| "chat".to_string());
+
+    // Map frontend provider name → Pi's internal registry name. Must stay in
+    // sync with the mapping in `pi_start_inner` (line ~1045) — a mismatch
+    // means Pi can't find the model and returns "Model not found".
+    let pi_provider = match provider_config.provider.as_str() {
+        "openai" => "openai-byok",
+        "openai-chatgpt" => "openai-chatgpt",
+        "native-ollama" => "ollama",
+        "anthropic" => "anthropic-byok",
+        "custom" if !provider_config.url.is_empty() => "custom",
+        "screenpipe-cloud" | "pi" | _ => "screenpipe",
+    };
+    let pi_model = resolve_screenpipe_model(&provider_config.model, pi_provider);
+
+    let queue = {
+        let mut pool = state.0.lock().await;
+        let m = pool.sessions.get_mut(&sid).ok_or("Pi not initialized")?;
+        if !m.is_running() {
+            return Err("Pi is not running".to_string());
+        }
+        m.last_activity = std::time::Instant::now();
+        m.queue_handle
+            .clone()
+            .ok_or("Pi command queue not initialized")?
+    };
+
+    info!(
+        "Pi set_model (session '{}'): provider={} model={}",
+        sid, pi_provider, pi_model
+    );
+
+    let cmd = json!({
+        "type": "set_model",
+        "provider": pi_provider,
+        "modelId": pi_model,
+    });
+
+    let rx = queue
+        .send(cmd, crate::pi_command_queue::WaitMode::WaitDone)
+        .await?;
+    rx.await
+        .map_err(|_| "Pi command queue dropped".to_string())?
+}
+
 /// Update Pi config and restart the chat session so the new model takes effect.
 /// Without restart, Pi keeps using the provider/model from its original CLI args.
+///
+/// Prefer `pi_set_model` when only provider+model changed — it preserves the
+/// conversation state instead of killing the subprocess.
 #[tauri::command]
 #[specta::specta]
 pub async fn pi_update_config(

@@ -93,18 +93,26 @@ impl WhatsAppGateway {
     }
 
     /// Start the Baileys gateway process for QR pairing.
-    pub async fn start_pairing(&self, bun_path: &str) -> Result<()> {
+    ///
+    /// `bun_hint` is advisory — if it's an absolute path to an existing binary,
+    /// we use it; otherwise we fall back to the bundled sidecar + common install
+    /// locations + PATH (see `resolve_bun_path`). This makes the frontend's life
+    /// easy (it can just pass `"bun"`) and still works on fresh Macs where bun
+    /// isn't on the user's PATH.
+    pub async fn start_pairing(&self, bun_hint: &str) -> Result<()> {
+        let bun_path = resolve_bun_path(Some(bun_hint))?;
+
         // Bump generation so any existing watchdog exits on its next check
         let gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
 
         // Stop any existing process
         self.stop_process().await;
 
-        // Cache bun path for watchdog restarts
-        *self.bun_path.lock().await = bun_path.to_string();
+        // Cache resolved bun path for watchdog restarts
+        *self.bun_path.lock().await = bun_path.clone();
 
-        self.ensure_deps(bun_path).await?;
-        self.spawn_gateway(bun_path).await?;
+        self.ensure_deps(&bun_path).await?;
+        self.spawn_gateway(&bun_path).await?;
 
         // Enable auto-restart now that we've successfully started
         self.auto_restart.store(true, Ordering::SeqCst);
@@ -510,7 +518,53 @@ impl WhatsAppGateway {
     }
 }
 
-/// Find bun executable on PATH.
+/// Resolve the `bun` executable used by the WhatsApp gateway subprocess.
+///
+/// Resolution order (first match wins):
+///   1. `hint` if it's an absolute path to an existing file. Allows callers
+///      (or advanced users) to force a specific binary.
+///   2. Bundled sidecar + common install locations via
+///      `screenpipe_core::agents::pi::find_bun_executable` — this is the
+///      common case on macOS/Windows where Tauri ships bun next to the app
+///      binary, or the user installed bun via the official installer.
+///   3. `which bun` / `where bun` PATH lookup — last resort, works when the
+///      user explicitly added bun to their shell PATH.
+///
+/// Returns a friendly error when bun can't be located anywhere, pointing the
+/// user at `https://bun.sh/install`. Prevents the cryptic
+/// "No such file or directory (os error 2)" that plain `Command::new("bun")`
+/// surfaces when the binary isn't on PATH.
+pub fn resolve_bun_path(hint: Option<&str>) -> Result<String> {
+    if let Some(h) = hint {
+        let trimmed = h.trim();
+        let is_placeholder = trimmed.is_empty()
+            || trimmed.eq_ignore_ascii_case("bun")
+            || trimmed.eq_ignore_ascii_case("bun.exe");
+        if !is_placeholder {
+            let p = std::path::Path::new(trimmed);
+            if p.is_absolute() && p.exists() {
+                return Ok(trimmed.to_string());
+            }
+        }
+    }
+
+    if let Some(p) = screenpipe_core::agents::pi::find_bun_executable() {
+        return Ok(p);
+    }
+
+    if let Some(p) = which_bun() {
+        return Ok(p);
+    }
+
+    anyhow::bail!(
+        "bun binary not found. screenpipe normally ships bun bundled inside the \
+         app. If you're running from source or the bundled binary is missing, \
+         install bun from https://bun.sh/install and restart the app."
+    )
+}
+
+/// Find bun executable on PATH. Prefer `resolve_bun_path` for end-to-end
+/// resolution — this is the PATH-only fallback.
 pub fn which_bun() -> Option<String> {
     which_executable("bun")
 }
@@ -537,4 +591,54 @@ fn which_executable(name: &str) -> Option<String> {
             None
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An absolute hint pointing at an existing file is returned verbatim —
+    /// this is the escape hatch for users who want to force a specific bun.
+    #[test]
+    fn hint_with_real_absolute_path_is_honored() {
+        // current_exe always exists and is absolute — it's not bun, but the
+        // resolver doesn't execute it, only checks that it exists.
+        let exe = std::env::current_exe().unwrap();
+        let got = resolve_bun_path(Some(exe.to_str().unwrap())).unwrap();
+        assert_eq!(got, exe.to_str().unwrap());
+    }
+
+    /// Placeholder hints ("bun", "bun.exe", "", "  ") should NOT match and
+    /// must fall through to the real resolver. We can't assert the fallback
+    /// path without poking the environment, so we just assert that the
+    /// placeholder is never echoed back.
+    #[test]
+    fn placeholder_hints_dont_short_circuit() {
+        for placeholder in [Some(""), Some("bun"), Some("BUN.EXE"), Some("  "), None] {
+            match resolve_bun_path(placeholder) {
+                Ok(path) => {
+                    // Whatever we got back, it must NOT be the literal placeholder.
+                    assert_ne!(path.as_str(), "bun");
+                    assert_ne!(path.as_str().to_lowercase(), "bun.exe");
+                    assert_ne!(path.trim(), "");
+                }
+                Err(_) => {
+                    // Acceptable — bun genuinely isn't installed anywhere on
+                    // this machine. The contract is "don't lie", not "always
+                    // succeed".
+                }
+            }
+        }
+    }
+
+    /// Relative or non-existent hint paths are treated as placeholders so
+    /// we don't hand the spawner a path that will fail with "os error 2".
+    #[test]
+    fn nonexistent_hint_path_is_ignored() {
+        let bogus = "/tmp/definitely-not-a-real-bun-binary-xyz";
+        match resolve_bun_path(Some(bogus)) {
+            Ok(path) => assert_ne!(path, bogus),
+            Err(_) => {} // bun not installed anywhere — fine.
+        }
+    }
 }

@@ -47,7 +47,7 @@
       "hardenedRuntime": true
     },
     "windows": {
-      "signCommand": "powershell -ExecutionPolicy Bypass -File sign-azure.ps1 %1"
+      "signCommand": "powershell -ExecutionPolicy Bypass -File sign-ssl.ps1 %1"
     }
   },
   "plugins": {

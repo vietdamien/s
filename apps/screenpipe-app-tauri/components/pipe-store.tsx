@@ -333,27 +333,25 @@ export function PipeStoreView() {
       .catch(() => setInstalledCount(0));
   }, []);
 
-  // Read initial tab from URL param (e.g. ?section=pipes&tab=discover)
-  // Default to "discover" when user has no pipes installed
-  const [activeTab, setActiveTab] = useState<"discover" | "my-pipes">(() => {
-    if (typeof window !== "undefined") {
-      const params = new URLSearchParams(window.location.search);
-      if (params.get("tab") === "discover") return "discover";
-      if (params.get("tab") === "my-pipes") return "my-pipes";
+  const [activeTab, setActiveTab] = useState<"discover" | "my-pipes">("my-pipes");
+
+  // Read ?tab= from URL after mount, then strip it so it doesn't persist
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const tab = params.get("tab");
+    if (tab === "discover") setActiveTab("discover");
+    else if (tab === "my-pipes") setActiveTab("my-pipes");
+    if (tab) {
+      params.delete("tab");
+      window.history.replaceState({}, "", `${window.location.pathname}?${params}`);
     }
-    return "my-pipes";
-  });
+  }, []);
 
   // Once we know installed count, switch new users to discover
   useEffect(() => {
     if (installedCount !== null && installedCount === 0) {
-      // Only auto-switch if no explicit tab param was set
-      if (typeof window !== "undefined") {
-        const params = new URLSearchParams(window.location.search);
-        if (!params.get("tab")) {
-          setActiveTab("discover");
-        }
-      }
+      const params = new URLSearchParams(window.location.search);
+      if (!params.get("tab")) setActiveTab("discover");
     }
   }, [installedCount]);
 
@@ -408,6 +406,18 @@ function DiscoverView({ onInstalled }: { onInstalled?: () => void }) {
   const [loading, setLoading] = useState(true);
   const [searchQuery, setSearchQuery] = useState("");
   const [debouncedQuery, setDebouncedQuery] = useState("");
+
+  // Prefill search from ?q= URL param after mount, then strip it so it doesn't persist
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const q = params.get("q") ?? "";
+    if (q) {
+      setSearchQuery(q);
+      setDebouncedQuery(q);
+      params.delete("q");
+      window.history.replaceState({}, "", `${window.location.pathname}?${params}`);
+    }
+  }, []);
   const [category, setCategory] = useState("All");
   const [sort, setSort] = useState("popular");
 
@@ -452,6 +462,20 @@ function DiscoverView({ onInstalled }: { onInstalled?: () => void }) {
 
   // Available updates from store
   const [availableUpdates, setAvailableUpdates] = useState<Record<string, { latest_version: number; installed_version: number; locally_modified: boolean }>>({});
+
+  // First-visit banner — show once, dismiss permanently
+  // Initialize false to match server render, set true after mount if not dismissed
+  const [showWelcome, setShowWelcome] = useState(false);
+  useEffect(() => {
+    if (!localStorage.getItem("screenpipe:pipes-welcome-dismissed")) {
+      setShowWelcome(true);
+    }
+  }, []);
+
+  const dismissWelcome = () => {
+    setShowWelcome(false);
+    localStorage.setItem("screenpipe:pipes-welcome-dismissed", "1");
+  };
 
   // Fetch installed pipes (cached 30s, invalidated on install)
   useEffect(() => {
@@ -734,19 +758,6 @@ function DiscoverView({ onInstalled }: { onInstalled?: () => void }) {
       </div>
     );
   }
-
-  // First-visit banner — show once, dismiss permanently
-  const [showWelcome, setShowWelcome] = useState(() => {
-    if (typeof window !== "undefined") {
-      return !localStorage.getItem("screenpipe:pipes-welcome-dismissed");
-    }
-    return true;
-  });
-
-  const dismissWelcome = () => {
-    setShowWelcome(false);
-    localStorage.setItem("screenpipe:pipes-welcome-dismissed", "1");
-  };
 
   return (
     <div className="space-y-6">

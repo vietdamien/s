@@ -166,6 +166,16 @@ pub async fn get_audio_devices() -> Result<Vec<AudioDeviceInfo>, String> {
     get_available_audio_devices().await
 }
 
+/// Read the current boot phase of the server. Used by the onboarding UI to
+/// show progress ("updating database", "loading pipes", ...) while the HTTP
+/// server is not yet listening — in particular during long DB migrations
+/// where /health is unreachable.
+#[tauri::command]
+#[specta::specta]
+pub async fn get_boot_phase() -> crate::health::BootPhaseSnapshot {
+    crate::health::get_boot_phase_snapshot()
+}
+
 pub async fn get_available_monitors() -> Result<Vec<MonitorDevice>, String> {
     debug!("Getting available monitors");
     let monitors = screenpipe_screen::monitor::list_monitors().await;
@@ -348,9 +358,28 @@ pub async fn spawn_screenpipe(
     let health_url = format!("http://localhost:{}/health", port);
 
     // --- Race prevention ---
+    //
+    // If a start is already in progress, wait on it rather than racing. This
+    // used to time out after 15s and retry — which was fine for small
+    // databases but catastrophic for large ones (Mike Cloke 2026-04-22: 31.5GB
+    // db, migration took 13.2s, watchdog fired a retry, both migrations
+    // raced on the SQLite lock, both failed, app stuck forever).
+    //
+    // Now we use boot-phase state as the source of truth:
+    //   - "ready" → server is up, we're done
+    //   - "error" → initial start failed, safe to take over and retry
+    //   - "migrating_database" / "building_audio" / "starting_pipes" / "starting"
+    //     → another thread is making progress, keep waiting no matter how long
+    //
+    // A 30-minute safety ceiling prevents a wedged start from hanging the app
+    // forever; for context, even a 100GB migration finishes in ~1 minute.
     if state.is_starting.swap(true, Ordering::SeqCst) {
-        info!("Server start already in progress, waiting for health...");
-        for _ in 0..30 {
+        info!("Server start already in progress, waiting for boot phase...");
+        const MAX_WAIT_SECS: u64 = 1800; // 30 minutes
+        const POLL_MS: u64 = 500;
+        let start_wait = std::time::Instant::now();
+        loop {
+            // Fast path: HTTP health up → done.
             if let Ok(resp) = reqwest::Client::new()
                 .get(&health_url)
                 .timeout(std::time::Duration::from_secs(1))
@@ -362,20 +391,60 @@ pub async fn spawn_screenpipe(
                     return Ok(());
                 }
             }
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        }
-        warn!("In-flight server start didn't produce healthy server after 15s");
-        {
-            let server_guard = state.server.lock().await;
-            if server_guard.is_some() {
-                info!("Server exists after timeout — not starting duplicate");
-                return Ok(());
+            let phase = crate::health::get_boot_phase_snapshot();
+            match phase.phase.as_str() {
+                "ready" => {
+                    // Phase says ready — HTTP may be binding right now. Loop
+                    // once more without extra wait; it'll resolve on next poll.
+                    tokio::time::sleep(std::time::Duration::from_millis(POLL_MS)).await;
+                    continue;
+                }
+                "error" => {
+                    warn!(
+                        "In-flight server start reported error: {}",
+                        phase.error.as_deref().unwrap_or("<no detail>")
+                    );
+                    // Take over: clear is_starting so the full-start path below
+                    // can run. Another concurrent caller may beat us; the
+                    // swap(true) below detects that.
+                    state.is_starting.store(false, Ordering::SeqCst);
+                    if state.is_starting.swap(true, Ordering::SeqCst) {
+                        // Someone else is already retrying. Bail out cleanly.
+                        return Ok(());
+                    }
+                    break;
+                }
+                "idle" => {
+                    // is_starting was true but phase never updated — the
+                    // spawning thread likely died before setting phase. Treat
+                    // like error and take over.
+                    if start_wait.elapsed() > std::time::Duration::from_secs(30) {
+                        warn!("is_starting set but boot phase still idle after 30s — taking over");
+                        state.is_starting.store(false, Ordering::SeqCst);
+                        if state.is_starting.swap(true, Ordering::SeqCst) {
+                            return Ok(());
+                        }
+                        break;
+                    }
+                }
+                _ => {
+                    // starting | migrating_database | building_audio | starting_pipes
+                    // — keep waiting, progress is being made.
+                }
             }
-        }
-        info!("No server after 15s — previous start likely failed, retrying");
-        state.is_starting.store(false, Ordering::SeqCst);
-        if state.is_starting.swap(true, Ordering::SeqCst) {
-            return Ok(());
+            if start_wait.elapsed() > std::time::Duration::from_secs(MAX_WAIT_SECS) {
+                warn!(
+                    "In-flight server start did not complete after {}s (phase={})",
+                    MAX_WAIT_SECS, phase.phase
+                );
+                state.is_starting.store(false, Ordering::SeqCst);
+                return Err(format!(
+                    "Server start timed out after {} minutes. Current phase: {}",
+                    MAX_WAIT_SECS / 60,
+                    phase.phase
+                ));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(POLL_MS)).await;
         }
     }
 
@@ -547,7 +616,9 @@ pub async fn spawn_screenpipe(
             {
                 Ok(rt) => rt,
                 Err(e) => {
-                    let _ = result_tx.send(Err(format!("Failed to create server runtime: {}", e)));
+                    let msg = format!("Failed to create server runtime: {}", e);
+                    crate::health::set_boot_error(&msg);
+                    let _ = result_tx.send(Err(msg));
                     return;
                 }
             };

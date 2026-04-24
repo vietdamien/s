@@ -550,6 +550,45 @@ export function PrivacySection() {
           </CardContent>
         </Card>
         </LockedSetting>
+
+        {/* LAN access — off by default. Toggling on force-enables api_auth
+            (the backend mirrors this guard in RecordingConfig::from_settings
+            so the API is never exposed to the network unauthenticated). */}
+        <LockedSetting settingKey="listen_on_lan">
+        <Card className="border-border bg-card">
+          <CardContent className="px-3 py-2.5">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center space-x-2.5">
+                <Shield className="h-4 w-4 text-muted-foreground shrink-0" />
+                <div>
+                  <h3 className="text-sm font-medium text-foreground">
+                    Allow LAN access
+                  </h3>
+                  <p className="text-xs text-muted-foreground mt-0.5">
+                    Bind the API to <code className="text-[10px]">0.0.0.0</code> so other devices on your local
+                    network can query it. API authentication is force-enabled
+                    whenever this is on. Restart the app to apply.
+                  </p>
+                </div>
+              </div>
+              <Switch
+                checked={settings.listenOnLan ?? false}
+                onCheckedChange={(checked) => {
+                  // Keep the UI consistent with the backend guard: flipping
+                  // LAN on also flips api_auth on, so the user can't
+                  // accidentally leave themselves open.
+                  if (checked) {
+                    handleSettingsChange({ listenOnLan: true, apiAuth: true });
+                  } else {
+                    handleSettingsChange({ listenOnLan: false });
+                  }
+                }}
+              />
+            </div>
+          </CardContent>
+        </Card>
+        </LockedSetting>
+
         <EncryptDataCard
           encryptStore={settings.encryptStore ?? false}
           onEncryptStoreChange={(checked) => {

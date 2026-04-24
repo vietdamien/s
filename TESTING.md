@@ -136,6 +136,7 @@ commits: `28e5c247`
 - [ ] **dead System Audio auto-reconnect** — Simulate a dead system audio stream. Verify it auto-reconnects and resumes capture. (`0f287761d`)
 - [ ] **per-device audio toggle** — In the tray menu, verify you can toggle recording for individual audio devices. (`3ee3defcb`)
 - [ ] **stable audio device order** — Verify that audio devices listed in the tray menu maintain a stable order across refreshes. (`4577ac8a6`)
+- [ ] **Mic disconnect false-positives on sleep/wake** — Put the computer to sleep and wake it up. Verify that no false-positive mic disconnect notifications or logs are generated. (`796baa619`)
 
 
 #### Audio device recovery (monitor unplug / device switch)
@@ -196,6 +197,7 @@ commits: `6dd5d98e`, `831ad258`
 - [ ] **reduced CPU spikes in vision/capture pipeline** — Actively browse and use applications, verifying that CPU spikes in the vision/capture pipeline are significantly reduced. (`8f7294e6`)
 - [ ] **OCR bounding boxes normalized on Windows/Linux** — On Windows and Linux, verify that OCR bounding boxes are correctly normalized to the 0-1 range, ensuring consistent text overlay and interaction. (`aba74513`)
 - [ ] **Debounced monitor capture errors** — Simulate transient monitor capture errors. Verify that these errors are debounced and do not lead to excessive error logging or app crashes.
+- [ ] **Focus-aware capture** — Enable "Only record focused monitor" in settings. Verify that Screenpipe only captures frames and runs OCR for the monitor that currently has the focused window. (`886b5c05d`)
 
 ### 6. Battery Saver Mode
 
@@ -681,6 +683,8 @@ commits: `fa887407`, `815f52e6`, `60840155`, `e66c3ff8`, `c905ffbf`, `01147096`,
 - [ ] **Rich activity-summary** — Verify that activity summaries include details about windows, URLs, and audio transcriptions. (`f2d8ba1dad3`)
 - [ ] **OpenAI-compatible transcription endpoint** — Verify that the `/v1/audio/transcriptions` endpoint works correctly with standard OpenAI clients. (`59deeba19`)
 - [ ] **Mermaid diagram XSS sanitization** — Verify that mermaid diagrams in the UI are correctly sanitized to prevent XSS attacks. (`3405e9793`)
+- [ ] **Per-machine pipe favorites (stars)** — Toggle the star icon for a pipe. Verify that favorites are persisted per-machine and that the filter chip correctly shows starred pipes first. (`e1a18adb9`, `0a2c1abb7`)
+- [ ] **Connected integrations @mentions in chat** — Open the filter popover in chat. Verify that connected integrations (like Notion, Slack, Google Docs) appear as @mentions for easy filtering. (`1c0c95b20`)
 
 commits: `fa887407`, `815f52e6`, `60840155`, `e66c3ff8`, `c905ffbf`, `01147096`, `5908d7f4`, `46422869`, `4f43da70`, `71a1a537`, `6abaaa36`
 
@@ -744,6 +748,7 @@ commits: `ad431b513`, `d9722bccc`, `4df21e83d`
 - [ ] **Ignore incognito toggle** — Verify that the "Ignore Incognito Windows" toggle in settings correctly prevents recording of private windows. (`d9722bccc`)
 - [ ] **Incognito detection UI feedback** — Verify that the UI correctly reflects when an incognito window is being ignored.
 - [ ] **DRM pause behavior** — Play DRM-protected content (e.g., Netflix in Safari). Verify that Screenpipe pauses recording gracefully and resumes automatically once the DRM content is closed, without crashing the server. (`3d9f0e8bb`)
+- [ ] **LAN-access toggle** — Toggle "Enable LAN access" in API settings. Verify that the API binds to `0.0.0.0` and that `api_auth` is forcibly enabled for security. (`c8d9c83f0`)
 
 commits: `fc830b43`
 
@@ -845,6 +850,7 @@ commits: `cf2dcd5f8`, `ad1d00d8f`, `6f623b30a`, `aaf031169`
 
 - [ ] **Restart notifications toggle** — Toggle "restart notifications" in settings. Verify notifications only appear when enabled. (`f82b4f350`)
 - [ ] **Notification text selection** — Verify that text can be selected in notification inbox messages. (`3449197c3`)
+- [ ] **macOS notification "Open" click** — Click "Open" on a macOS system notification. Verify it correctly brings the Screenpipe window to the front. (`3e86cebb0`)
 
 ### 26. Onboarding & Fleet UX
 
@@ -863,9 +869,16 @@ commits: `c8769545b`, `4f522325b`, `54000c295`
 - [ ] **New service connections** — Verify Brex, Stripe, Sentry, Vercel, Pipedrive, Intercom, and Limitless connections can be authorized and sync data. (`4f522325b`, `54000c295`)
 - [ ] **Multi-instance OAuth for GitHub and Notion** — Verify that multi-instance OAuth works for GitHub and Notion, including fetching identity after token exchange. (`5d6ee5da3`)
 - [ ] **Glean icon in connections grid** — Verify that the Glean icon is displayed in the connections grid. (`ec6374e1d`)
+- [ ] **Google Docs connection & Pro gate** — Verify that Google Docs connection works and that the "Pro required" gate correctly appears for non-pro users on the connect button. (`9835b09d8`, `dbf451f34`, `dda16447c`, `e3a2be5cb`)
+- [ ] **Bitrix24 CRM integration** — Verify that Bitrix24 CRM connection can be authorized and syncs data correctly. (`55026df56`)
+- [ ] **OAuth auto-refresh** — Verify that expired OAuth tokens for generic proxy connections (like Google, Bitrix24) are automatically refreshed. (`d7835eabb`)
 
 ### 28. Deployment & Remote Management
 
 commits: `c6a73b17e`, `945b687ec`
 
 - [ ] **Deploy to offline devices** — Use chat prompt to deploy screenpipe to an offline device. Verify it handles the "Screen Sharing" permission dialog by opening it on the target machine. (`c6a73b17e`, `945b687ec`)
+
+### 29. Browser Extension
+
+- [ ] **Browser extension token auth** — Open the browser extension options page. Verify that token-based authentication works and that it can successfully connect to the Screenpipe API. (`be14de544`)

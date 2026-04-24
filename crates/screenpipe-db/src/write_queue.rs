@@ -30,9 +30,6 @@ use tracing::{debug, error, info, warn};
 /// the write lock too long and starving readers.
 const MAX_BATCH_SIZE: usize = 500;
 
-/// How often the drain loop wakes up to flush buffered writes.
-const DRAIN_INTERVAL: Duration = Duration::from_millis(100);
-
 /// Channel capacity. 4096 provides headroom for burst writes without
 /// backpressure reaching capture threads.
 const CHANNEL_CAPACITY: usize = 4096;
@@ -375,28 +372,17 @@ async fn drain_loop(
     write_pool: Pool<Sqlite>,
     write_semaphore: Arc<Semaphore>,
 ) {
-    let mut batch: Vec<PendingWrite> = Vec::with_capacity(256);
-    let mut interval = tokio::time::interval(DRAIN_INTERVAL);
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut batch: Vec<PendingWrite> = Vec::with_capacity(MAX_BATCH_SIZE);
 
     loop {
-        // Wait for either: interval tick OR first write arriving
-        tokio::select! {
-            _ = interval.tick() => {},
-            item = rx.recv() => {
-                match item {
-                    Some(pw) => batch.push(pw),
-                    None => break, // channel closed = shutdown
-                }
-            }
-        }
-
-        // Drain all currently buffered writes (non-blocking)
-        while batch.len() < MAX_BATCH_SIZE {
-            match rx.try_recv() {
-                Ok(pw) => batch.push(pw),
-                Err(_) => break,
-            }
+        // Block until at least one write arrives, then take up to MAX_BATCH_SIZE
+        // in a single atomic call. No periodic wake-ups — the previous
+        // `tokio::select!` + 100ms interval added nothing under load (recv
+        // usually won the race anyway) and cost idle wake-ups otherwise.
+        let n = rx.recv_many(&mut batch, MAX_BATCH_SIZE).await;
+        if n == 0 {
+            // Channel closed — all senders dropped.
+            break;
         }
 
         // ── Sleep/wake pause gate ──
@@ -404,12 +390,10 @@ async fn drain_loop(
         // until resumed. This prevents WAL corruption from I/O errors
         // during sleep transitions.
         if WRITE_PAUSED.load(Ordering::SeqCst) {
-            if !batch.is_empty() {
-                info!(
-                    "write_queue: paused for sleep, holding {} writes",
-                    batch.len()
-                );
-            }
+            info!(
+                "write_queue: paused for sleep, holding {} writes",
+                batch.len()
+            );
             let notify = RESUME_NOTIFY.get_or_init(|| tokio::sync::Notify::new());
             tokio::select! {
                 _ = notify.notified() => {
@@ -420,31 +404,23 @@ async fn drain_loop(
                     WRITE_PAUSED.store(false, Ordering::SeqCst);
                 }
             }
-            continue;
         }
 
-        if batch.is_empty() {
-            continue;
-        }
-
-        let batch_size = batch.len();
-        debug!("write_queue: draining batch of {} writes", batch_size);
-
+        debug!("write_queue: draining batch of {} writes", batch.len());
         execute_batch(&write_pool, &write_semaphore, &mut batch).await;
         batch.clear();
     }
 
     // Shutdown: drain remaining writes
     rx.close();
-    while let Some(pw) = rx.recv().await {
-        batch.push(pw);
-    }
-    if !batch.is_empty() {
+    let mut tail_batch: Vec<PendingWrite> = Vec::with_capacity(MAX_BATCH_SIZE);
+    while rx.recv_many(&mut tail_batch, MAX_BATCH_SIZE).await > 0 {
         debug!(
             "write_queue: shutdown — flushing {} remaining writes",
-            batch.len()
+            tail_batch.len()
         );
-        execute_batch(&write_pool, &write_semaphore, &mut batch).await;
+        execute_batch(&write_pool, &write_semaphore, &mut tail_batch).await;
+        tail_batch.clear();
     }
     debug!("write_queue: drain loop exited");
 }

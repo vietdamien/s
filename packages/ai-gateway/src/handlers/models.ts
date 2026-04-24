@@ -4,7 +4,7 @@
 
 import { Env, UserTier } from '../types';
 import { createSuccessResponse, createErrorResponse, addCorsHeaders } from '../utils/cors';
-import { getTierConfig } from '../services/usage-tracker';
+import { getTierConfig, getModelWeight } from '../services/usage-tracker';
 import { listAnthropicModels } from '../providers/anthropic-proxy';
 import { getModelHealth, ModelHealthStatus } from '../services/model-health';
 
@@ -29,6 +29,15 @@ interface ModelEntry {
   warning?: string;
   /** Live health status from rolling 5-minute error rate */
   health?: ModelHealthStatus;
+  /**
+   * How many "daily query" units one message on this model consumes.
+   * 0 = doesn't count against the user's daily cap (free-tier Vertex,
+   * auto, gemini-3-flash, etc.). Higher = fewer messages before cap.
+   * UI uses `floor(remaining / query_weight)` to warn when the user is
+   * about to run out for a weighted model. Populated server-side from
+   * `getModelWeight()` so client doesn't have to mirror the table.
+   */
+  query_weight?: number;
 }
 
 /** Curated model catalog — single source of truth */
@@ -95,6 +104,9 @@ const CURATED_MODELS: ModelEntry[] = [
     cost_tier: 'free',
     recommended_for: ['pipes', 'chat'],
   },
+  // minimax-m2 not yet exposed — Vertex's openapi endpoint rejects both
+  // the publisher-prefixed and bare-model-id formats. Re-add once the
+  // correct invocation shape is verified in Model Garden.
   {
     id: 'llama-4-maverick',
     object: 'model',
@@ -125,8 +137,7 @@ const CURATED_MODELS: ModelEntry[] = [
     cost_tier: 'free',
     recommended_for: ['pipes', 'chat'],
   },
-  // glm-5.1 and minimax-m2.7 hidden 2026-04-17 — Vertex returns 404 for
-  // their publisher/model IDs. Re-add once we verify the real paths.
+  // glm-5.1 still pending — released 2026-04-07 on HuggingFace, not yet on Vertex MaaS.
   {
     id: 'deepseek-r1',
     object: 'model',
@@ -228,7 +239,7 @@ const CURATED_MODELS: ModelEntry[] = [
     context_window: 1000000,
     best_for: ['high-volume', 'extraction', 'general'],
     speed: 'fast',
-    intelligence: 'medium',
+    intelligence: 'standard',
     cost_tier: 'free',
     recommended_for: ['pipes', 'chat'],
   },
@@ -261,9 +272,8 @@ const CURATED_MODELS: ModelEntry[] = [
     best_for: ['complex tasks', 'analysis', 'agentic coding'],
     speed: 'slow',
     intelligence: 'highest',
-    cost_tier: 'high',
-    recommended_for: ['chat', 'analysis'],
-    warning: 'expensive — will use your daily limit fast. use haiku or a free model for pipes',
+    cost_tier: 'medium',
+    recommended_for: ['chat', 'analysis', 'coding'],
   },
   {
     id: 'claude-opus-4-6',
@@ -403,6 +413,10 @@ export async function handleModelListing(env: Env, tier: UserTier = 'subscribed'
         model.health = health[model.id];
       }
       // Default: healthy (no data = no errors)
+
+      // Attach per-message query weight so UIs can warn the user before
+      // they run out for a weighted model. 0 means "doesn't count."
+      model.query_weight = getModelWeight(model.id);
     }
 
     return addCorsHeaders(createSuccessResponse({
