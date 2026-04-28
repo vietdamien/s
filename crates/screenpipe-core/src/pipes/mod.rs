@@ -152,6 +152,18 @@ pub struct PipeConfig {
     #[serde(default, skip_serializing_if = "is_false")]
     pub subagent: bool,
 
+    /// When true, the pipe's agent has `SCREENPIPE_FILTER_PII=1` in its
+    /// env so the BASH_ENV shim rewrites every `curl .../search` call to
+    /// append `filter_pii=1` — PII is redacted server-side before the
+    /// agent ever sees it. Use for pipes that forward results to third
+    /// parties (Slack, Notion, Google Docs, etc.).
+    ///
+    /// NOTE: the front-matter field parses but the pipe runner does NOT
+    /// yet read it into the spawned Pi env. Wire-up is pending — tracked
+    /// separately from the chat-side feature which is already live.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub privacy_filter: bool,
+
     /// Catches any extra fields from front-matter (backwards compat).
     #[serde(default, flatten, skip_serializing_if = "HashMap::is_empty")]
     pub config: HashMap<String, serde_json::Value>,
@@ -1050,6 +1062,19 @@ pub type OnPipeRunComplete = Arc<dyn Fn(&str, bool, f64, Option<&str>) + Send + 
 /// Args: (pipe_name, execution_id, line)
 pub type OnPipeOutputLine = Arc<dyn Fn(&str, i64, &str) + Send + Sync>;
 
+/// Async predicate: given a pipe's required connections, return the
+/// subset that is NOT yet configured (`enabled && credentials present`).
+/// Returning an empty vec means "all connections are ready, pipe may run".
+///
+/// Injected from the engine layer (which owns the SecretStore + screenpipe
+/// dir) to keep the scheduler in `screenpipe-core` free of a
+/// `screenpipe-connect` dep — that crate already depends on us.
+pub type ConnectionCheck = Arc<
+    dyn Fn(Vec<String>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<String>> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// Default execution timeout: 10 minutes.
 const DEFAULT_TIMEOUT_SECS: u64 = 600;
 
@@ -1180,6 +1205,10 @@ pub struct PipeManager {
     on_run_complete: Option<OnPipeRunComplete>,
     /// Optional callback fired for each stdout line from a running pipe.
     on_output_line: Option<OnPipeOutputLine>,
+    /// Optional async predicate that returns the missing connections for a
+    /// pipe. If set, the scheduler skips any enabled pipe whose required
+    /// connections aren't all configured ("setup mode").
+    connection_check: Option<ConnectionCheck>,
     /// Optional persistence store (None in CLI mode).
     store: Option<Arc<dyn PipeStore>>,
     /// API port for prompt rendering (default 3030).
@@ -1221,6 +1250,7 @@ impl PipeManager {
             scheduler_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             on_run_complete: None,
             on_output_line: None,
+            connection_check: None,
             store,
             api_port,
             last_reload: Arc::new(Mutex::new(
@@ -1282,6 +1312,14 @@ impl PipeManager {
     /// Set a callback to be invoked after each scheduled pipe run.
     pub fn set_on_run_complete(&mut self, cb: OnPipeRunComplete) {
         self.on_run_complete = Some(cb);
+    }
+
+    /// Set the async predicate used to gate scheduled runs on connection
+    /// readiness. Without this, pipes "in setup mode" (enabled but missing
+    /// required integrations) would still tick on their cron / event
+    /// trigger and run with broken credentials.
+    pub fn set_connection_check(&mut self, cb: ConnectionCheck) {
+        self.connection_check = Some(cb);
     }
 
     /// Set a callback to be invoked for each stdout line from a running pipe.
@@ -2578,6 +2616,12 @@ impl PipeManager {
 
         let content = std::fs::read_to_string(&pipe_md)?;
         let (mut config, body) = parse_frontmatter(&content)?;
+        // Block enabling a stale one-off — would either silently no-op
+        // (caught by the scheduler's stale guard) or fire a confusingly
+        // old reminder. User must set a new `at <iso>` first.
+        if enabled {
+            validate_one_off_freshness(&config.schedule)?;
+        }
         config.enabled = enabled;
         let new_content = serialize_pipe(&config, &body)?;
         atomic_write(&pipe_md, &new_content)?;
@@ -3025,6 +3069,7 @@ impl PipeManager {
         let pipes_dir = self.pipes_dir.clone();
         let on_run_complete = self.on_run_complete.clone();
         let on_output_line = self.on_output_line.clone();
+        let connection_check = self.connection_check.clone();
         let store = self.store.clone();
         let api_port = self.api_port;
         let token_registry = self.token_registry.clone();
@@ -3219,6 +3264,25 @@ impl PipeManager {
                         }
                     }
 
+                    // Setup-mode gate: pipes whose declared `connections` aren't
+                    // all configured (`enabled && credentials present`) must not
+                    // run on schedule or event. Mirrors the manual-run gate in
+                    // pipes_api::run_pipe_now. Placed after the schedule/queue
+                    // checks so we only hit the SecretStore when the pipe would
+                    // otherwise be about to start.
+                    if !config.connections.is_empty() {
+                        if let Some(check) = &connection_check {
+                            let missing = check(config.connections.clone()).await;
+                            if !missing.is_empty() {
+                                debug!(
+                                    "scheduler: pipe '{}' in setup mode (missing connections: {:?}), skipping",
+                                    name, missing
+                                );
+                                continue;
+                            }
+                        }
+                    }
+
                     // Defense-in-depth: check PID file (survives crashes)
                     if let Some(existing_pid) = read_pid_file(&pipes_dir, name) {
                         if is_process_alive(existing_pid) {
@@ -3262,6 +3326,20 @@ impl PipeManager {
                         }
                     );
                     last_run.insert(name.clone(), Utc::now());
+
+                    // One-off (`schedule: at <iso>`) auto-disables on fire so
+                    // it never runs twice — even across crashes/restarts. The
+                    // pipe.md stays on disk; only the local-override flag flips.
+                    if matches!(parse_schedule(&config.schedule), Some(ParsedSchedule::Once(_))) {
+                        if let Err(e) = set_local_override(&pipes_dir, name, false) {
+                            warn!(
+                                "scheduler: failed to auto-disable one-off pipe '{}': {}",
+                                name, e
+                            );
+                        } else {
+                            info!("scheduler: one-off pipe '{}' fired, auto-disabled", name);
+                        }
+                    }
 
                     // Mark as queued so the next tick doesn't double-queue
                     {
@@ -4038,20 +4116,65 @@ Pipe name: {}
 // Schedule parsing
 // ---------------------------------------------------------------------------
 
-/// Parsed schedule — either a fixed interval or a cron expression.
+/// Maximum lateness before a one-off pipe is considered stale and refused.
+/// Tolerates clock skew, brief app downtime, and crash-then-restart. Any
+/// longer than this, the user almost certainly didn't expect the task to
+/// run "now" — they expected it then. Better to no-op than surprise them.
+const ONE_OFF_STALE_THRESHOLD: chrono::Duration = chrono::Duration::hours(1);
+
+/// Validate that a `schedule: at <iso>` timestamp isn't already stale.
+/// Returns `Ok(())` for any non-one-off schedule. Called from `install_pipe`
+/// and `enable_pipe` so a stale one-off never lands on disk in the active
+/// state — the user gets a clear error instead of a silent no-op pipe.
+fn validate_one_off_freshness(schedule: &str) -> Result<()> {
+    if let Some(ParsedSchedule::Once(run_at)) = parse_schedule(schedule) {
+        let lateness = Utc::now().signed_duration_since(run_at);
+        if lateness > ONE_OFF_STALE_THRESHOLD {
+            let mins = lateness.num_minutes();
+            let pretty = if mins < 60 {
+                format!("{}m", mins)
+            } else if mins < 1440 {
+                format!("{}h", mins / 60)
+            } else {
+                format!("{}d", mins / 1440)
+            };
+            return Err(anyhow!(
+                "one-off `at <iso>` schedule is {} in the past — set a future RFC3339 \
+                 timestamp (e.g. `at {}`) or use `schedule: manual` for a non-firing template",
+                pretty,
+                (Utc::now() + chrono::Duration::hours(1)).to_rfc3339()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Parsed schedule — fixed interval, cron, or a single fire-once timestamp.
 pub enum ParsedSchedule {
     Interval(std::time::Duration),
     Cron(Box<CronSchedule>),
+    /// One-off: fire once at this UTC instant, then never again. Used for
+    /// AI-scheduled "remind me in 2 days" tasks. After firing, the pipe
+    /// is disabled via local-override so it stays on disk as history.
+    Once(DateTime<Utc>),
 }
 
-/// Parse a schedule string into an interval or cron expression.
+/// Parse a schedule string into an interval, cron expression, or one-off.
 /// Returns `None` for `"manual"`.
 ///
-/// Supports: `"every 30m"`, `"every 2h"`, `"daily"`, cron (`"0 */2 * * *"`).
+/// Supports: `"every 30m"`, `"every 2h"`, `"daily"`, cron (`"0 */2 * * *"`),
+/// and `"at 2026-04-29T17:00:00-07:00"` (RFC3339 timestamp; fires once).
 pub fn parse_schedule(schedule: &str) -> Option<ParsedSchedule> {
     let s = schedule.trim();
     if s.eq_ignore_ascii_case("manual") {
         return None;
+    }
+    // One-off: "at <RFC3339 timestamp>" — fires once, never again.
+    if let Some(rest) = s.strip_prefix("at ").or_else(|| s.strip_prefix("AT ")) {
+        if let Ok(t) = DateTime::parse_from_rfc3339(rest.trim()) {
+            return Some(ParsedSchedule::Once(t.with_timezone(&Utc)));
+        }
+        // Malformed `at <whatever>` — fall through to other parsers, then None.
     }
     if s.eq_ignore_ascii_case("daily") {
         return Some(ParsedSchedule::Interval(std::time::Duration::from_secs(
@@ -4249,6 +4372,25 @@ fn should_run(schedule: &str, last_run: DateTime<Utc>) -> bool {
                 Some(next) => now >= next,
                 None => false,
             }
+        }
+        Some(ParsedSchedule::Once(run_at)) => {
+            // Fire if we've reached the timestamp AND haven't run since
+            // (cheap re-fire guard against in-memory last_run resets).
+            // The auto-disable happens in the scheduler tick after queueing.
+            //
+            // Defense in depth against stale timestamps: if the run-at is
+            // more than ONE_OFF_STALE_THRESHOLD in the past (e.g. AI
+            // hallucinated a past time, or app was off for days and is
+            // catching up), refuse to fire — surprising the user with a
+            // "weeks-old reminder running now" is worse than missing it.
+            // Install / enable validation also rejects stale timestamps so
+            // a stale pipe never reaches the scheduler in the first place;
+            // this is the runtime backstop.
+            let now = Utc::now();
+            if now.signed_duration_since(run_at) > ONE_OFF_STALE_THRESHOLD {
+                return false;
+            }
+            now >= run_at && last_run < run_at
         }
     }
 }
@@ -4673,6 +4815,7 @@ mod tests {
             installed_version: None,
             source_hash: None,
             subagent: false,
+            privacy_filter: false,
             trigger: None,
         };
         let body = "Do something useful";
@@ -4861,6 +5004,111 @@ mod tests {
         assert!(parse_schedule("not a schedule").is_none());
     }
 
+    // -- one-off `at <iso>` --------------------------------------------------
+
+    #[test]
+    fn test_parse_schedule_at_rfc3339() {
+        match parse_schedule("at 2099-01-01T12:00:00Z") {
+            Some(ParsedSchedule::Once(t)) => {
+                assert_eq!(t.to_rfc3339(), "2099-01-01T12:00:00+00:00");
+            }
+            other => panic!("expected Once, got {:?}", other.is_some()),
+        }
+    }
+
+    #[test]
+    fn test_parse_schedule_at_with_offset() {
+        match parse_schedule("at 2099-01-01T05:00:00-07:00") {
+            Some(ParsedSchedule::Once(t)) => {
+                // -07:00 05:00 == UTC 12:00
+                assert_eq!(t.to_rfc3339(), "2099-01-01T12:00:00+00:00");
+            }
+            other => panic!("expected Once, got {:?}", other.is_some()),
+        }
+    }
+
+    #[test]
+    fn test_parse_schedule_at_malformed_returns_none() {
+        assert!(parse_schedule("at not-a-date").is_none());
+        assert!(parse_schedule("at ").is_none());
+    }
+
+    #[test]
+    fn test_should_run_once_in_past_unfired() {
+        // Past timestamp within the freshness window (30m < ONE_OFF_STALE_THRESHOLD),
+        // never fired (last_run = epoch) → fire now.
+        let thirty_min_ago = Utc::now() - chrono::Duration::minutes(30);
+        let schedule = format!("at {}", thirty_min_ago.to_rfc3339());
+        assert!(should_run(&schedule, DateTime::UNIX_EPOCH));
+    }
+
+    #[test]
+    fn test_should_run_once_already_fired() {
+        // Past timestamp, already fired (last_run after run_at) → don't fire.
+        let two_hours_ago = Utc::now() - chrono::Duration::hours(2);
+        let an_hour_ago = Utc::now() - chrono::Duration::hours(1);
+        let schedule = format!("at {}", two_hours_ago.to_rfc3339());
+        assert!(!should_run(&schedule, an_hour_ago));
+    }
+
+    #[test]
+    fn test_should_run_once_in_future() {
+        // Future timestamp → don't fire yet.
+        let in_an_hour = Utc::now() + chrono::Duration::hours(1);
+        let schedule = format!("at {}", in_an_hour.to_rfc3339());
+        assert!(!should_run(&schedule, DateTime::UNIX_EPOCH));
+    }
+
+    #[test]
+    fn test_should_run_once_stale_refused() {
+        // Stale past timestamp (>1h) → runtime guard refuses to fire even
+        // if the pipe somehow got past install/enable validation.
+        let two_hours_ago = Utc::now() - chrono::Duration::hours(2);
+        let schedule = format!("at {}", two_hours_ago.to_rfc3339());
+        assert!(!should_run(&schedule, DateTime::UNIX_EPOCH));
+    }
+
+    #[test]
+    fn test_should_run_once_recent_past_fires() {
+        // Past timestamp within freshness window (e.g. 5 min ago — clock
+        // skew, brief downtime) still fires. Prevents needless misses.
+        let five_min_ago = Utc::now() - chrono::Duration::minutes(5);
+        let schedule = format!("at {}", five_min_ago.to_rfc3339());
+        assert!(should_run(&schedule, DateTime::UNIX_EPOCH));
+    }
+
+    #[test]
+    fn test_validate_one_off_freshness_future_ok() {
+        let in_an_hour = Utc::now() + chrono::Duration::hours(1);
+        let schedule = format!("at {}", in_an_hour.to_rfc3339());
+        assert!(validate_one_off_freshness(&schedule).is_ok());
+    }
+
+    #[test]
+    fn test_validate_one_off_freshness_recent_past_ok() {
+        let twenty_min_ago = Utc::now() - chrono::Duration::minutes(20);
+        let schedule = format!("at {}", twenty_min_ago.to_rfc3339());
+        assert!(validate_one_off_freshness(&schedule).is_ok());
+    }
+
+    #[test]
+    fn test_validate_one_off_freshness_stale_err() {
+        let three_days_ago = Utc::now() - chrono::Duration::days(3);
+        let schedule = format!("at {}", three_days_ago.to_rfc3339());
+        let err = validate_one_off_freshness(&schedule).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("in the past"), "msg = {}", msg);
+    }
+
+    #[test]
+    fn test_validate_one_off_freshness_non_one_off_passes_through() {
+        // Recurring / cron / manual schedules are out-of-scope for this
+        // validator — must always return Ok.
+        assert!(validate_one_off_freshness("every 1h").is_ok());
+        assert!(validate_one_off_freshness("manual").is_ok());
+        assert!(validate_one_off_freshness("0 */2 * * *").is_ok());
+    }
+
     // -- should_run ---------------------------------------------------------
 
     #[test]
@@ -4902,6 +5150,7 @@ mod tests {
             installed_version: None,
             source_hash: None,
             subagent: false,
+            privacy_filter: false,
             trigger: None,
         };
         let prompt = render_prompt_with_port(&config, "body text", 3031, None, None);
@@ -4933,6 +5182,7 @@ mod tests {
             installed_version: None,
             source_hash: None,
             subagent: false,
+            privacy_filter: false,
             trigger: None,
         };
         let sys = render_pipe_system_prompt("hello", 3030, None);
@@ -4957,6 +5207,7 @@ mod tests {
             installed_version: None,
             source_hash: None,
             subagent: false,
+            privacy_filter: false,
             trigger: None,
         };
         let sys = render_pipe_system_prompt("body text", 3030, Some("You are a helpful assistant"));
@@ -4983,6 +5234,7 @@ mod tests {
             installed_version: None,
             source_hash: None,
             subagent: false,
+            privacy_filter: false,
             trigger: None,
         };
         let sys = render_pipe_system_prompt("body text", 3030, None);
@@ -5062,6 +5314,7 @@ mod tests {
                 installed_version: None,
                 source_hash: None,
                 subagent: false,
+                privacy_filter: false,
                 trigger: None,
             },
             last_run: None,

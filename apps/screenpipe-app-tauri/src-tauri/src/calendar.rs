@@ -138,6 +138,59 @@ pub async fn calendar_status() -> Result<CalendarStatus, String> {
     }
 }
 
+/// Reset TCC (privacy) permission for Calendars on this app's bundle ID.
+///
+/// Why: users (Mike, Jarad, Ruark, Louis's own Mac mini) clicked
+/// "Fix Calendar Permission" → macOS opened the Calendars privacy pane
+/// with an EMPTY app list, so they had no way to grant access. Root cause
+/// is a stale TCC record (dev-build → prod-build reinstall, OS update,
+/// user previously revoked etc.) where macOS silently refuses to re-add
+/// the app on subsequent requestFullAccessToEventsWithCompletion calls.
+///
+/// `tccutil reset Calendars <bundle_id>` clears that stale record. Next
+/// call to requestFullAccessToEventsWithCompletion then shows the native
+/// consent popup again and registers the app in Privacy → Calendars.
+///
+/// Bundle ID is read at runtime from the running app (not hard-coded), so
+/// this works for both `screenpi.pe` (prod) and `screenpi.pe.dev` (dev).
+/// No sudo required — tccutil's per-app user scope is user-writable.
+#[tauri::command]
+#[specta::specta]
+pub async fn calendar_reset_permission(
+    app: tauri::AppHandle,
+) -> Result<String, String> {
+    #[cfg(target_os = "macos")]
+    {
+        use tauri::Manager;
+        let bundle_id = app
+            .config()
+            .identifier
+            .clone();
+        if bundle_id.is_empty() {
+            return Err("no bundle identifier in app config".to_string());
+        }
+        info!(
+            "calendar: resetting TCC Calendars permission for bundle {}",
+            bundle_id
+        );
+        let output = tokio::process::Command::new("tccutil")
+            .args(["reset", "Calendars", &bundle_id])
+            .output()
+            .await
+            .map_err(|e| format!("failed to run tccutil: {}", e))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("tccutil failed: {}", stderr.trim()));
+        }
+        Ok(format!("reset ok for {}", bundle_id))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = app;
+        Err("only available on macOS".into())
+    }
+}
+
 /// Request Calendar permission (shows one-time macOS popup).
 /// Returns "granted", "denied", or an error message.
 #[tauri::command]

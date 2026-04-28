@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from "react";
 import { commands, PiInfo, PiCheckResult } from "@/lib/utils/tauri";
 import { listen } from "@tauri-apps/api/event";
+import { mountAgentEventBus, onTerminated as onAgentTerminated } from "@/lib/events/bus";
 
 export interface UsePiResult {
   info: PiInfo | null;
@@ -107,8 +108,14 @@ export function usePi(): UsePiResult {
       setLogs((prev) => [...prev.slice(-99), event.payload]);
     });
 
-    const unlistenTerminated = listen<number | null>("pi_terminated", () => {
-      refresh();
+    // Termination — bus broadcast (`agent_terminated`). This hook
+    // doesn't filter by sessionId; any pi termination triggers a
+    // status refresh regardless of which session.
+    let offTerminated: (() => void) | null = null;
+    void mountAgentEventBus().then(() => {
+      offTerminated = onAgentTerminated(() => {
+        refresh();
+      });
     });
 
     const unlistenError = listen<string>("pi_error", (event) => {
@@ -119,7 +126,7 @@ export function usePi(): UsePiResult {
     return () => {
       unlistenLog.then((fn) => fn());
       unlistenOutput.then((fn) => fn());
-      unlistenTerminated.then((fn) => fn());
+      try { offTerminated?.(); } catch { /* ignore */ }
       unlistenError.then((fn) => fn());
     };
   }, [refresh]);

@@ -68,6 +68,20 @@ netstat -ano | findstr :3030  # Windows
 
 still stuck? [ask in Discord](https://discord.gg/screenpipe).
 
+### suppress CLI reminders (optional)
+
+when running `npx screenpipe record`, the CLI prints a friendly reminder every 5 minutes to download the desktop app. if you prefer to run the CLI silently, disable the reminders:
+
+```bash
+SCREENPIPE_NO_REMINDERS=1 npx screenpipe@latest record
+```
+
+or set it once in your shell:
+```bash
+export SCREENPIPE_NO_REMINDERS=1
+npx screenpipe@latest record
+```
+
 ### access your recorded timeline
 
 after starting the CLI, you have three ways to access your screen history:

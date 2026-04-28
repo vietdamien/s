@@ -1,7 +1,7 @@
 ---
-title: "screenpipe MCP server - connect to Claude, Cursor & AI assistants"
+title: "MCP server setup for Claude, Cursor, and other AI tools"
 sidebarTitle: "mcp server"
-description: "Set up screenpipe as an MCP server to give Claude, Cursor, and other AI assistants access to your screen history and context."
+description: "Set up screenpipe as a Model Context Protocol server so Claude Desktop, Cursor, and other AI assistants can search your screen history and audio transcripts."
 icon: "server"
 ---
 
@@ -66,6 +66,28 @@ verify with `claude mcp list` or `/mcp` inside Claude Code.
 [click here to install in cursor](cursor://anysphere.cursor-deeplink/mcp/install?name=screenpipe&config=eyJ0eXBlIjoic3RkaW8iLCJjb21tYW5kIjoibnB4IiwiYXJncyI6WyIteSIsInNjcmVlbnBpcGUtbWNwIl19)
 
 or manually: open **cursor settings** → **mcp** → **add new global mcp server** → set command to `npx` with args `["-y", "screenpipe-mcp"]`.
+
+## warp
+
+Warp's Agent Mode supports MCP. Open **Settings** → **AI** → **Manage MCP servers** → **+ Add**, choose **CLI Server (Command)**, then paste:
+
+```json
+{
+  "screenpipe": {
+    "command": "npx",
+    "args": ["-y", "screenpipe-mcp@latest"],
+    "start_on_launch": true
+  }
+}
+```
+
+Save — the server should show **Running**. Then ask Warp's agent: *"what did I do in the last 5 minutes?"*
+
+<Tip>
+Warp's MCP schema is per-server (no wrapping `mcpServers` object). Don't paste the Claude/Cursor JSON shape — it won't validate.
+</Tip>
+
+You can also reach this screen via the Command Palette → *Open MCP Servers*. Or just open the screenpipe app → **settings** → **connections** → **Warp** to copy the config.
 
 ## other editors (cline, continue, windsurf, etc.)
 
@@ -182,7 +204,7 @@ if the one-click methods above don't work, you can manually edit config files.
 
 ```bash
 git clone https://github.com/screenpipe/screenpipe
-cd screenpipe/crates/screenpipe-integrations/screenpipe-mcp
+cd screenpipe/packages/screenpipe-mcp
 npm install && npm run build
 ```
 

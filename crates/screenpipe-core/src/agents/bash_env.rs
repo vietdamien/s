@@ -40,7 +40,9 @@ pub const WRAPPER_RELATIVE_PATH: &str = "pi-agent/bash-env.sh";
 /// substrings in command arguments. If none match, `curl` runs unchanged.
 pub const WRAPPER_SCRIPT: &str = r#"# screenpipe — auto-injected by pi-agent bash subshells (do not edit by hand)
 # Transparently adds Authorization: Bearer to curl calls that target the
-# local screenpipe API. Other curl calls pass through unchanged — the
+# local screenpipe API, and — when SCREENPIPE_FILTER_PII=1 — rewrites any
+# /search URL to include filter_pii=1 so responses are PII-redacted
+# before Pi sees them. Other curl calls pass through unchanged — the
 # token never leaks to third-party hosts.
 #
 # Regenerated on every pi-agent spawn from screenpipe-core::agents::bash_env.
@@ -51,20 +53,41 @@ _sp_auth_key() {
 }
 
 curl() {
-  local key
+  local key has_local=0 add_filter=0 arg
+  local -a out=()
   key="$(_sp_auth_key)"
-  if [ -n "$key" ]; then
-    local arg
-    for arg in "$@"; do
-      case "$arg" in
-        *localhost:3030*|*127.0.0.1:3030*|*'[::1]:3030'*)
-          command curl -H "Authorization: Bearer $key" "$@"
-          return $?
-          ;;
-      esac
-    done
+  if [ "${SCREENPIPE_FILTER_PII:-}" = "1" ]; then
+    add_filter=1
   fi
-  command curl "$@"
+
+  for arg in "$@"; do
+    case "$arg" in
+      *localhost:3030*|*127.0.0.1:3030*|*'[::1]:3030'*)
+        has_local=1
+        if [ "$add_filter" = "1" ]; then
+          # Only /search responses contain user-visible text we want to redact.
+          # Match the path segment so we don't rewrite unrelated args that
+          # happen to contain the host:port substring.
+          case "$arg" in
+            *:3030/search*|*:3030//search*)
+              if [[ "$arg" == *"?"* ]]; then
+                arg="${arg}&filter_pii=1"
+              else
+                arg="${arg}?filter_pii=1"
+              fi
+              ;;
+          esac
+        fi
+        ;;
+    esac
+    out+=("$arg")
+  done
+
+  if [ "$has_local" = "1" ] && [ -n "$key" ]; then
+    command curl -H "Authorization: Bearer $key" "${out[@]}"
+  else
+    command curl "${out[@]}"
+  fi
 }
 "#;
 
@@ -169,5 +192,105 @@ mod tests {
                 needle
             );
         }
+    }
+
+    #[test]
+    fn wrapper_script_references_filter_pii_env() {
+        assert!(
+            WRAPPER_SCRIPT.contains("SCREENPIPE_FILTER_PII"),
+            "wrapper must check the privacy-filter env var to rewrite /search URLs"
+        );
+        assert!(
+            WRAPPER_SCRIPT.contains("filter_pii=1"),
+            "wrapper must append the filter_pii query param"
+        );
+    }
+
+    /// End-to-end sanity: invoke the shim via `bash -c` and assert that the
+    /// rewritten command line contains the appended query param only under
+    /// the right conditions. Uses a fake `curl` so the test doesn't need a
+    /// running server — we capture the final argv written to a tmpfile.
+    #[test]
+    #[cfg(unix)]
+    fn shim_rewrites_search_url_when_env_set() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let wrapper = ensure_wrapper(tmp.path()).unwrap();
+
+        // A fake curl that writes its argv to $CURL_ARGV_FILE, one per line.
+        let fake_curl_dir = tmp.path().join("bin");
+        std::fs::create_dir_all(&fake_curl_dir).unwrap();
+        let fake_curl = fake_curl_dir.join("curl");
+        std::fs::write(
+            &fake_curl,
+            "#!/usr/bin/env bash\nfor a in \"$@\"; do echo \"$a\" >> \"$CURL_ARGV_FILE\"; done\n",
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&fake_curl).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_curl, perms).unwrap();
+
+        // Off: URL is passed through untouched.
+        let argv_off = tmp.path().join("off.argv");
+        let status = Command::new("bash")
+            .env("PATH", format!("{}:/usr/bin:/bin", fake_curl_dir.display()))
+            .env("BASH_ENV", &wrapper)
+            .env("CURL_ARGV_FILE", &argv_off)
+            .arg("-c")
+            .arg("curl http://localhost:3030/search?q=foo")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let off = std::fs::read_to_string(&argv_off).unwrap();
+        assert!(
+            off.contains("http://localhost:3030/search?q=foo"),
+            "URL should pass through unchanged when filter disabled; got: {off}"
+        );
+        assert!(
+            !off.contains("filter_pii"),
+            "should NOT append filter_pii when env is unset; got: {off}"
+        );
+
+        // On: filter_pii=1 is appended.
+        let argv_on = tmp.path().join("on.argv");
+        let status = Command::new("bash")
+            .env("PATH", format!("{}:/usr/bin:/bin", fake_curl_dir.display()))
+            .env("BASH_ENV", &wrapper)
+            .env("CURL_ARGV_FILE", &argv_on)
+            .env("SCREENPIPE_FILTER_PII", "1")
+            .arg("-c")
+            .arg("curl http://localhost:3030/search?q=foo")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let on = std::fs::read_to_string(&argv_on).unwrap();
+        assert!(
+            on.contains("filter_pii=1"),
+            "should append filter_pii=1 when env is set; got: {on}"
+        );
+        assert!(
+            on.contains("q=foo&filter_pii=1"),
+            "should use & separator when query already present; got: {on}"
+        );
+
+        // Non-search paths are untouched even when filter is on.
+        let argv_other = tmp.path().join("other.argv");
+        let status = Command::new("bash")
+            .env("PATH", format!("{}:/usr/bin:/bin", fake_curl_dir.display()))
+            .env("BASH_ENV", &wrapper)
+            .env("CURL_ARGV_FILE", &argv_other)
+            .env("SCREENPIPE_FILTER_PII", "1")
+            .arg("-c")
+            .arg("curl http://localhost:3030/health")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let other = std::fs::read_to_string(&argv_other).unwrap();
+        assert!(
+            !other.contains("filter_pii"),
+            "non-/search paths must not be rewritten; got: {other}"
+        );
     }
 }

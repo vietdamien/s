@@ -382,10 +382,15 @@ fn default_true() -> bool {
     true
 }
 
-/// Default `true` — stream.rs has an automatic fallback to SCK if the
-/// Process Tap can't start, so this is safe on every platform.
+/// Default `false` — the Process Tap can't see audio rendered through
+/// VoiceProcessing AudioUnits (Zoom / Google Meet / Microsoft Teams all
+/// use one for echo cancellation), so for meeting audio it silently
+/// captures zeroed buffers even though the tap creation succeeds. SCK
+/// captures at the display compositor which *does* see VoiceProcessing
+/// output, so it's the right default for every user who uses call apps.
+/// Users who hit SCK's sleep/wake display-enumeration bug can still opt in.
 fn default_experimental_coreaudio_system_audio() -> bool {
-    true
+    false
 }
 
 fn default_max_snapshot_width() -> u32 {

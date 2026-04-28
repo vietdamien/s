@@ -465,6 +465,13 @@ export async function getUsageStatus(
  * Check if a model is allowed for a given tier
  */
 export function isModelAllowed(model: string, tier: UserTier, env?: Env): boolean {
+  // Internal zero-cost models (e.g., the workflow event classifier on our
+  // own vLLM) are always allowed regardless of tier — we eat the cost and
+  // they're gated at the feature level (opt-in setting), not the tier.
+  if (model === 'screenpipe-event-classifier') {
+    return true;
+  }
+
   const allowedModels = getTierConfig(env)[tier].allowedModels;
 
   // Subscribed users can use any model

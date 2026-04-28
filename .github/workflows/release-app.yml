@@ -1399,7 +1399,6 @@ jobs:
 
       - name: Trigger changelog generation on website repo
         uses: peter-evans/repository-dispatch@v3
-        continue-on-error: true
         with:
           token: ${{ secrets.WEBSITE_REPO_TOKEN }}
           repository: screenpipe/website

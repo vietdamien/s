@@ -9,7 +9,7 @@
 //! - Click-through mode: mouse events pass through to windows below
 //! - Interactive mode: window receives mouse events normally
 
-use tauri::WebviewWindow;
+use tauri::{AppHandle, Manager, WebviewWindow};
 use tracing::{error, info};
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Gdi::{
@@ -224,6 +224,43 @@ pub fn is_click_through_enabled(window: &WebviewWindow) -> bool {
 /// Repositions the overlay to exactly cover the monitor at the given physical point.
 /// Used when re-showing the overlay so it appears on the monitor where the cursor is,
 /// matching macOS behavior where the panel moves to the active screen.
+/// Centers window-mode overlay (fixed inner size) on the monitor that contains
+/// the cursor. Without this, Windows places the first webview near the prior
+/// window (often beside Home), which breaks cursor-vs-monitor bounds checks.
+pub fn center_window_mode_on_cursor_monitor(
+    window: &WebviewWindow,
+    app: &AppHandle,
+) -> Result<(), String> {
+    let cursor = app.cursor_position().map_err(|e| e.to_string())?;
+    let monitors = app.available_monitors().map_err(|e| e.to_string())?;
+    let monitor = monitors
+        .into_iter()
+        .find(|m| {
+            let p = m.position();
+            let s = m.size();
+            let cx = cursor.x as i32;
+            let cy = cursor.y as i32;
+            cx >= p.x
+                && cx < p.x + s.width as i32
+                && cy >= p.y
+                && cy < p.y + s.height as i32
+        })
+        .or_else(|| app.primary_monitor().ok().flatten())
+        .ok_or_else(|| "no monitor found for centering".to_string())?;
+
+    let mp = monitor.position();
+    let ms = monitor.size();
+    let ws = window.inner_size().map_err(|e| e.to_string())?;
+    let x = mp.x + (ms.width as i32 - ws.width as i32) / 2;
+    let y = mp.y + (ms.height as i32 - ws.height as i32) / 2;
+
+    window
+        .set_position(tauri::Position::Physical(tauri::PhysicalPosition::new(x, y)))
+        .map_err(|e| e.to_string())?;
+    info!("window-mode overlay centered at ({}, {})", x, y);
+    Ok(())
+}
+
 pub fn reposition_to_cursor_monitor(
     window: &WebviewWindow,
     cursor_x: i32,

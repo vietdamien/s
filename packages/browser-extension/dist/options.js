@@ -2,9 +2,10 @@
 var DEFAULT_BASE_URL = "http://127.0.0.1:3030";
 var STORAGE_KEY_TOKEN = "screenpipe_token";
 var STORAGE_KEY_BASE_URL = "screenpipe_base_url";
+var BROWSER_BASE_PATH = "/connections/browser";
 function buildWsUrl(baseHttpUrl, token) {
   const base = baseHttpUrl.replace(/^http:/, "ws:").replace(/^https:/, "wss:");
-  const path = "/browser/ws";
+  const path = `${BROWSER_BASE_PATH}/ws`;
   if (!token)
     return `${base}${path}`;
   return `${base}${path}?token=${encodeURIComponent(token)}`;
@@ -13,7 +14,7 @@ function healthUrl(baseHttpUrl) {
   return `${baseHttpUrl.replace(/\/$/, "")}/health`;
 }
 function browserStatusUrl(baseHttpUrl) {
-  return `${baseHttpUrl.replace(/\/$/, "")}/browser/status`;
+  return `${baseHttpUrl.replace(/\/$/, "")}${BROWSER_BASE_PATH}/status`;
 }
 
 // src/options.ts
@@ -77,7 +78,7 @@ async function onSaveClick() {
   const { token, baseUrl } = getFormValues();
   await saveSettings(token, baseUrl);
   const { status, message } = await probeConnection(token, baseUrl);
-  setStatus(status, message);
+  setStatus(status, status === "ok" ? `settings saved · ${message}` : message);
 }
 async function onTestClick() {
   setStatus("saving", "testing…");

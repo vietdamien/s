@@ -33,6 +33,10 @@ const RECONNECT_MAX_MS = 30_000;
 const AUTH_FAIL_THRESHOLD = 3;
 /** How long to stay silent after alerting — avoids notification spam. */
 const ALERT_COOLDOWN_MS = 10 * 60_000;
+/** Heartbeat — must be < server READ_IDLE_TIMEOUT (50s). */
+const HEARTBEAT_INTERVAL_MS = 20_000;
+/** If no frame from server for this long, assume the WS is half-dead. */
+const HEARTBEAT_DEAD_MS = 50_000;
 
 // ---------------------------------------------------------------------------
 // Connection state
@@ -47,6 +51,10 @@ let closeWithoutOpen = 0;
 let lastAlertAt = 0;
 /** Whether the current attempt ever reached OPEN. */
 let openedThisAttempt = false;
+/** Last time we received a frame from the server (any frame: pong, eval, …). */
+let lastFrameAt = 0;
+/** Heartbeat interval handle — cleared on disconnect. */
+let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 
 // ---------------------------------------------------------------------------
 // Storage helpers
@@ -98,6 +106,11 @@ function notifyOnce(title: string, message: string): void {
 // ---------------------------------------------------------------------------
 
 async function connect(): Promise<void> {
+  // Honor the backoff timer — alarms and tab events shouldn't bypass it.
+  // Without this guard, after auth failure the worker would hammer
+  // /browser/ws on every tab switch (multiple times per second on busy
+  // browsers), spamming logs and rate-limiting the user.
+  if (reconnectTimer) return;
   if (
     socket?.readyState === WebSocket.OPEN ||
     socket?.readyState === WebSocket.CONNECTING
@@ -121,7 +134,9 @@ async function connect(): Promise<void> {
     openedThisAttempt = true;
     reconnectDelay = RECONNECT_BASE_MS;
     closeWithoutOpen = 0;
+    lastFrameAt = Date.now();
     clearBadge();
+    startHeartbeat();
 
     const hello: HelloMessage = {
       type: "hello",
@@ -133,6 +148,7 @@ async function connect(): Promise<void> {
   };
 
   socket.onclose = () => {
+    stopHeartbeat();
     if (!openedThisAttempt) {
       closeWithoutOpen += 1;
       // After repeated failures-before-open, the most likely cause is auth
@@ -155,6 +171,7 @@ async function connect(): Promise<void> {
   };
 
   socket.onmessage = async (event: MessageEvent) => {
+    lastFrameAt = Date.now();
     let msg: IncomingMessage;
     try {
       msg = JSON.parse(event.data);
@@ -194,12 +211,14 @@ function scheduleReconnect(): void {
 }
 
 function forceReconnect(): void {
-  // User updated settings (or clicked reconnect) — blow away state so the
-  // next attempt starts fresh instead of cooling down.
+  // User updated settings (or clicked reconnect, or heartbeat detected a
+  // half-dead socket) — blow away state so the next attempt starts fresh
+  // instead of cooling down.
   if (reconnectTimer) {
     clearTimeout(reconnectTimer);
     reconnectTimer = null;
   }
+  stopHeartbeat();
   reconnectDelay = RECONNECT_BASE_MS;
   closeWithoutOpen = 0;
   lastAlertAt = 0;
@@ -220,20 +239,86 @@ function send(obj: unknown): void {
 }
 
 // ---------------------------------------------------------------------------
+// Heartbeat — detects half-dead WS sockets where onclose never fires.
+//
+// Service-worker WebSockets are notoriously unreliable: NATs, corporate
+// proxies, and even Chrome's own MV3 lifecycle can sever the underlying TCP
+// connection without the JS layer noticing. Without this loop, the popup
+// would show "connected" while the server saw a stale dead socket — exactly
+// the flapping symptom users have reported.
+// ---------------------------------------------------------------------------
+
+function startHeartbeat(): void {
+  stopHeartbeat();
+  heartbeatTimer = setInterval(() => {
+    if (socket?.readyState !== WebSocket.OPEN) {
+      stopHeartbeat();
+      return;
+    }
+    // App-level ping — the server replies via its own ping frame on a 20s
+    // cadence, so any traffic at all resets lastFrameAt. If we go silent for
+    // longer than HEARTBEAT_DEAD_MS, the connection is half-dead.
+    if (Date.now() - lastFrameAt > HEARTBEAT_DEAD_MS) {
+      console.warn("[screenpipe] no server traffic for 50s — reconnecting");
+      forceReconnect();
+      return;
+    }
+    send({ type: "ping" });
+  }, HEARTBEAT_INTERVAL_MS);
+}
+
+function stopHeartbeat(): void {
+  if (heartbeatTimer) {
+    clearInterval(heartbeatTimer);
+    heartbeatTimer = null;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Tab finding
 // ---------------------------------------------------------------------------
+
+/**
+ * Tabs we cannot drive: Chrome's privileged scheme pages and the extension's
+ * own pages. `chrome.debugger.attach` is rejected on these by the browser, so
+ * picking one would surface as an opaque "cannot execute scripts on …" error.
+ */
+function isRestrictedUrl(url: string | undefined): boolean {
+  if (!url) return true;
+  return (
+    url.startsWith("chrome://") ||
+    url.startsWith("chrome-extension://") ||
+    url.startsWith("edge://") ||
+    url.startsWith("about:") ||
+    url.includes("chromewebstore.google.com")
+  );
+}
 
 async function findTab(urlPattern?: string): Promise<number> {
   if (urlPattern) {
     const tabs = await chrome.tabs.query({});
-    const match = tabs.find((t) => t.url?.includes(urlPattern));
+    const match = tabs.find(
+      (t) => t.url?.includes(urlPattern) && !isRestrictedUrl(t.url),
+    );
     if (match?.id != null) return match.id;
   }
 
+  // Prefer the focused active tab when it's eligible — that's almost always
+  // what the user means. Otherwise scan every window for the first regular
+  // web tab we can drive. This avoids the "test connection failed because
+  // your active tab happened to be the extension's options page" trap.
   const [active] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
-  if (active?.id != null) return active.id;
+  if (active?.id != null && !isRestrictedUrl(active.url)) {
+    return active.id;
+  }
 
-  throw new Error("no matching tab found");
+  const all = await chrome.tabs.query({});
+  const eligible = all.find((t) => t.id != null && !isRestrictedUrl(t.url));
+  if (eligible?.id != null) return eligible.id;
+
+  throw new Error(
+    "no eligible tab found — open a regular web page (not chrome://, chrome-extension://, or the chrome web store)",
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -242,14 +327,7 @@ async function findTab(urlPattern?: string): Promise<number> {
 
 async function evalInTab(tabId: number, code: string): Promise<unknown> {
   const tab = await chrome.tabs.get(tabId);
-  if (
-    !tab.url ||
-    tab.url.startsWith("chrome://") ||
-    tab.url.startsWith("chrome-extension://") ||
-    tab.url.startsWith("edge://") ||
-    tab.url.startsWith("about:") ||
-    tab.url.includes("chromewebstore.google.com")
-  ) {
+  if (isRestrictedUrl(tab.url)) {
     throw new Error(`cannot execute scripts on ${tab.url}`);
   }
 
@@ -322,9 +400,10 @@ chrome.storage.onChanged.addListener((changes, area) => {
   }
 });
 
-/** Clicking the toolbar icon → open options. Quickest path to fix "no token". */
-chrome.action.onClicked.addListener(() => {
-  void chrome.runtime.openOptionsPage();
+/** Popup (or any other context) can send { type: "wake" } to keep the worker
+ *  alive and trigger a reconnect attempt immediately. */
+chrome.runtime.onMessage.addListener(() => {
+  void connect();
 });
 
 /** On fresh install, open options so the user can paste a token immediately. */
@@ -336,10 +415,23 @@ chrome.runtime.onInstalled.addListener(async (details) => {
   }
 });
 
-/** Keep the service worker warm so the WS doesn't drop after 30s idle. */
-chrome.alarms.create("screenpipe_keepalive", { periodInMinutes: 1 });
+/** Keep the service worker warm so the WS doesn't drop. Chrome MV3 puts
+ *  the SW to sleep after ~30s of zero events; the server's READ_IDLE_TIMEOUT
+ *  is 50s. With a 1-minute alarm the SW spends T+30..T+60 dormant — the
+ *  setInterval heartbeat pauses and the server kills the WS at T+50.
+ *  0.5 min is Chrome's tightest legal period and re-wakes us before the
+ *  server's idle timer fires. */
+chrome.alarms.create("screenpipe_keepalive", { periodInMinutes: 0.5 });
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === "screenpipe_keepalive") void connect();
+  if (alarm.name !== "screenpipe_keepalive") return;
+  // setInterval may have been killed by SW dormancy. Send a ping directly
+  // so the server gets traffic even if the heartbeat loop is gone. If the
+  // socket is closed, kick a reconnect.
+  if (socket?.readyState === WebSocket.OPEN) {
+    send({ type: "ping" });
+  } else {
+    void connect();
+  }
 });
 
 chrome.tabs.onActivated.addListener(() => void connect());

@@ -192,8 +192,9 @@ async spawnScreenpipe(overrideArgs: string[] | null) : Promise<Result<null, stri
 }
 },
 /**
- * Stop everything — capture only. Server stays alive.
- * This is the command called by the tray toggle and keyboard shortcut.
+ * Stop capture AND server so the next spawn_screenpipe does a full restart.
+ * Called by "Apply & Restart", audio shortcuts, updates, and rollbacks.
+ * The tray toggle uses stop_capture / start_capture to keep the server alive.
  */
 async stopScreenpipe() : Promise<Result<null, string>> {
     try {
@@ -241,6 +242,15 @@ async getAudioDevices() : Promise<Result<AudioDeviceInfo[], string>> {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
+},
+/**
+ * Read the current boot phase of the server. Used by the onboarding UI to
+ * show progress ("updating database", "loading pipes", ...) while the HTTP
+ * server is not yet listening — in particular during long DB migrations
+ * where /health is unreachable.
+ */
+async getBootPhase() : Promise<BootPhaseSnapshot> {
+    return await TAURI_INVOKE("get_boot_phase");
 },
 async isEnterpriseBuildCmd() : Promise<boolean> {
     return await TAURI_INVOKE("is_enterprise_build_cmd");
@@ -316,6 +326,30 @@ async updateShowScreenpipeShortcut(newShortcut: string, enabled: boolean) : Prom
 async showWindow(window: ShowRewindWindow) : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("show_window", { window }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Like `show_window` but forces macOS app activation first, so the target
+ * window actually comes to the foreground when the caller is a
+ * `NSNonactivatingPanelMask` panel (notifications, tray, etc.).
+ * 
+ * Without this, clicking "Open" in the notification panel on macOS often
+ * appears to do nothing: the non-activating panel style prevents the app
+ * from becoming active, and overlay/fullscreen main modes rely on an
+ * activate-aware `show_panel_visible(activate_app=true)` path that only
+ * fires for `overlay_mode == "window"`. The window technically shows but
+ * stays behind whatever app the user was in.
+ * 
+ * Callers that represent explicit user intent (clicking Open on a
+ * notification) should use this variant. Passive show-surface callers
+ * should keep using `show_window` to avoid stealing focus unnecessarily.
+ */
+async showWindowActivated(window: ShowRewindWindow) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("show_window_activated", { window }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -1002,6 +1036,32 @@ async calendarAuthorize() : Promise<Result<string, string>> {
 }
 },
 /**
+ * Reset TCC (privacy) permission for Calendars on this app's bundle ID.
+ * 
+ * Why: users (Mike, Jarad, Ruark, Louis's own Mac mini) clicked
+ * "Fix Calendar Permission" → macOS opened the Calendars privacy pane
+ * with an EMPTY app list, so they had no way to grant access. Root cause
+ * is a stale TCC record (dev-build → prod-build reinstall, OS update,
+ * user previously revoked etc.) where macOS silently refuses to re-add
+ * the app on subsequent requestFullAccessToEventsWithCompletion calls.
+ * 
+ * `tccutil reset Calendars <bundle_id>` clears that stale record. Next
+ * call to requestFullAccessToEventsWithCompletion then shows the native
+ * consent popup again and registers the app in Privacy → Calendars.
+ * 
+ * Bundle ID is read at runtime from the running app (not hard-coded), so
+ * this works for both `screenpi.pe` (prod) and `screenpi.pe.dev` (dev).
+ * No sudo required — tccutil's per-app user scope is user-writable.
+ */
+async calendarResetPermission() : Promise<Result<string, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("calendar_reset_permission") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Get calendar events in a time window.
  */
 async calendarGetEvents(hoursBack: bigint | null, hoursAhead: bigint | null) : Promise<Result<CalendarEventItem[], string>> {
@@ -1143,6 +1203,25 @@ async reencryptStore() : Promise<Result<null, string>> {
 export type AIPreset = { id: string; prompt: string; provider: AIProviderType; url?: string; model?: string; defaultPreset: boolean; apiKey: string | null; maxContextChars: number; maxTokens?: number }
 export type AIProviderType = "openai" | "openai-chatgpt" | "native-ollama" | "custom" | "screenpipe-cloud" | "pi" | "anthropic"
 export type AudioDeviceInfo = { name: string; isDefault: boolean }
+export type BootPhaseSnapshot = { 
+/**
+ * One of: idle | starting | migrating_database | building_audio |
+ * starting_pipes | ready | error
+ */
+phase: string; 
+/**
+ * Human-readable detail to show the user (may be long-running hint)
+ */
+message: string | null; 
+/**
+ * Present only when phase == "error"
+ */
+error: string | null; 
+/**
+ * Unix epoch seconds when the current phase was entered. Lets the UI
+ * show "X minutes" on slow migrations.
+ */
+sinceEpochSecs: bigint }
 /**
  * Per-browser automation status: "granted", "denied", or "not_asked".
  * Also includes whether the browser is currently running.
@@ -1281,9 +1360,16 @@ useSystemDefaultAudio: boolean;
 /**
  * Experimental: capture System Audio via the CoreAudio Process Tap API
  * (macOS 14.4+) instead of ScreenCaptureKit. Avoids SCK's display
- * enumeration failures after sleep/wake and the GPU/compositor wake
- * overhead. Off by default — existing users keep the SCK path.
- * Ignored on macOS <14.4 and on non-macOS platforms.
+ * enumeration failures after sleep/wake, the GPU/compositor wake
+ * overhead, and — most importantly — captures audio that's been
+ * routed to a Bluetooth headset via HFP (which SCK can't see; see
+ * Ruark Ferreira's 2026-04-24 Zoom call where AirPods-as-input
+ * silently routed output away from the SCK-visible mixer).
+ * 
+ * Default `true`: if tap creation fails for any reason (permission,
+ * macOS <14.4, OS quirk), stream.rs falls back to the SCK path
+ * automatically — so flipping the default on can't regress anyone.
+ * Ignored on non-macOS platforms.
  */
 experimentalCoreaudioSystemAudio?: boolean; 
 /**
@@ -1474,7 +1560,16 @@ apiAuth?: boolean;
 /**
  * Custom API key for remote authentication. If empty, a key is auto-generated.
  */
-apiKey?: string }) & 
+apiKey?: string; 
+/**
+ * When true, the HTTP server binds to `0.0.0.0` so other devices on the
+ * LAN can reach the screenpipe API. Off by default — the server binds
+ * `127.0.0.1` (localhost only) which is the safe choice.
+ * 
+ * `api_auth` is force-enabled whenever this is true; [`RecordingConfig::from_settings`]
+ * overrides it, so a user can't accidentally expose the API unauthenticated on their network.
+ */
+listenOnLan?: boolean }) & 
 /**
  * Catch-all for fields added by the frontend (e.g. chatHistory)
  * that the Rust struct doesn't know about. Without this, `save()` would

@@ -7,7 +7,7 @@ import React, { useEffect, useState, useRef, Suspense, useCallback } from "react
 import {
   Settings as SettingsIcon,
   Workflow,
-  Home,
+  Plus,
   Clock,
   Gift,
   HelpCircle,
@@ -17,22 +17,32 @@ import {
   Volume2,
   PanelLeftClose,
   PanelLeftOpen,
+  Search,
   Sparkles,
   Phone,
   X,
 } from "lucide-react";
+import { emit } from "@tauri-apps/api/event";
+import { useChatStore, getOrCreateEmptyChatId } from "@/lib/stores/chat-store";
 import { useOverlayData } from "@/app/shortcut-reminder/use-overlay-data";
 import { cn } from "@/lib/utils";
 import { AppSidebar, SidebarProvider, useSidebarContext } from "@/components/app-sidebar";
+import { usePlatform } from "@/lib/hooks/use-platform";
 import { FeedbackSection } from "@/components/settings/feedback-section";
 import { PipeStoreView } from "@/components/pipe-store";
 import { MemoriesSection } from "@/components/settings/memories-section";
 import { StandaloneChat } from "@/components/standalone-chat";
+import { ChatSidebar } from "@/components/chat-sidebar";
+import { mountPiEventRouter } from "@/lib/stores/pi-event-router";
+import { mountPipeRunRecorder } from "@/lib/events/pipe-run-recorder";
+import { mountPipeWatchWriter } from "@/lib/events/pipe-watch-writer";
 import { NotificationBell } from "@/components/notification-bell";
 import Timeline from "@/components/rewind/timeline";
 import { useQueryState } from "nuqs";
 import { listen } from "@tauri-apps/api/event";
 import { useSettings } from "@/lib/hooks/use-settings";
+import { commands } from "@/lib/utils/tauri";
+import { formatShortcutDisplay } from "@/lib/chat-utils";
 import { useTeam } from "@/lib/hooks/use-team";
 import { useEnterprisePolicy } from "@/lib/hooks/use-enterprise-policy";
 import { EnterpriseLicensePrompt } from "@/components/enterprise-license-prompt";
@@ -64,6 +74,7 @@ const SETTINGS_SECTIONS = new Set<string>([
 
 function HomeContent() {
   const router = useRouter();
+  const { isMac } = usePlatform();
   const [activeSection, setActiveSection] = useQueryState("section", {
     defaultValue: "home",
     parse: (value) => {
@@ -96,6 +107,66 @@ function HomeContent() {
     const fallback = ["home", "timeline", "pipes"].find((s) => !isSectionHidden(s));
     setActiveSection(fallback ?? "home");
   }, [activeSection, isSectionHidden, setActiveSection]);
+
+  // Mount the Pi event router once, app-wide. Listens for `pi_event` /
+  // `pi_session_evicted` outside any chat-component lifecycle and mirrors
+  // per-session liveness into the chat store. This is what lets the chat
+  // sidebar show a live ● dot for sessions running in the background while
+  // the user is on Timeline / Pipes / Settings — without it, status would
+  // freeze the moment the chat unmounts. Idempotent.
+  useEffect(() => {
+    void mountPiEventRouter();
+    // Pipe-run recorder — buffers pipe-source events on the agent-event
+    // bus and saves each completed run as a `kind: "pipe-run"` chat
+    // file. Pairs with the chat router; both run for the lifetime of
+    // the app process. Idempotent.
+    void mountPipeRunRecorder();
+    // Pipe-watch writer — sole authority on chat-store messages for
+    // sessions with kind="pipe-watch". The chat panel mirrors the
+    // store; this writer is what makes "switch away and back" preserve
+    // the full live transcript. Idempotent.
+    void mountPipeWatchWriter();
+  }, []);
+
+  // Selecting a chat from the sidebar (or any other source that emits
+  // chat-load-conversation) should also FLIP the active view to the chat
+  // panel. Without this, clicking a chat from the Pipes / Timeline /
+  // Memories views appears to "do nothing" — the standalone chat
+  // component receives the event and switches conversation just fine,
+  // but the user is still looking at a different view. They'd have to
+  // also click "New chat" or similar to see the result. Hooking the
+  // listener at the page level fixes the cross-view UX.
+  useEffect(() => {
+    let unlistenFn: (() => void) | undefined;
+    let cancelled = false;
+    (async () => {
+      const { listen } = await import("@tauri-apps/api/event");
+      const u = await listen("chat-load-conversation", () => {
+        if (cancelled) return;
+        setActiveSection("home");
+      });
+      unlistenFn = u;
+    })();
+    return () => {
+      cancelled = true;
+      unlistenFn?.();
+    };
+  }, [setActiveSection]);
+
+  // Clear the sidebar's "current" highlight when leaving the chat
+  // view; restore it from panelSessionId when coming back. The chat
+  // panel stays mounted (display:none) and keeps streaming, but
+  // visually the row shouldn't look "selected" while the user is
+  // looking at Pipes/Memories/etc.
+  useEffect(() => {
+    const { actions } = useChatStore.getState();
+    if (activeSection === "home") {
+      const panelId = useChatStore.getState().panelSessionId;
+      if (panelId) actions.setCurrent(panelId);
+    } else {
+      actions.setCurrent(null);
+    }
+  }, [activeSection]);
 
   // Sidebar collapse state (persisted in localStorage)
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
@@ -286,7 +357,10 @@ function HomeContent() {
     }
     switch (activeSection) {
       case "home":
-        return <StandaloneChat className="h-full" />;
+        // Chat is rendered separately below — always-mounted so streaming
+        // and Pi event listeners survive navigation. Returning null here
+        // means the case branch falls through to the always-mounted chat.
+        return null;
       case "timeline":
         return <Timeline embedded />;
       case "memories":
@@ -307,10 +381,14 @@ function HomeContent() {
 
   // Top-level nav items (filtered by enterprise policy)
   const mainSections = [
-    { id: "home", label: "Home", icon: <Home className="h-4 w-4" /> },
-    { id: "pipes", label: "Pipes", icon: <Workflow className="h-4 w-4" /> },
-    { id: "timeline", label: "Timeline", icon: <Clock className="h-4 w-4" /> },
-    { id: "memories", label: "Memories", icon: <Sparkles className="h-4 w-4" /> },
+    // The first nav item doubles as "go to chat view + start a fresh
+    // conversation". Replaces the old "Home" + the "+" inside the chat
+    // sidebar (single, obvious entry point). The click handler below
+    // both switches the active section AND spins up a new chat session.
+    { id: "home", label: "New chat", icon: <Plus className="h-3.5 w-3.5" /> },
+    { id: "pipes", label: "Pipes", icon: <Workflow className="h-3.5 w-3.5" /> },
+    { id: "timeline", label: "Timeline", icon: <Clock className="h-3.5 w-3.5" /> },
+    { id: "memories", label: "Memories", icon: <Sparkles className="h-3.5 w-3.5" /> },
   ].filter((s) => !isSectionHidden(s.id));
 
   // Listen for navigation events from other windows (e.g. tray, Rust-side links)
@@ -343,28 +421,72 @@ function HomeContent() {
       <div className="h-screen flex min-h-0">
           {/* Sidebar */}
           <TooltipProvider delayDuration={0}>
+          {/* Top-left action buttons — pinned next to the macOS traffic
+              lights when the sidebar is EXPANDED. When collapsed these
+              live as the first two rows of the icon column instead (see
+              below), so the title bar stays clean and the column has a
+              single icon per line. Fixed positioning anchors them to the
+              viewport so they aren't clipped by AppSidebar's overflow. */}
+          {!sidebarCollapsed && (
+            <>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <button
+                    onClick={toggleSidebar}
+                    aria-label="collapse sidebar"
+                    className={cn(
+                      // top-1 + p-1 puts the 14px icon's center at y≈15px, matching the
+                      // vertical center of the macOS traffic lights (which sit at y≈14).
+                      "fixed top-1 z-20 p-1 rounded-md transition-colors",
+                      isMac ? "left-[78px]" : "left-2",
+                      isTranslucent ? "vibrant-nav-item" : "text-muted-foreground hover:text-foreground hover:bg-muted/50"
+                    )}
+                  >
+                    <PanelLeftClose className="h-3.5 w-3.5" />
+                  </button>
+                </TooltipTrigger>
+                <TooltipContent side="bottom" className="text-xs">
+                  collapse sidebar <kbd className="ml-1 px-1 py-0.5 bg-muted rounded text-[10px]">⌘B</kbd>
+                </TooltipContent>
+              </Tooltip>
+
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <button
+                    onClick={() => {
+                      void commands.showWindow({ Search: { query: null } });
+                    }}
+                    aria-label="search"
+                    className={cn(
+                      "fixed top-1 z-20 p-1 rounded-md transition-colors",
+                      // 28px right of the collapse icon (icon 16 + gap 8 + small breathing).
+                      isMac ? "left-[110px]" : "left-9",
+                      isTranslucent ? "vibrant-nav-item" : "text-muted-foreground hover:text-foreground hover:bg-muted/50"
+                    )}
+                  >
+                    <Search className="h-3.5 w-3.5" />
+                  </button>
+                </TooltipTrigger>
+                <TooltipContent side="bottom" className="text-xs">
+                  search
+                  <kbd className="ml-1 px-1 py-0.5 bg-muted rounded text-[10px]">
+                    {formatShortcutDisplay(
+                      settings.searchShortcut || (isMac ? "Control+Super+K" : "Alt+K"),
+                      isMac,
+                    )}
+                  </kbd>
+                </TooltipContent>
+              </Tooltip>
+            </>
+          )}
+
           <AppSidebar collapsed={sidebarCollapsed} className="pl-4">
+            {!sidebarCollapsed && (
             <div className={cn(isTranslucent ? "vibrant-sidebar-border" : "", "border-b", sidebarCollapsed ? "px-2 py-3" : "px-4 py-3")}>
-              {/* Row 1: name + phone + collapse */}
+              {/* Row 1: name (collapse moved out — pinned top-left next
+                  to the traffic lights, see above). */}
               <div className={cn("flex items-center", sidebarCollapsed ? "justify-center" : "justify-between")}>
                 {!sidebarCollapsed && <h1 className={cn("text-lg font-bold", isTranslucent ? "vibrant-heading" : "text-foreground")}>screenpipe</h1>}
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <button
-                      onClick={toggleSidebar}
-                      className={cn("transition-colors", isTranslucent ? "vibrant-nav-item" : "text-muted-foreground hover:text-foreground")}
-                    >
-                      {sidebarCollapsed ? (
-                        <PanelLeftOpen className="h-4 w-4" />
-                      ) : (
-                        <PanelLeftClose className="h-4 w-4" />
-                      )}
-                    </button>
-                  </TooltipTrigger>
-                  <TooltipContent side="bottom" className="text-xs">
-                    {sidebarCollapsed ? "expand sidebar" : "collapse sidebar"} <kbd className="ml-1 px-1 py-0.5 bg-muted rounded text-[10px]">⌘B</kbd>
-                  </TooltipContent>
-                </Tooltip>
               </div>
               {/* Row 2: device status + action buttons */}
               {!sidebarCollapsed && (() => {
@@ -451,11 +573,77 @@ function HomeContent() {
                 );
               })()}
             </div>
+            )}
 
-            {/* Navigation */}
-            <div className="p-2 flex-1 overflow-y-auto flex flex-col">
-              {/* Main sections */}
-              <div className="space-y-0.5">
+            {/* Navigation.
+                Outer flex column has no overflow — the chat-list section
+                inside owns its own scroll, otherwise the team promo +
+                bottom items would be pushed below the fold by long
+                conversation lists. */}
+            <div className="p-2 flex-1 flex flex-col min-h-0">
+              {/* Main sections — when collapsed, the column is prefixed
+                  with the collapse + search icons (one-per-line, with a
+                  divider) so they sit just below the traffic lights. */}
+              <div className="space-y-0.5 shrink-0">
+                {sidebarCollapsed && (
+                  <>
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <button
+                          onClick={toggleSidebar}
+                          aria-label="expand sidebar"
+                          className={cn(
+                            "w-full flex items-center justify-center px-2.5 py-1.5 rounded-lg transition-all duration-150 text-left group",
+                            isTranslucent
+                              ? "vibrant-nav-item vibrant-nav-hover"
+                              : "hover:bg-card/50 text-muted-foreground hover:text-foreground",
+                          )}
+                        >
+                          <PanelLeftOpen className={cn(
+                            "h-3.5 w-3.5 transition-colors flex-shrink-0",
+                            isTranslucent ? "vibrant-sidebar-fg-muted" : "text-muted-foreground group-hover:text-foreground"
+                          )} />
+                        </button>
+                      </TooltipTrigger>
+                      <TooltipContent side="right" className="text-xs">
+                        expand sidebar <kbd className="ml-1 px-1 py-0.5 bg-muted rounded text-[10px]">⌘B</kbd>
+                      </TooltipContent>
+                    </Tooltip>
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <button
+                          onClick={() => {
+                            void commands.showWindow({ Search: { query: null } });
+                          }}
+                          aria-label="search"
+                          className={cn(
+                            "w-full flex items-center justify-center px-2.5 py-1.5 rounded-lg transition-all duration-150 text-left group",
+                            isTranslucent
+                              ? "vibrant-nav-item vibrant-nav-hover"
+                              : "hover:bg-card/50 text-muted-foreground hover:text-foreground",
+                          )}
+                        >
+                          <Search className={cn(
+                            "h-3.5 w-3.5 transition-colors flex-shrink-0",
+                            isTranslucent ? "vibrant-sidebar-fg-muted" : "text-muted-foreground group-hover:text-foreground"
+                          )} />
+                        </button>
+                      </TooltipTrigger>
+                      <TooltipContent side="right" className="text-xs">
+                        search
+                        <kbd className="ml-1 px-1 py-0.5 bg-muted rounded text-[10px]">
+                          {formatShortcutDisplay(
+                            settings.searchShortcut || (isMac ? "Control+Super+K" : "Alt+K"),
+                            isMac,
+                          )}
+                        </kbd>
+                      </TooltipContent>
+                    </Tooltip>
+                    {/* Divider between the search affordance and the
+                        primary nav (+ pipes / timeline / memories). */}
+                    <div className={cn("my-1 border-t", isTranslucent ? "vibrant-sidebar-border" : "border-border/50")} />
+                  </>
+                )}
                 {mainSections.map((section) => {
                   const isActive = activeSection === section.id;
                   const btn = (
@@ -464,9 +652,39 @@ function HomeContent() {
                       data-testid={`nav-${section.id}`}
                       onClick={() => {
                         setActiveSection(section.id);
+                        // The "home" slot is the New Chat affordance —
+                        // clicking it (from any view) spawns a fresh
+                        // chat session and switches to it. Mirrors the
+                        // sidebar's "+ new chat" behaviour exactly so
+                        // the two entry points stay in sync.
+                        if (section.id === "home") {
+                          // Reuse an existing empty chat if there is one;
+                          // otherwise create. Mirrors the sidebar's
+                          // "+ new chat" handler so spamming the nav
+                          // doesn't pile up empty rows.
+                          const { id, isNew } = getOrCreateEmptyChatId();
+                          const store = useChatStore.getState();
+                          if (isNew) {
+                            store.actions.upsert({
+                              id,
+                              title: "new chat",
+                              preview: "",
+                              status: "idle",
+                              messageCount: 0,
+                              createdAt: Date.now(),
+                              updatedAt: Date.now(),
+                              pinned: false,
+                              unread: false,
+                            });
+                          }
+                          store.actions.setCurrent(id);
+                          void emit("chat-load-conversation", {
+                            conversationId: id,
+                          });
+                        }
                       }}
                       className={cn(
-                        "w-full flex items-center px-3 py-2 rounded-lg transition-all duration-150 text-left group",
+                        "w-full flex items-center px-2.5 py-1.5 rounded-lg transition-all duration-150 text-left group",
                         sidebarCollapsed ? "justify-center" : "space-x-2.5",
                         isActive
                           ? isTranslucent
@@ -485,7 +703,7 @@ function HomeContent() {
                       )}>
                         {section.icon}
                       </div>
-                      {!sidebarCollapsed && <span className={cn("text-sm truncate", isActive && isTranslucent ? "font-semibold vibrant-sidebar-fg" : "font-medium")}>{section.label}</span>}
+                      {!sidebarCollapsed && <span className={cn("text-xs truncate", isActive && isTranslucent ? "font-semibold vibrant-sidebar-fg" : "font-medium")}>{section.label}</span>}
                     </button>
                   );
                   if (sidebarCollapsed) {
@@ -501,34 +719,25 @@ function HomeContent() {
               </div>
 
 
-              {/* Spacer */}
-              <div className="flex-1" />
-
-              {/* Team promo card — hidden when user already has a team, sidebar collapsed, or enterprise */}
-              {!teamState.team && !sidebarCollapsed && !isSectionHidden("team") && !teamPromoDismissed && (
-                <div className={cn("mx-1 mb-3 p-3 border relative group", isTranslucent ? "vibrant-card-border" : "border-border bg-card")}>
-                  <button
-                    onClick={() => {
-                      setTeamPromoDismissed(true);
-                      localStorage.setItem("team-promo-dismissed", "true");
-                    }}
-                    className={cn("absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition-opacity", isTranslucent ? "vibrant-nav-item" : "text-muted-foreground hover:text-foreground")}
-                  >
-                    <X className="h-3.5 w-3.5" />
-                  </button>
-                  <h3 className={cn("text-sm font-medium", isTranslucent ? "vibrant-heading" : "text-foreground")}>
-                    Add your team to screenpipe
-                  </h3>
-                  <p className={cn("text-xs mt-1", isTranslucent ? "vibrant-sidebar-fg-muted" : "text-muted-foreground")}>
-                    Push pipe configs and content filters to all members.
-                  </p>
-                  <button
-                    onClick={() => openSettings("team")}
-                    className={cn("mt-2.5 px-3 py-1.5 text-xs font-medium border transition-colors duration-150", isTranslucent ? "vibrant-btn-border" : "border-border bg-background hover:bg-foreground hover:text-background")}
-                  >
-                    ADD YOUR TEAM
-                  </button>
+              {/* Embedded chat list — sits below the nav, scrolls within
+                  its own viewport so the team promo + bottom items stay
+                  pinned. Hidden when the sidebar is collapsed (no room for
+                  the conversation titles). */}
+              {!sidebarCollapsed ? (
+                <div
+                  className={cn(
+                    // pb-6 keeps a clear gap between the recents list
+                    // and the team / settings / help row — pb-3 was
+                    // too tight; the list ran almost flush against the
+                    // bottom nav.
+                    "flex-1 min-h-0 flex flex-col mt-2 -mx-2 border-t pt-2 pb-6",
+                    isTranslucent ? "vibrant-sidebar-border" : "border-border/50"
+                  )}
+                >
+                  <ChatSidebar />
                 </div>
+              ) : (
+                <div className="flex-1" />
               )}
 
               {/* Bottom items */}
@@ -542,13 +751,13 @@ function HomeContent() {
                     <button
                       onClick={() => openSettings("team")}
                       className={cn(
-                        "w-full flex items-center px-3 py-2 rounded-lg transition-all duration-150 text-left group",
+                        "w-full flex items-center px-2.5 py-1.5 rounded-lg transition-all duration-150 text-left group",
                         sidebarCollapsed ? "justify-center" : "space-x-2.5",
                         isTranslucent ? "vibrant-nav-item vibrant-nav-hover" : "hover:bg-card/50 text-muted-foreground hover:text-foreground",
                       )}
                     >
-                      <UserPlus className={cn("h-4 w-4 transition-colors flex-shrink-0", isTranslucent ? "" : "text-muted-foreground group-hover:text-foreground")} />
-                      {!sidebarCollapsed && <span className="font-medium text-sm truncate">{teamLabel}</span>}
+                      <UserPlus className={cn("h-3.5 w-3.5 transition-colors flex-shrink-0", isTranslucent ? "" : "text-muted-foreground group-hover:text-foreground")} />
+                      {!sidebarCollapsed && <span className="font-medium text-xs truncate">{teamLabel}</span>}
                     </button>
                   );
                   if (sidebarCollapsed) {
@@ -568,13 +777,13 @@ function HomeContent() {
                     <button
                       onClick={() => openSettings("referral")}
                       className={cn(
-                        "w-full flex items-center px-3 py-2 rounded-lg transition-all duration-150 text-left group",
+                        "w-full flex items-center px-2.5 py-1.5 rounded-lg transition-all duration-150 text-left group",
                         sidebarCollapsed ? "justify-center" : "space-x-2.5",
                         isTranslucent ? "vibrant-nav-item vibrant-nav-hover" : "hover:bg-card/50 text-muted-foreground hover:text-foreground",
                       )}
                     >
-                      <Gift className={cn("h-4 w-4 transition-colors flex-shrink-0", isTranslucent ? "" : "text-muted-foreground group-hover:text-foreground")} />
-                      {!sidebarCollapsed && <span className="font-medium text-sm truncate">Get free month</span>}
+                      <Gift className={cn("h-3.5 w-3.5 transition-colors flex-shrink-0", isTranslucent ? "" : "text-muted-foreground group-hover:text-foreground")} />
+                      {!sidebarCollapsed && <span className="font-medium text-xs truncate">Get free month</span>}
                     </button>
                   );
                   if (sidebarCollapsed) {
@@ -595,7 +804,7 @@ function HomeContent() {
                       data-testid="nav-settings"
                       onClick={() => openSettings("general")}
                       className={cn(
-                        "w-full flex items-center px-3 py-2 rounded-lg transition-all duration-150 text-left group",
+                        "w-full flex items-center px-2.5 py-1.5 rounded-lg transition-all duration-150 text-left group",
                         sidebarCollapsed ? "justify-center" : "space-x-2.5",
                         isTranslucent
                           ? "vibrant-nav-item vibrant-nav-hover"
@@ -606,9 +815,9 @@ function HomeContent() {
                         "transition-colors flex-shrink-0",
                         isTranslucent ? "" : "text-muted-foreground group-hover:text-foreground"
                       )}>
-                        <SettingsIcon className="h-4 w-4" />
+                        <SettingsIcon className="h-3.5 w-3.5" />
                       </div>
-                      {!sidebarCollapsed && <span className="font-medium text-sm truncate">Settings</span>}
+                      {!sidebarCollapsed && <span className="font-medium text-xs truncate">Settings</span>}
                     </button>
                   );
                   if (sidebarCollapsed) {
@@ -632,7 +841,7 @@ function HomeContent() {
                         setActiveSection("help");
                       }}
                       className={cn(
-                        "w-full flex items-center px-3 py-2 rounded-lg transition-all duration-150 text-left group",
+                        "w-full flex items-center px-2.5 py-1.5 rounded-lg transition-all duration-150 text-left group",
                         sidebarCollapsed ? "justify-center" : "space-x-2.5",
                         isActive
                           ? isTranslucent
@@ -649,9 +858,9 @@ function HomeContent() {
                           ? isTranslucent ? "" : "text-primary"
                           : isTranslucent ? "" : "text-muted-foreground group-hover:text-foreground"
                       )}>
-                        <HelpCircle className="h-4 w-4" />
+                        <HelpCircle className="h-3.5 w-3.5" />
                       </div>
-                      {!sidebarCollapsed && <span className="font-medium text-sm truncate">Help</span>}
+                      {!sidebarCollapsed && <span className="font-medium text-xs truncate">Help</span>}
                     </button>
                   );
                   if (sidebarCollapsed) {
@@ -671,16 +880,42 @@ function HomeContent() {
 
           {/* Content */}
           <div className={cn("flex-1 flex flex-col h-full bg-background min-h-0 relative", isTranslucent ? "rounded-none" : "rounded-tr-lg")}>
-            {isFullHeight ? (
-              <div className="flex-1 min-h-0 overflow-hidden">
-                {renderMainSection()}
-              </div>
-            ) : (
-              <div className="flex-1 overflow-y-auto overflow-x-hidden min-h-0">
-                <div className="p-6 pb-12 max-w-4xl mx-auto">
+            {/* ALWAYS-MOUNTED chat layer.
+                Hidden via CSS (display:none) when the user is on a non-chat
+                section, so the StandaloneChat component never unmounts. This
+                is what gives us "background streaming" — the chat's own
+                pi_event listener stays subscribed and its in-memory message
+                state survives navigation to Timeline / Pipes / Settings.
+                Without this trick, switching tabs killed any in-flight
+                Pi response and lost the partial token stream.
+                The ChatSidebar (recents + live status) is part of the same
+                layer so it's mounted with the chat. The pi-event-router (see
+                the useEffect above) updates the sidebar dots independently
+                of the chat panel, so background sessions keep pulsing in the
+                sidebar even on non-chat views — though the sidebar itself is
+                only visible when the user navigates back to the chat. */}
+            <div
+              className={cn(
+                "flex-1 min-h-0 overflow-hidden",
+                activeSection !== "home" && "hidden"
+              )}
+            >
+              <StandaloneChat className="h-full" hideInlineHistory />
+            </div>
+
+            {/* Non-chat sections render on top when active. */}
+            {activeSection !== "home" && (
+              isFullHeight ? (
+                <div className="flex-1 min-h-0 overflow-hidden">
                   {renderMainSection()}
                 </div>
-              </div>
+              ) : (
+                <div className="flex-1 overflow-y-auto overflow-x-hidden min-h-0">
+                  <div className="p-6 pb-12 max-w-4xl mx-auto">
+                    {renderMainSection()}
+                  </div>
+                </div>
+              )
             )}
 
           </div>

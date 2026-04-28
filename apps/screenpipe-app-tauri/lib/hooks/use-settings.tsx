@@ -82,6 +82,34 @@ export interface ChatMessage {
 	contentBlocks?: any[];
 	model?: string;
 	provider?: string;
+	/** UI override — when set, the sidebar / panel header renders this
+	 *  instead of `content` for compact display (e.g. "pipe executed
+	 *  10:24 – 10:26" for synthetic prompts). Doesn't affect persistence
+	 *  or what's sent to the model. */
+	displayContent?: string;
+	images?: any[];
+}
+
+/** What kind of session a conversation represents.
+ *
+ *  - `chat`        — a normal Pi chat session. The default; assumed when
+ *                    `kind` is missing on disk.
+ *  - `pipe-watch`  — a live pipe execution the user is currently
+ *                    watching. The chat panel renders pipe events in
+ *                    real time; the conversation is volatile (not
+ *                    persisted unless the user opts to keep it).
+ *  - `pipe-run`    — a completed pipe execution kept around as
+ *                    history. Lives under "Pipe runs" in the sidebar
+ *                    rather than "Recents". */
+export type ConversationKind = "chat" | "pipe-watch" | "pipe-run";
+
+/** Pipe-specific context attached to `pipe-watch` / `pipe-run`
+ *  conversations. Drives the in-panel banner and the sidebar
+ *  grouping. */
+export interface PipeContext {
+	pipeName: string;
+	executionId: number;
+	startedAt?: string;
 }
 
 export interface ChatConversation {
@@ -90,6 +118,29 @@ export interface ChatConversation {
 	messages: ChatMessage[];
 	createdAt: number;
 	updatedAt: number;
+	/** User pinned this conversation in the chat sidebar — keeps it at the top.
+	 *  Persists across app restarts via the on-disk conversation file. */
+	pinned?: boolean;
+	/** User closed this conversation from the chat sidebar — keeps the file on
+	 *  disk (so deleting via close is non-destructive) but excludes it from the
+	 *  sidebar listing. Re-surface via a future "show hidden" UI; meanwhile a
+	 *  dedicated delete-forever action is the only way to actually remove. */
+	hidden?: boolean;
+	/** ms since epoch of the most recent USER-SENT message. Drives the
+	 *  sidebar sort order. Persisted so that order survives app restart;
+	 *  derived from messages on first hydration if not set on disk yet. */
+	lastUserMessageAt?: number;
+	/** Conversation type — defaults to "chat" when missing (back-compat
+	 *  with older on-disk files). See `ConversationKind`. */
+	kind?: ConversationKind;
+	/** Pipe metadata for `pipe-watch` / `pipe-run` conversations.
+	 *  Undefined for plain chats. */
+	pipeContext?: PipeContext;
+	/** Last URL the agent navigated the embedded browser sidebar to.
+	 *  Drives the right-side `<BrowserSidebar />` panel: when the user
+	 *  re-opens this conversation the panel restores to this URL.
+	 *  Cleared (set to undefined) when the user closes the sidebar. */
+	browserState?: { url: string; updatedAt: number };
 }
 
 export interface ChatHistoryStore {
@@ -148,6 +199,9 @@ export type Settings = SettingsStore & {
 	filterMusic?: boolean;
 	/** Maximum batch transcription duration in seconds (0 = engine default: Deepgram 5000s, OpenAI 3000s, Whisper 600s) */
 	batchMaxDurationSecs?: number;
+	/** Redact PII from screenpipe API responses before they reach the LLM.
+	 *  Pro-only; enforced client-side (UI hides the toggle for non-pro). */
+	piPrivacyFilter?: boolean;
 	/** Show periodic notifications suggesting pipe ideas based on user's data (default: true) */
 	pipeSuggestionsEnabled?: boolean;
 	/** Hours between pipe suggestion notifications (default: 24) */
@@ -379,7 +433,7 @@ let DEFAULT_SETTINGS: Settings = {
 			filterMusic: false,
 			ignoreIncognitoWindows: true,
 			pauseOnDrmContent: false,
-			experimentalCoreaudioSystemAudio: true,
+			experimentalCoreaudioSystemAudio: false,
 			recordWhileLocked: false,
 			appendTypedTextToMeetingNotes: true,
 			localRetentionEnabled: true,
@@ -462,16 +516,19 @@ function createSettingsStore() {
 			needsUpdate = true;
 		}
 
-		// One-time migration: the CoreAudio Process Tap toggle used to default
-		// off (opt-in experimental flag). Existing installs therefore have
-		// `experimentalCoreaudioSystemAudio: false` persisted explicitly, which
-		// means just changing the static default doesn't reach them. Flip
-		// once, then record a marker so explicit opt-outs after this point
-		// are respected. Safe because stream.rs falls back to SCK if the tap
-		// can't start — see Ruark Ferreira's AirPods/HFP case (2026-04-24).
-		if (!(settings as any).coreaudioTapMigrationV1) {
-			settings.experimentalCoreaudioSystemAudio = true;
-			(settings as any).coreaudioTapMigrationV1 = true;
+		// One-time migration (V2 — supersedes V1): flip the CoreAudio Process
+		// Tap toggle OFF for every existing install, keeping SCK as the System
+		// Audio backend. V1 (run a few days earlier) had flipped it ON by
+		// default, but the Process Tap can't capture audio rendered through a
+		// VoiceProcessing AudioUnit — Zoom/Meet/Teams all use one for echo
+		// cancellation — so the tap silently captured zeroed buffers on every
+		// meeting. Users who explicitly want the tap (e.g. to dodge SCK's
+		// sleep/wake display-enumeration bug) can re-enable it in Settings.
+		// Reported by Ruark Ferreira on 2026-04-24 after his v2.4.46 calls
+		// kept dropping other participants.
+		if (!(settings as any).coreaudioTapMigrationV2) {
+			settings.experimentalCoreaudioSystemAudio = false;
+			(settings as any).coreaudioTapMigrationV2 = true;
 			needsUpdate = true;
 		}
 
@@ -873,20 +930,16 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 		await settingsStore.set(updates);
 		// Settings will be updated via the listener
 
-		// Reconfigure API module if auth/port settings changed.
-		// `apiKey` deliberately omitted: the server is the source of truth and
-		// the frontend learns the key via IPC (`get_local_api_config`). When
-		// the user changes their api_key preference here, the server picks it
-		// up on its next restart and the frontend will re-fetch the resolved
-		// value — passing `apiKey: null` here when settings.apiKey is empty
-		// would race with that IPC and wipe the cached key.
-		if ("port" in updates || "apiKey" in updates || "apiAuth" in updates) {
+		// Only update the port in the API module immediately — auth changes
+		// (apiAuth / apiKey) must NOT be applied until after the server restarts.
+		// Calling configureApi({ authEnabled: false }) before restart clears the
+		// auth cookie, causing every frontend WebSocket to reconnect without a
+		// token and flood the logs with 403 rejections (the server still requires
+		// auth until it restarts with the new setting).
+		if ("port" in updates) {
 			const { configureApi } = await import("@/lib/api");
 			const merged = { ...settings, ...updates };
-			configureApi({
-				port: merged.port ?? 3030,
-				authEnabled: merged.apiAuth ?? true,
-			});
+			configureApi({ port: merged.port ?? 3030 });
 		}
 	};
 

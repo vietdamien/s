@@ -605,13 +605,29 @@ jobs:
           "
           cd ../../..
 
+      # Publish helper: only swallow the *specific* "version already exists"
+      # error from npm. Anything else (auth failure, network, validation) must
+      # surface so the workflow fails loudly instead of silently shipping nothing.
+      # Previously this step used `2>/dev/null || echo "skipping"` which masked
+      # every error — versions 0.3.290..0.3.295 all "succeeded" without ever
+      # publishing because the npm token had expired and nobody noticed.
       - name: Publish platform packages
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           for pkg in screenpipe-darwin-arm64 screenpipe-darwin-x64 screenpipe-linux-x64 screenpipe-win32-x64; do
             cd packages/cli/$pkg
-            npm publish --access public 2>/dev/null || echo "skipping $pkg (may already exist)"
+            err=$(mktemp)
+            if npm publish --access public 2>"$err"; then
+              echo "::notice::published $pkg"
+            else
+              if grep -q "You cannot publish over the previously published versions" "$err"; then
+                echo "::warning::$pkg already at this version, skipping"
+              else
+                cat "$err" >&2
+                exit 1
+              fi
+            fi
             cd ../../..
           done
 
@@ -620,7 +636,17 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           cd packages/cli/screenpipe
-          npm publish --access public 2>/dev/null || echo "skipping main package (may already exist)"
+          err=$(mktemp)
+          if npm publish --access public 2>"$err"; then
+            echo "::notice::published main package"
+          else
+            if grep -q "You cannot publish over the previously published versions" "$err"; then
+              echo "::warning::main package already at this version, skipping"
+            else
+              cat "$err" >&2
+              exit 1
+            fi
+          fi
 
   release:
     runs-on: ubuntu-latest

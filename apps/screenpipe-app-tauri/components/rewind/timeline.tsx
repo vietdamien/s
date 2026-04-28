@@ -28,6 +28,7 @@ import { useKeywordSearchStore } from "@/lib/hooks/use-keyword-search-store";
 import { usePlatform } from "@/lib/hooks/use-platform";
 import { useAudioPlayback } from "@/lib/hooks/use-audio-playback";
 import { useHealthCheck } from "@/lib/hooks/use-health-check";
+import { useSettings } from "@/lib/hooks/use-settings";
 import { usePipes, type TemplatePipe } from "@/lib/hooks/use-pipes";
 
 import posthog from "posthog-js";
@@ -90,6 +91,7 @@ const easeOutCubic = (x: number): number => {
 
 export default function Timeline({ embedded = false }: { embedded?: boolean }) {
 	const { isMac } = usePlatform();
+	const { settings } = useSettings();
 	const { health } = useHealthCheck();
 	const [currentIndex, setCurrentIndex] = useState(0);
 	const [showAudioTranscript, setShowAudioTranscript] = useState(false);
@@ -395,6 +397,9 @@ export default function Timeline({ embedded = false }: { embedded?: boolean }) {
 	// Hide timeline when mouse moves to a different screen (skip in embedded mode)
 	useEffect(() => {
 		if (embedded) return;
+		// Window mode is a small movable window; cursor is often "outside" vs fullscreen
+		// monitor bounds, which incorrectly fired closeWindow and unregistered Escape.
+		if (settings?.overlayMode === "window") return;
 		let initialScreenBounds: { x: number; y: number; width: number; height: number } | null = null;
 		let checkInterval: ReturnType<typeof setInterval> | null = null;
 
@@ -449,7 +454,7 @@ export default function Timeline({ embedded = false }: { embedded?: boolean }) {
 				clearInterval(checkInterval);
 			}
 		};
-	}, []);
+	}, [embedded, settings?.overlayMode]);
 
 	// Helper to navigate to a timestamp
 	const navigateToTimestamp = useCallback(async (targetTimestamp: string) => {
@@ -474,6 +479,7 @@ export default function Timeline({ embedded = false }: { embedded?: boolean }) {
 			unlisten.then((fn) => fn());
 		};
 	}, [navigateToTimestamp]);
+
 
 	// Listen for navigate-to-frame events (deep link: screenpipe://frame/12345)
 	useEffect(() => {
@@ -1162,13 +1168,16 @@ export default function Timeline({ embedded = false }: { embedded?: boolean }) {
 						startAndEndDates={startAndEndDates}
 						onDateChange={handleDateChange}
 						onJumpToday={handleJumpToday}
-						onSearchClick={() => {
-							if (embedded) {
-								setShowSearchModal(true);
-							} else {
-								commands.showWindow({ Search: { query: null } });
-							}
-						}}
+						// Embedded timeline no longer renders a search button
+						// here — the AppSidebar's top bar (next to the macOS
+						// traffic lights) owns search now and emits an
+						// `open-search` event that the listener below picks
+						// up. Standalone timeline window keeps its button.
+						onSearchClick={
+							embedded
+								? undefined
+								: () => commands.showWindow({ Search: { query: null } })
+						}
 						onChatClick={embedded ? undefined : () => commands.showWindow("Chat")}
 						embedded={embedded}
 						isPlaying={isPlaying}

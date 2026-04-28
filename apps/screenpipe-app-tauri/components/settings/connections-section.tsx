@@ -31,6 +31,7 @@ import { GmailCard } from "./gmail-card";
 import { IcsCalendarCard } from "./ics-calendar-card";
 import { OpenClawCard } from "./openclaw-card";
 import { BrowserUrlCard } from "./browser-url-card";
+import { UserBrowserCard } from "./user-browser-card";
 import { VoiceMemosCard } from "./voice-memos-card";
 import posthog from "posthog-js";
 
@@ -207,6 +208,7 @@ export function IntegrationIcon({ icon }: { icon: string }) {
     claude: <ClaudeLogo />,
     cursor: <CursorLogo className="w-5 h-5 rounded" />,
     "claude-code": <Terminal className="h-5 w-5" />,
+    warp: <img src="/images/warp.png" alt="Warp" className="w-5 h-5 rounded" />,
     chatgpt: <img src="/images/openai.png" alt="ChatGPT" className="w-5 h-5 rounded" />,
     telegram: (
       <svg viewBox="0 0 24 24" className="w-5 h-5" fill="#2AABEE">
@@ -280,9 +282,13 @@ export function IntegrationIcon({ icon }: { icon: string }) {
     monday: <img src="/images/monday.png" alt="Monday.com" className="w-5 h-5 rounded" />,
     asana: <img src="/images/asana.svg" alt="Asana" className="w-5 h-5" />,
     "browser-url": <img src="/images/browser-url.svg" alt="Browser URL" className="w-5 h-5 rounded" />,
-    "browser-extension": (
-      <svg viewBox="0 0 24 24" className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-        <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" /><polyline points="15 3 21 3 21 9" /><line x1="10" y1="14" x2="21" y2="3" />
+    // user-browser: your real Chrome/Arc/Edge via the screenpipe extension.
+    // The arrow-out-of-square hints at "drives an external browser".
+    "user-browser": (
+      <svg viewBox="0 0 24 24" className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+        <circle cx="12" cy="12" r="9" />
+        <path d="M3 12h18" />
+        <path d="M12 3a14 14 0 0 1 0 18a14 14 0 0 1 0-18z" />
       </svg>
     ),
     "voice-memos": <img src="/images/voice-memos.svg" alt="Voice Memos" className="w-5 h-5 rounded" />,
@@ -369,16 +375,8 @@ export function IntegrationIcon({ icon }: { icon: string }) {
     otter: <img src="/images/otter.png" alt="Otter.ai" className="w-5 h-5 rounded" />,
     lexi: <img src="/images/lexi.png" alt="Leexi" className="w-5 h-5 rounded" />,
     financialsense: <img src="/images/financialsense.png" alt="Financial Sense" className="w-5 h-5 rounded" />,
-    loops: (
-      <svg viewBox="0 0 24 24" className="w-5 h-5" fill="currentColor" aria-hidden>
-        <path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zm-1.2 14.5v-9l6.3 4.5-6.3 4.5z"/>
-      </svg>
-    ),
-    resend: (
-      <svg viewBox="0 0 24 24" className="w-5 h-5" fill="currentColor" aria-hidden>
-        <path d="M3 4h18v3l-9 6-9-6V4zm0 5.2 9 6 9-6V20H3V9.2z"/>
-      </svg>
-    ),
+    loops: <img src="/images/loops.svg" alt="Loops" className="w-5 h-5" />,
+    resend: <img src="/images/resend.svg" alt="Resend" className="w-5 h-5 dark:invert" />,
     supabase: (
       <svg viewBox="0 0 24 24" className="w-5 h-5" fill="#3ECF8E" aria-hidden>
         <path d="M13.4 22.6c-.6.7-1.7.3-1.7-.6V14H6.3c-1.1 0-1.7-1.3-1-2.1L10.6 1.4c.6-.7 1.7-.3 1.7.6V10h5.4c1.1 0 1.7 1.3 1 2.1l-5.3 10.5z"/>
@@ -698,6 +696,52 @@ function MstyPanel() {
   );
 }
 
+function WarpPanel() {
+  const [copied, setCopied] = useState(false);
+  // Warp's MCP schema is per-server: no wrapping `mcpServers` object,
+  // just one `{ name: { command, args, ... } }` block pasted in the UI.
+  const config = JSON.stringify({
+    screenpipe: {
+      command: "npx",
+      args: ["-y", "screenpipe-mcp@latest"],
+      start_on_launch: true,
+    },
+  }, null, 2);
+  const handleCopy = useCallback(async () => {
+    try {
+      await navigator.clipboard.writeText(config);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {}
+  }, [config]);
+
+  return (
+    <div className="space-y-3">
+      <p className="text-xs text-muted-foreground">
+        Give Warp&apos;s Agent Mode access to your screen &amp; audio history via MCP.
+      </p>
+      <p className="text-xs text-muted-foreground">
+        1. In Warp, open <strong>Settings</strong> &gt; <strong>AI</strong> &gt; <strong>Manage MCP servers</strong> &gt; <strong>+ Add</strong> (or run <code className="bg-muted px-1 rounded">Open MCP Servers</code> from the Command Palette)
+      </p>
+      <p className="text-xs text-muted-foreground">
+        2. Choose <strong>CLI Server (Command)</strong> and paste this config:
+      </p>
+      <div className="relative group">
+        <pre className="bg-muted border border-border rounded-lg p-3 pr-10 text-xs font-mono text-foreground overflow-x-auto whitespace-pre-wrap">{config}</pre>
+        <Button variant="ghost" size="sm" onClick={handleCopy} className="absolute top-2 right-2 h-6 w-6 p-0 opacity-0 group-hover:opacity-100 transition-opacity">
+          {copied ? <Check className="h-3 w-3" /> : <Copy className="h-3 w-3 text-muted-foreground" />}
+        </Button>
+      </div>
+      <p className="text-xs text-muted-foreground">
+        3. Click <strong>Save</strong>. The server should show <strong>Running</strong>. Then ask Warp&apos;s agent: <em>&quot;what did I do in the last 5 minutes?&quot;</em>
+      </p>
+      <Button variant="outline" onClick={() => openUrl("https://www.warp.dev")} size="sm" className="gap-1.5 h-7 text-xs normal-case font-sans tracking-normal">
+        <ExternalLink className="h-3 w-3" />open warp
+      </Button>
+    </div>
+  );
+}
+
 function OllamaPanel() {
   const [status, setStatus] = useState<"idle" | "checking" | "connected" | "error">("idle");
   const [models, setModels] = useState<string[]>([]);
@@ -791,87 +835,6 @@ function LMStudioPanel() {
       )}
       {status === "error" && (
         <p className="text-xs text-destructive">lm studio not detected. make sure it&apos;s running on localhost:1234.</p>
-      )}
-    </div>
-  );
-}
-
-function BrowserExtensionPanel({ connected, onRefresh }: { connected: boolean; onRefresh: () => void }) {
-  const [testing, setTesting] = useState(false);
-  const [testResult, setTestResult] = useState<string | null>(null);
-
-  const handleTest = async () => {
-    setTesting(true);
-    setTestResult(null);
-    try {
-      const r = await localFetch("/browser/eval", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ code: "return document.title" }),
-      });
-      const d = await r.json();
-      if (d.success) {
-        setTestResult(`connected — active tab: "${d.result}"`);
-      } else {
-        setTestResult(`error: ${d.error}`);
-      }
-    } catch (e: any) {
-      setTestResult(`failed: ${e.message}`);
-    } finally {
-      setTesting(false);
-      onRefresh();
-    }
-  };
-
-  return (
-    <div className="space-y-4">
-      <div>
-        <h3 className="text-sm font-medium mb-1">browser extension</h3>
-        <p className="text-xs text-muted-foreground">
-          connects your browser to screenpipe so pipes can read data from authenticated pages
-          (ChatGPT history, Claude conversations, dashboards, etc.)
-        </p>
-      </div>
-
-      <div className="flex items-center gap-2">
-        <div className={`w-2 h-2 rounded-full ${connected ? "bg-foreground" : "bg-muted-foreground/30"}`} />
-        <span className="text-sm">{connected ? "connected" : "not connected"}</span>
-      </div>
-
-      {!connected && (
-        <div className="space-y-2">
-          <p className="text-xs text-muted-foreground">
-            install the extension, then it auto-connects when screenpipe is running.
-          </p>
-          <div className="flex gap-2">
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => openUrl("https://chromewebstore.google.com/detail/screenpipe-browser-bridge/bgiepgcbfoiikehdnkfffdkgpdhlijeh")}
-            >
-              chrome web store <ExternalLink className="w-3 h-3 ml-1" />
-            </Button>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => openUrl("https://github.com/screenpipe/screenpipe/tree/main/packages/browser-extension")}
-            >
-              manual install <ExternalLink className="w-3 h-3 ml-1" />
-            </Button>
-          </div>
-        </div>
-      )}
-
-      {connected && (
-        <div className="space-y-2">
-          <Button variant="outline" size="sm" onClick={handleTest} disabled={testing}>
-            {testing ? <Loader2 className="h-3 w-3 animate-spin mr-1" /> : <Check className="h-3 w-3 mr-1" />}
-            test connection
-          </Button>
-          {testResult && (
-            <p className="text-xs text-muted-foreground">{testResult}</p>
-          )}
-        </div>
       )}
     </div>
   );
@@ -1539,8 +1502,8 @@ export function ConnectionsSection() {
   const [claudeInstalled, setClaudeInstalled] = useState(false);
   const [cursorInstalled, setCursorInstalled] = useState(false);
   const [chatgptConnected, setChatgptConnected] = useState(false);
-  const [browserExtConnected, setBrowserExtConnected] = useState(false);
   const [calendarUserDisconnected, setCalendarUserDisconnected] = useState(false);
+  const [googleCalendarConnected, setGoogleCalendarConnected] = useState(false);
 
   const refreshCalendarTile = useCallback(() => {
     getStore()
@@ -1563,10 +1526,9 @@ export function ConnectionsSection() {
     commands.chatgptOauthStatus().then(res => {
       setChatgptConnected(res.status === "ok" && res.data.logged_in);
     }).catch(() => {});
-    localFetch("/browser/status")
-      .then(r => r.json())
-      .then(d => setBrowserExtConnected(d.connected === true))
-      .catch(() => setBrowserExtConnected(false));
+    commands.oauthStatus("google-calendar", null).then(res => {
+      setGoogleCalendarConnected(res.status === "ok" && res.data.connected);
+    }).catch(() => {});
   }, []);
 
   useEffect(() => { refreshStatus(); }, [selected, refreshStatus]);
@@ -1614,8 +1576,8 @@ export function ConnectionsSection() {
       { id: "claude", name: "Claude Desktop", icon: "claude", connected: claudeInstalled },
       { id: "cursor", name: "Cursor", icon: "cursor", connected: cursorInstalled },
       { id: "claude-code", name: "Claude Code", icon: "claude-code", connected: false },
+      { id: "warp", name: "Warp", icon: "warp", connected: false },
       { id: "chatgpt", name: "ChatGPT", icon: "chatgpt", connected: chatgptConnected },
-      { id: "browser-extension", name: "Browser Extension", icon: "browser-extension", connected: browserExtConnected },
       ...(os === "macos" ? [
         { id: "browser-url", name: "Browser URL Capture", icon: "browser-url", connected: false },
         { id: "voice-memos", name: "Voice Memos", icon: "voice-memos", connected: false },
@@ -1637,10 +1599,12 @@ export function ConnectionsSection() {
       { id: "linear", name: "Linear", icon: "linear", connected: false },
       { id: "perplexity", name: "Perplexity", icon: "perplexity", connected: false },
     ];
-    // Merge API tiles, skipping duplicates already in hardcoded
+    // Merge API tiles, skipping duplicates already in hardcoded.
+    // owned-default is hidden from settings — the agent drives it via the
+    // embedded sidebar, no user-facing controls.
     const hardcodedIds = new Set(hardcoded.map(h => h.id));
     const apiTiles: ConnectionTile[] = integrations
-      .filter(i => !hardcodedIds.has(i.id))
+      .filter(i => !hardcodedIds.has(i.id) && i.id !== "owned-default")
       .map(i => ({ id: i.id, name: i.name, icon: i.icon, connected: i.connected }));
     // Update connected status from API for hardcoded tiles that also exist in API
     for (const h of hardcoded) {
@@ -1650,8 +1614,12 @@ export function ConnectionsSection() {
     // If user explicitly disconnected calendar, suppress the dot regardless of OS state
     const calTile = hardcoded.find(h => h.id === "apple-calendar");
     if (calTile && calendarUserDisconnected) calTile.connected = false;
+    // Google Calendar dot is driven by direct oauthStatus (not the cached API), so it stays
+    // in sync immediately after connect/disconnect without waiting for cache expiry.
+    const googleCalTile = hardcoded.find(h => h.id === "google-calendar");
+    if (googleCalTile) googleCalTile.connected = googleCalendarConnected;
     return [...hardcoded, ...apiTiles];
-  }, [os, claudeInstalled, cursorInstalled, chatgptConnected, browserExtConnected, integrations, calendarUserDisconnected]);
+  }, [os, claudeInstalled, cursorInstalled, chatgptConnected, integrations, calendarUserDisconnected, googleCalendarConnected]);
 
   const filtered = useMemo(() => {
     if (!search.trim()) return allTiles;
@@ -1674,12 +1642,15 @@ export function ConnectionsSection() {
       />;
       case "claude-code": return <ClaudeCodePanel />;
       case "chatgpt": return <ChatGptPanel />;
-      case "browser-extension": return <BrowserExtensionPanel connected={browserExtConnected} onRefresh={refreshStatus} />;
+      case "user-browser": return <UserBrowserCard />;
       case "browser-url": return <BrowserUrlCard />;
       case "voice-memos": return <VoiceMemosCard />;
       case "apple-intelligence": return <AppleIntelligenceCard />;
       case "apple-calendar": return <CalendarCard onConnectionChange={refreshCalendarTile} />;
-      case "google-calendar": return <GoogleCalendarCard />;
+      case "google-calendar": return <GoogleCalendarCard
+        onConnected={() => setGoogleCalendarConnected(true)}
+        onDisconnected={() => { setGoogleCalendarConnected(false); apiCache.invalidate("connections/list"); }}
+      />;
       case "google-docs": return <GoogleDocsCard />;
       case "gmail": return <GmailCard />;
       case "ics-calendar": return <IcsCalendarCard />;
@@ -1689,6 +1660,7 @@ export function ConnectionsSection() {
       case "ollama": return <OllamaPanel />;
       case "lmstudio": return <LMStudioPanel />;
       case "msty": return <MstyPanel />;
+      case "warp": return <WarpPanel />;
       default:
         if (selectedIntegration) {
           if (selectedIntegration.is_oauth) {

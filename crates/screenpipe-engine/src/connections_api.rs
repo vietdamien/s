@@ -19,6 +19,9 @@ use serde_json::{json, Map, Value};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+use crate::routes::browser::BrowserBridge;
+use screenpipe_connect::connections::browser::{BrowserRegistry, BrowserSummary, EvalError};
+
 pub type SharedConnectionManager = Arc<Mutex<ConnectionManager>>;
 pub type SharedWhatsAppGateway = Arc<Mutex<WhatsAppGateway>>;
 
@@ -27,6 +30,8 @@ pub struct ConnectionsState {
     pub cm: SharedConnectionManager,
     pub wa: SharedWhatsAppGateway,
     pub secret_store: Option<Arc<SecretStore>>,
+    pub browser_bridge: Arc<BrowserBridge>,
+    pub browser_registry: Arc<BrowserRegistry>,
 }
 
 #[derive(Deserialize)]
@@ -104,6 +109,30 @@ async fn list_connections(State(state): State<ConnectionsState>) -> Json<Value> 
             "connected": wa_connected,
             "has_session": has_session,
         }));
+
+        // Browsers — every kind of browser the agent can drive (user's
+        // real browser via the extension, app-managed owned webview, etc.)
+        // is registered into the BrowserRegistry. Surface each one as its
+        // own entry so the AI sees the natural-language description and
+        // picks by id. Canonical control surface lives at
+        // GET /connections/browsers and POST /connections/browsers/:id/eval.
+        for b in state.browser_registry.list().await {
+            arr.push(json!({
+                "id": b.id(),
+                "name": b.name(),
+                "icon": b.id(),
+                "category": "browser",
+                "description": format!(
+                    "{}\n\nControl: GET /connections/browsers/{}/status, \
+                     POST /connections/browsers/{}/eval {{\"code\":\"...\",\"url\":\"...\"}}.",
+                    b.description(),
+                    b.id(),
+                    b.id(),
+                ),
+                "fields": [],
+                "connected": b.is_ready().await,
+            }));
+        }
     }
 
     Json(json!({ "data": data }))
@@ -118,6 +147,30 @@ async fn get_connection(
     Path(id): Path<String>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
+
+    // Browsers live in the registry, not in the integration table — so a
+    // generic `GET /connections/user-browser` would otherwise fall into
+    // ConnectionManager::find() and 400 with "unknown integration". Return
+    // the registry entry's natural-language description instead, which
+    // already embeds the eval/status endpoints the agent needs to drive it.
+    for b in state.browser_registry.list().await {
+        if b.id() == id {
+            let body = json!({
+                "id": b.id(),
+                "name": b.name(),
+                "category": "browser",
+                "connected": b.is_ready().await,
+                "description": format!(
+                    "{}\n\nControl: GET /connections/browsers/{}/status, \
+                     POST /connections/browsers/{}/eval {{\"code\":\"...\",\"url\":\"...\"}}.",
+                    b.description(),
+                    b.id(),
+                    b.id(),
+                ),
+            });
+            return (StatusCode::OK, Json(body)).into_response();
+        }
+    }
 
     let mgr = state.cm.lock().await;
     let has_proxy = mgr.find_proxy_config(&id).is_some();
@@ -1021,6 +1074,7 @@ fn resolve_auth(
     proxy_auth: &screenpipe_connect::connections::ProxyAuth,
     creds: Option<&Map<String, Value>>,
     oauth_token: Option<&str>,
+    oauth_extras: Option<&Value>,
 ) -> ResolvedAuth {
     use screenpipe_connect::connections::ProxyAuth;
     match proxy_auth {
@@ -1040,13 +1094,16 @@ fn resolve_auth(
         ProxyAuth::Header {
             name,
             credential_key,
-        } => creds
-            .and_then(|c| {
-                c.get(*credential_key)
-                    .and_then(|v| v.as_str())
-                    .map(|k| ResolvedAuth::Header(name.to_string(), k.to_string()))
-            })
-            .unwrap_or(ResolvedAuth::None),
+        } => {
+            // Header-based auth can come from either stored connection creds
+            // or OAuth metadata persisted alongside the token response.
+            let from_creds = creds.and_then(|c| c.get(*credential_key).and_then(|v| v.as_str()));
+            let from_oauth = oauth_extras.and_then(|v| v[*credential_key].as_str());
+            from_creds
+                .or(from_oauth)
+                .map(|k| ResolvedAuth::Header(name.to_string(), k.to_string()))
+                .unwrap_or(ResolvedAuth::None)
+        }
         ProxyAuth::BasicAuth {
             username_key,
             password_key,
@@ -1145,6 +1202,7 @@ async fn connection_proxy(
         &proxy_cfg.auth,
         creds.as_ref(),
         oauth_token.await.as_deref(),
+        oauth_json.as_ref(),
     );
 
     // Check that auth was actually resolved (don't send unauthenticated requests)
@@ -1308,10 +1366,139 @@ async fn connection_config(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Browser extension bridge wrappers — re-extract the bridge from ConnectionsState
+// so the underlying handlers in routes::browser remain state-agnostic.
+// ---------------------------------------------------------------------------
+
+async fn browser_ws(
+    ws: axum::extract::ws::WebSocketUpgrade,
+    State(state): State<ConnectionsState>,
+) -> axum::response::Response {
+    crate::routes::browser::browser_ws_handler(ws, State(state.browser_bridge)).await
+}
+
+async fn browser_eval(
+    State(state): State<ConnectionsState>,
+    body: Json<crate::routes::browser::EvalRequestBody>,
+) -> impl axum::response::IntoResponse {
+    crate::routes::browser::browser_eval_handler(State(state.browser_bridge), body).await
+}
+
+async fn browser_status(
+    State(state): State<ConnectionsState>,
+) -> impl axum::response::IntoResponse {
+    crate::routes::browser::browser_status_handler(State(state.browser_bridge)).await
+}
+
+// ---------------------------------------------------------------------------
+// Browser registry — uniform API for every kind of browser the agent can
+// drive. The agent reads `GET /connections/browsers`, picks one by id, and
+// calls `POST /connections/browsers/:id/eval`. Same shape regardless of
+// whether the underlying browser is the user's real Chrome (via the
+// extension) or an app-managed owned webview.
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct BrowserEvalBody {
+    code: String,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    timeout_secs: Option<u64>,
+}
+
+/// GET /connections/browsers — list every registered browser with its
+/// natural-language description and ready flag. The LLM uses the
+/// description field to decide which browser to call.
+async fn list_browsers(State(state): State<ConnectionsState>) -> Json<Value> {
+    let browsers = state.browser_registry.list().await;
+    let mut summaries = Vec::with_capacity(browsers.len());
+    for b in &browsers {
+        summaries.push(BrowserSummary::from_browser(b).await);
+    }
+    // Stable ordering — browsers should appear in the same order across
+    // calls so the agent's prompt doesn't shuffle.
+    summaries.sort_by(|a, b| a.id.cmp(&b.id));
+    Json(json!({ "data": summaries }))
+}
+
+/// GET /connections/browsers/:id/status — single-browser readiness probe.
+async fn browser_get_status(
+    State(state): State<ConnectionsState>,
+    Path(id): Path<String>,
+) -> (StatusCode, Json<Value>) {
+    match state.browser_registry.get(&id).await {
+        Some(b) => (
+            StatusCode::OK,
+            Json(json!({
+                "id": b.id(),
+                "name": b.name(),
+                "description": b.description(),
+                "ready": b.is_ready().await,
+            })),
+        ),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("no browser registered with id '{id}'") })),
+        ),
+    }
+}
+
+/// POST /connections/browsers/:id/eval — run JS in the named browser.
+async fn browser_run_eval(
+    State(state): State<ConnectionsState>,
+    Path(id): Path<String>,
+    Json(body): Json<BrowserEvalBody>,
+) -> (StatusCode, Json<Value>) {
+    let browser = match state.browser_registry.get(&id).await {
+        Some(b) => b,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": format!("no browser registered with id '{id}'") })),
+            );
+        }
+    };
+
+    let timeout = std::time::Duration::from_secs(body.timeout_secs.unwrap_or(30).min(120));
+    match browser.eval(&body.code, body.url.as_deref(), timeout).await {
+        Ok(r) => {
+            let status = if r.ok {
+                StatusCode::OK
+            } else {
+                StatusCode::UNPROCESSABLE_ENTITY
+            };
+            (
+                status,
+                Json(json!({
+                    "success": r.ok,
+                    "result": r.result,
+                    "error": r.error,
+                })),
+            )
+        }
+        Err(EvalError::NotConnected) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "success": false, "error": EvalError::NotConnected.to_string() })),
+        ),
+        Err(e @ EvalError::SendFailed(_)) | Err(e @ EvalError::Disconnected) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({ "success": false, "error": e.to_string() })),
+        ),
+        Err(e @ EvalError::Timeout(_)) => (
+            StatusCode::GATEWAY_TIMEOUT,
+            Json(json!({ "success": false, "error": e.to_string() })),
+        ),
+    }
+}
+
 pub fn router<S>(
     cm: SharedConnectionManager,
     wa: SharedWhatsAppGateway,
     secret_store: Option<Arc<SecretStore>>,
+    browser_bridge: Arc<BrowserBridge>,
+    browser_registry: Arc<BrowserRegistry>,
 ) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
@@ -1320,9 +1507,21 @@ where
         cm,
         wa,
         secret_store,
+        browser_bridge,
+        browser_registry,
     };
     Router::new()
         .route("/", get(list_connections))
+        // Browser registry — canonical multi-instance API.
+        // (Must be before /:id to avoid conflict with generic integration routes.)
+        .route("/browsers", get(list_browsers))
+        .route("/browsers/:id/status", get(browser_get_status))
+        .route("/browsers/:id/eval", post(browser_run_eval))
+        // Legacy single-instance browser routes — deployed extensions
+        // (Chrome v0.2.x and v0.3.0) hardcode these. Keep until usage drops.
+        .route("/browser/ws", get(browser_ws))
+        .route("/browser/eval", post(browser_eval))
+        .route("/browser/status", get(browser_status))
         // OAuth callback (must be before /:id to avoid conflict)
         .route("/oauth/callback", get(oauth_callback))
         // Calendar routes (must be before /:id to avoid conflict)
@@ -1468,7 +1667,7 @@ mod tests {
         };
         let mut creds = Map::new();
         creds.insert("api_key".into(), json!("sk-test-123"));
-        match resolve_auth(&auth_cfg, Some(&creds), None) {
+        match resolve_auth(&auth_cfg, Some(&creds), None, None) {
             ResolvedAuth::Header(name, value) => {
                 assert_eq!(name, "Authorization");
                 assert_eq!(value, "Bearer sk-test-123");
@@ -1484,7 +1683,7 @@ mod tests {
         };
         let mut creds = Map::new();
         creds.insert("api_key".into(), json!("should-not-use-this"));
-        match resolve_auth(&auth_cfg, Some(&creds), Some("oauth-token-xyz")) {
+        match resolve_auth(&auth_cfg, Some(&creds), Some("oauth-token-xyz"), None) {
             ResolvedAuth::Header(name, value) => {
                 assert_eq!(name, "Authorization");
                 assert_eq!(value, "Bearer oauth-token-xyz");
@@ -1499,7 +1698,7 @@ mod tests {
             credential_key: "api_key",
         };
         assert!(matches!(
-            resolve_auth(&auth_cfg, None, None),
+            resolve_auth(&auth_cfg, None, None, None),
             ResolvedAuth::None
         ));
     }
@@ -1512,7 +1711,7 @@ mod tests {
         };
         let mut creds = Map::new();
         creds.insert("api_key".into(), json!("my-key"));
-        match resolve_auth(&auth_cfg, Some(&creds), None) {
+        match resolve_auth(&auth_cfg, Some(&creds), None, None) {
             ResolvedAuth::Header(name, value) => {
                 assert_eq!(name, "X-API-Key");
                 assert_eq!(value, "my-key");
@@ -1530,7 +1729,7 @@ mod tests {
         let mut creds = Map::new();
         creds.insert("email".into(), json!("user@example.com"));
         creds.insert("api_token".into(), json!("secret123"));
-        match resolve_auth(&auth_cfg, Some(&creds), None) {
+        match resolve_auth(&auth_cfg, Some(&creds), None, None) {
             ResolvedAuth::Basic(user, pass) => {
                 assert_eq!(user, "user@example.com");
                 assert_eq!(pass, "secret123");
@@ -1547,7 +1746,7 @@ mod tests {
         };
         let creds = Map::new(); // no email or api_token
         assert!(matches!(
-            resolve_auth(&auth_cfg, Some(&creds), None),
+            resolve_auth(&auth_cfg, Some(&creds), None, None),
             ResolvedAuth::None
         ));
     }
@@ -1556,7 +1755,7 @@ mod tests {
     fn test_resolve_auth_none() {
         let auth_cfg = ProxyAuth::None;
         assert!(matches!(
-            resolve_auth(&auth_cfg, None, None),
+            resolve_auth(&auth_cfg, None, None, None),
             ResolvedAuth::None
         ));
     }

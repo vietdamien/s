@@ -48,6 +48,8 @@ import {
 } from "@/components/ui/select";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { emit, once, listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { mountAgentEventBus, registerDefault } from "@/lib/events/bus";
+import { parsePipeSessionId } from "@/lib/events/types";
 import { ChatPrefillData } from "@/lib/chat-utils";
 import { commands } from "@/lib/utils/tauri";
 import { cn } from "@/lib/utils";
@@ -1320,24 +1322,34 @@ export function PipesSection() {
     };
   }, [savePipeContent]);
 
-  // Listen for pipe_event to stream live output for running executions
+  // Listen for pipe events on the unified agent_event bus to stream
+  // live output for running executions. Filters source==pipe and
+  // parses the synthetic sessionId for pipe metadata.
   useEffect(() => {
-    let unlisten: UnlistenFn | null = null;
     let mounted = true;
+    let off: (() => void) | null = null;
 
-    listen<any>("pipe_event", (event) => {
+    void mountAgentEventBus().then(() => {
       if (!mounted) return;
-      const { pipeName, executionId, event: pipeEvent } = event.payload;
-      if (!pipeName || executionId == null) return;
+      off = registerDefault((envelope) => {
+      if (!mounted) return;
+      if (envelope.source !== "pipe") return;
+      const parsed = parsePipeSessionId(envelope.sessionId);
+      if (!parsed) return;
+      const { pipeName, executionId } = parsed;
+      const pipeEvent = envelope.event;
 
       const key = `${pipeName}:${executionId}`;
       let text = "";
       if (pipeEvent?.type === "raw_line") {
-        text = pipeEvent.text || "";
+        text = (pipeEvent as any).text || "";
       } else if (pipeEvent) {
-        // For structured events (Pi NDJSON), show only meaningful content
+        // For structured events (Pi NDJSON), show only meaningful content.
+        // The `assistantMessageEvent` shape in the agent-event types only
+        // declares the fields stage-1 codified; pipe stdout still carries
+        // some legacy variants (`thinking`, etc) that we read defensively.
         if (pipeEvent.type === "message_update" && pipeEvent.assistantMessageEvent) {
-          const evt = pipeEvent.assistantMessageEvent;
+          const evt = pipeEvent.assistantMessageEvent as any;
           if (evt.type === "text_delta" && evt.delta) {
             text = evt.delta;
           } else if (evt.type === "thinking" && evt.thinking) {
@@ -1346,7 +1358,7 @@ export function PipesSection() {
             text = `\n> running ${evt.toolName}...\n`;
           }
         } else if (pipeEvent.type === "tool_use") {
-          text = `\n> running ${pipeEvent.name || "unknown"}...\n`;
+          text = `\n> running ${(pipeEvent as any).name || "unknown"}...\n`;
         }
         // Silently skip all other event types (turn_start, turn_end,
         // message_start, message_end, tool_execution_start/end/update,
@@ -1360,11 +1372,12 @@ export function PipesSection() {
         };
         setLiveOutput({ ...liveOutputRef.current });
       }
-    }).then((fn) => { unlisten = fn; });
+      });
+    });
 
     return () => {
       mounted = false;
-      unlisten?.();
+      try { off?.(); } catch { /* ignore */ }
     };
   }, []);
 
@@ -2200,54 +2213,6 @@ export function PipesSection() {
                           })()}
                         </div>
 
-                        {/* Timeout */}
-                        <div>
-                          <Label className="text-xs mb-2 block cursor-help" title="max execution time before the pipe is killed — increase for slow LLMs or complex pipes">timeout</Label>
-                          <Select
-                            value={String(pipe.config.timeout || 600)}
-                            onValueChange={(value) => {
-                              const pipeName = pipe.config.name;
-                              const timeout = Number(value);
-                              setPipes((prev) =>
-                                prev.map((p) =>
-                                  p.config.name === pipeName
-                                    ? { ...p, config: { ...p.config, timeout } }
-                                    : p
-                                )
-                              );
-                              const savePromise = fetch(`${apiBase}/pipes/${pipeName}/config`, {
-                                method: "POST",
-                                headers: { "Content-Type": "application/json" },
-                                body: JSON.stringify({ timeout }),
-                              }).then(() => {
-                                delete pendingConfigSaves.current[pipeName];
-                                fetchPipes();
-                              }).catch(() => {
-                                delete pendingConfigSaves.current[pipeName];
-                              });
-                              pendingConfigSaves.current[pipeName] = savePromise;
-                            }}
-                          >
-                            <SelectTrigger className="mt-1 h-8 text-xs">
-                              <SelectValue />
-                            </SelectTrigger>
-                            <SelectContent>
-                              {[
-                                { value: "120", label: "2 minutes" },
-                                { value: "300", label: "5 minutes" },
-                                { value: "600", label: "10 minutes" },
-                                { value: "900", label: "15 minutes" },
-                                { value: "1800", label: "30 minutes" },
-                                { value: "3600", label: "1 hour" },
-                              ].map((opt) => (
-                                <SelectItem key={opt.value} value={opt.value}>
-                                  {opt.label}
-                                </SelectItem>
-                              ))}
-                            </SelectContent>
-                          </Select>
-                        </div>
-
                         {/* Connections */}
                         <div>
                           <Label className="text-xs mb-2 block cursor-help" title="give the agent access to your apps (Slack, Obsidian, CRM, etc.) — credentials are fetched at runtime">connections</Label>
@@ -2529,6 +2494,54 @@ export function PipesSection() {
 
                       {/* ═══ ADVANCED TAB ═══ */}
                       <TabsContent value="advanced" className="mt-3 space-y-3">
+                      {/* Timeout */}
+                      <div>
+                        <Label className="text-xs mb-2 block cursor-help" title="max execution time before the pipe is killed — increase for slow LLMs or complex pipes">timeout</Label>
+                        <Select
+                          value={String(pipe.config.timeout || 600)}
+                          onValueChange={(value) => {
+                            const pipeName = pipe.config.name;
+                            const timeout = Number(value);
+                            setPipes((prev) =>
+                              prev.map((p) =>
+                                p.config.name === pipeName
+                                  ? { ...p, config: { ...p.config, timeout } }
+                                  : p
+                              )
+                            );
+                            const savePromise = fetch(`${apiBase}/pipes/${pipeName}/config`, {
+                              method: "POST",
+                              headers: { "Content-Type": "application/json" },
+                              body: JSON.stringify({ timeout }),
+                            }).then(() => {
+                              delete pendingConfigSaves.current[pipeName];
+                              fetchPipes();
+                            }).catch(() => {
+                              delete pendingConfigSaves.current[pipeName];
+                            });
+                            pendingConfigSaves.current[pipeName] = savePromise;
+                          }}
+                        >
+                          <SelectTrigger className="mt-1 h-8 text-xs">
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent>
+                            {[
+                              { value: "120", label: "2 minutes" },
+                              { value: "300", label: "5 minutes" },
+                              { value: "600", label: "10 minutes" },
+                              { value: "900", label: "15 minutes" },
+                              { value: "1800", label: "30 minutes" },
+                              { value: "3600", label: "1 hour" },
+                            ].map((opt) => (
+                              <SelectItem key={opt.value} value={opt.value}>
+                                {opt.label}
+                              </SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                      </div>
+
                       <div className="flex items-center justify-between border px-3 py-2.5">
                         <span className="text-xs font-medium cursor-help" title="when enabled, the pipe remembers context from previous runs">history</span>
                         <Switch

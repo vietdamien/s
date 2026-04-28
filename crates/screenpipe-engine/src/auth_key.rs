@@ -79,6 +79,28 @@ fn resolve_without_env(
     (k, "auto-generated")
 }
 
+/// Wipe the persisted key and write a fresh `sp-<uuid8>` to the secret store.
+/// The running server will keep using its in-memory key until restart — caller
+/// is responsible for prompting the user to apply & restart for the new key
+/// to take effect.
+pub async fn regenerate_api_auth_key(data_dir: &Path) -> Result<String> {
+    let new_key = format!("sp-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+    if let Ok(store) = open_secret_store(data_dir).await {
+        store
+            .set("api_auth_key", new_key.as_bytes())
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to persist regenerated key: {e}"))?;
+    } else {
+        anyhow::bail!("could not open secret store to persist regenerated key");
+    }
+    // Best-effort cleanup of legacy file so it doesn't shadow the new key.
+    if let Some(home) = dirs::home_dir() {
+        let _ = std::fs::remove_file(home.join(".screenpipe/auth.json"));
+    }
+    tracing::info!("api auth: key regenerated (new prefix: {})", &new_key[..6]);
+    Ok(new_key)
+}
+
 async fn open_secret_store(data_dir: &Path) -> Result<screenpipe_secrets::SecretStore> {
     let db_path = data_dir.join("db.sqlite");
     let db_url = format!("sqlite:{}?mode=rwc", db_path.display());

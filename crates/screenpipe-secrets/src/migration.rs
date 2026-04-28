@@ -63,7 +63,7 @@ pub async fn migrate_legacy_secrets(
                                     .ok()
                                     .flatten()
                                     .and_then(|t| chrono::DateTime::parse_from_rfc3339(&t).ok())
-                                    .map(|dt| std::time::SystemTime::from(dt));
+                                    .map(std::time::SystemTime::from);
 
                                 match (file_mtime, store_time) {
                                     (Some(fm), Some(st)) if fm > st => {
@@ -222,10 +222,8 @@ pub fn fix_secret_file_permissions(screenpipe_dir: &Path) -> usize {
                 false
             };
 
-            if should_fix {
-                if set_permissions_600(&path) {
-                    count += 1;
-                }
+            if should_fix && set_permissions_600(&path) {
+                count += 1;
             }
         }
     }

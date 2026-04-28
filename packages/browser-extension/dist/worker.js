@@ -2,9 +2,10 @@
 var DEFAULT_BASE_URL = "http://127.0.0.1:3030";
 var STORAGE_KEY_TOKEN = "screenpipe_token";
 var STORAGE_KEY_BASE_URL = "screenpipe_base_url";
+var BROWSER_BASE_PATH = "/connections/browser";
 function buildWsUrl(baseHttpUrl, token) {
   const base = baseHttpUrl.replace(/^http:/, "ws:").replace(/^https:/, "wss:");
-  const path = "/browser/ws";
+  const path = `${BROWSER_BASE_PATH}/ws`;
   if (!token)
     return `${base}${path}`;
   return `${base}${path}?token=${encodeURIComponent(token)}`;
@@ -13,7 +14,7 @@ function healthUrl(baseHttpUrl) {
   return `${baseHttpUrl.replace(/\/$/, "")}/health`;
 }
 function browserStatusUrl(baseHttpUrl) {
-  return `${baseHttpUrl.replace(/\/$/, "")}/browser/status`;
+  return `${baseHttpUrl.replace(/\/$/, "")}${BROWSER_BASE_PATH}/status`;
 }
 
 // src/worker.ts
@@ -21,12 +22,16 @@ var RECONNECT_BASE_MS = 500;
 var RECONNECT_MAX_MS = 30000;
 var AUTH_FAIL_THRESHOLD = 3;
 var ALERT_COOLDOWN_MS = 10 * 60000;
+var HEARTBEAT_INTERVAL_MS = 20000;
+var HEARTBEAT_DEAD_MS = 50000;
 var socket = null;
 var reconnectDelay = RECONNECT_BASE_MS;
 var reconnectTimer = null;
 var closeWithoutOpen = 0;
 var lastAlertAt = 0;
 var openedThisAttempt = false;
+var lastFrameAt = 0;
+var heartbeatTimer = null;
 async function getConfig() {
   const s = await chrome.storage.local.get([STORAGE_KEY_TOKEN, STORAGE_KEY_BASE_URL]);
   const token = s[STORAGE_KEY_TOKEN]?.trim() || null;
@@ -58,6 +63,8 @@ function notifyOnce(title, message) {
   } catch {}
 }
 async function connect() {
+  if (reconnectTimer)
+    return;
   if (socket?.readyState === WebSocket.OPEN || socket?.readyState === WebSocket.CONNECTING) {
     return;
   }
@@ -75,7 +82,9 @@ async function connect() {
     openedThisAttempt = true;
     reconnectDelay = RECONNECT_BASE_MS;
     closeWithoutOpen = 0;
+    lastFrameAt = Date.now();
     clearBadge();
+    startHeartbeat();
     const hello = {
       type: "hello",
       from: "extension",
@@ -85,6 +94,7 @@ async function connect() {
     send(hello);
   };
   socket.onclose = () => {
+    stopHeartbeat();
     if (!openedThisAttempt) {
       closeWithoutOpen += 1;
       if (closeWithoutOpen >= AUTH_FAIL_THRESHOLD) {
@@ -100,6 +110,7 @@ async function connect() {
     } catch {}
   };
   socket.onmessage = async (event) => {
+    lastFrameAt = Date.now();
     let msg;
     try {
       msg = JSON.parse(event.data);
@@ -137,6 +148,7 @@ function forceReconnect() {
     clearTimeout(reconnectTimer);
     reconnectTimer = null;
   }
+  stopHeartbeat();
   reconnectDelay = RECONNECT_BASE_MS;
   closeWithoutOpen = 0;
   lastAlertAt = 0;
@@ -154,21 +166,52 @@ function send(obj) {
     }
   } catch {}
 }
+function startHeartbeat() {
+  stopHeartbeat();
+  heartbeatTimer = setInterval(() => {
+    if (socket?.readyState !== WebSocket.OPEN) {
+      stopHeartbeat();
+      return;
+    }
+    if (Date.now() - lastFrameAt > HEARTBEAT_DEAD_MS) {
+      console.warn("[screenpipe] no server traffic for 50s — reconnecting");
+      forceReconnect();
+      return;
+    }
+    send({ type: "ping" });
+  }, HEARTBEAT_INTERVAL_MS);
+}
+function stopHeartbeat() {
+  if (heartbeatTimer) {
+    clearInterval(heartbeatTimer);
+    heartbeatTimer = null;
+  }
+}
+function isRestrictedUrl(url) {
+  if (!url)
+    return true;
+  return url.startsWith("chrome://") || url.startsWith("chrome-extension://") || url.startsWith("edge://") || url.startsWith("about:") || url.includes("chromewebstore.google.com");
+}
 async function findTab(urlPattern) {
   if (urlPattern) {
     const tabs = await chrome.tabs.query({});
-    const match = tabs.find((t) => t.url?.includes(urlPattern));
+    const match = tabs.find((t) => t.url?.includes(urlPattern) && !isRestrictedUrl(t.url));
     if (match?.id != null)
       return match.id;
   }
   const [active] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
-  if (active?.id != null)
+  if (active?.id != null && !isRestrictedUrl(active.url)) {
     return active.id;
-  throw new Error("no matching tab found");
+  }
+  const all = await chrome.tabs.query({});
+  const eligible = all.find((t) => t.id != null && !isRestrictedUrl(t.url));
+  if (eligible?.id != null)
+    return eligible.id;
+  throw new Error("no eligible tab found — open a regular web page (not chrome://, chrome-extension://, or the chrome web store)");
 }
 async function evalInTab(tabId, code) {
   const tab = await chrome.tabs.get(tabId);
-  if (!tab.url || tab.url.startsWith("chrome://") || tab.url.startsWith("chrome-extension://") || tab.url.startsWith("edge://") || tab.url.startsWith("about:") || tab.url.includes("chromewebstore.google.com")) {
+  if (isRestrictedUrl(tab.url)) {
     throw new Error(`cannot execute scripts on ${tab.url}`);
   }
   const expression = `(async () => { ${code} })()`;
@@ -224,8 +267,8 @@ chrome.storage.onChanged.addListener((changes, area) => {
     forceReconnect();
   }
 });
-chrome.action.onClicked.addListener(() => {
-  chrome.runtime.openOptionsPage();
+chrome.runtime.onMessage.addListener(() => {
+  connect();
 });
 chrome.runtime.onInstalled.addListener(async (details) => {
   if (details.reason !== "install")
@@ -235,10 +278,15 @@ chrome.runtime.onInstalled.addListener(async (details) => {
     chrome.runtime.openOptionsPage();
   }
 });
-chrome.alarms.create("screenpipe_keepalive", { periodInMinutes: 1 });
+chrome.alarms.create("screenpipe_keepalive", { periodInMinutes: 0.5 });
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === "screenpipe_keepalive")
+  if (alarm.name !== "screenpipe_keepalive")
+    return;
+  if (socket?.readyState === WebSocket.OPEN) {
+    send({ type: "ping" });
+  } else {
     connect();
+  }
 });
 chrome.tabs.onActivated.addListener(() => void connect());
 chrome.tabs.onUpdated.addListener((_tabId, info) => {

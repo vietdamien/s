@@ -12,11 +12,29 @@
 //! On Windows/Linux: uses the `keyring` crate.
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
+use std::sync::Mutex;
 use std::sync::OnceLock;
 use tracing::{debug, info, warn};
 
 const SERVICE: &str = "com.screenpipe.app";
 const KEY_NAME: &str = "store-encryption-key";
+
+/// Cache successful keychain keys for the process lifetime.
+static CACHED_KEY: OnceLock<Mutex<Option<[u8; 32]>>> = OnceLock::new();
+
+fn cache() -> &'static Mutex<Option<[u8; 32]>> {
+    CACHED_KEY.get_or_init(|| Mutex::new(None))
+}
+
+fn set_cached_key(key: Option<[u8; 32]>) {
+    if let Ok(mut guard) = cache().lock() {
+        *guard = key;
+    }
+}
+
+fn get_cached_key() -> Option<[u8; 32]> {
+    cache().lock().ok().and_then(|guard| *guard)
+}
 
 /// Result of a keychain key lookup.
 pub enum KeyResult {
@@ -68,7 +86,15 @@ pub fn is_keychain_available() -> bool {
 
 /// Retrieve the encryption key from the keychain (read-only, never triggers a modal).
 pub fn get_key() -> KeyResult {
+    if let Some(cached) = get_cached_key() {
+        debug!("keychain: cache hit");
+        return KeyResult::Found(cached);
+    }
+
+    debug!("keychain: cache miss, checking keychain");
+
     if !is_keychain_available() {
+        warn!("keychain: unavailable");
         return KeyResult::Unavailable;
     }
 
@@ -78,6 +104,7 @@ pub fn get_key() -> KeyResult {
                 Ok(b) => b,
                 Err(_) => {
                     warn!("keychain: stored key is not valid base64, treating as not found");
+                    set_cached_key(None);
                     return KeyResult::NotFound;
                 }
             };
@@ -86,15 +113,23 @@ pub fn get_key() -> KeyResult {
                     "keychain: stored key has wrong length ({}), treating as not found",
                     bytes.len()
                 );
+                set_cached_key(None);
                 return KeyResult::NotFound;
             }
             let mut key = [0u8; 32];
             key.copy_from_slice(&bytes);
             debug!("keychain: retrieved existing encryption key");
+            set_cached_key(Some(key));
             KeyResult::Found(key)
         }
-        KeychainLookup::NotFound => KeyResult::NotFound,
-        KeychainLookup::AccessDenied => KeyResult::AccessDenied,
+        KeychainLookup::NotFound => {
+            set_cached_key(None);
+            KeyResult::NotFound
+        }
+        KeychainLookup::AccessDenied => {
+            set_cached_key(None);
+            KeyResult::AccessDenied
+        }
     }
 }
 
@@ -121,8 +156,10 @@ pub fn get_or_create_key() -> Option<[u8; 32]> {
 
     if !set_password_in_keychain(&b64) {
         warn!("keychain: failed to store encryption key");
+        set_cached_key(None);
         return None;
     }
+    set_cached_key(Some(key));
     info!("keychain: generated and stored new encryption key");
     Some(key)
 }
@@ -130,6 +167,7 @@ pub fn get_or_create_key() -> Option<[u8; 32]> {
 /// Delete the encryption key from the keychain (for testing/reset).
 #[allow(dead_code)]
 pub fn delete_key() -> Result<(), String> {
+    set_cached_key(None);
     #[cfg(target_os = "macos")]
     {
         let status = std::process::Command::new("security")

@@ -10,7 +10,11 @@ import { useKeywordSearchStore } from "@/lib/hooks/use-keyword-search-store";
 import posthog from "posthog-js";
 import type { StreamTimeSeriesResponse } from "@/components/rewind/timeline";
 
-const MAX_DATE_RETRIES = 7; // Don't walk back more than 7 days
+// How far the arrow keys walk past empty days. The underlying SQL uses
+// the timestamp index (O(log n)) so a wider window costs nothing. 7 was
+// too tight — users with >7 day recording gaps would dead-end on the
+// arrow and have to use the calendar instead.
+const MAX_DATE_RETRIES = 365;
 
 export function useDateNavigation(opts: {
 	frames: StreamTimeSeriesResponse[];

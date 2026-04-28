@@ -137,7 +137,7 @@ pub async fn handle_mcp_command(
                 let owner = "screenpipe";
                 let repo = "screenpipe";
                 let branch = "main";
-                let target_dir = "crates/screenpipe-integrations/screenpipe-mcp";
+                let target_dir = "packages/screenpipe-mcp";
 
                 let api_url = format!(
                     "https://api.github.com/repos/{}/{}/contents/{}?ref={}",

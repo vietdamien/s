@@ -319,6 +319,19 @@ void notif_free_string(char* ptr) { if (ptr) free(ptr); }
 }
 
 fn main() {
+    // Stamp the build time so `main.rs` can self-quiesce Sentry reports
+    // for ancient builds. This makes the Sentry inbox reflect what's
+    // actually running today; users who never update gradually fall
+    // silent instead of polluting signal for months after a known bug
+    // has been fixed. 90-day TTL is enforced in the `before_send` hook.
+    let build_time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    println!("cargo:rustc-env=SCREENPIPE_BUILD_UNIX_TIME={}", build_time);
+    // Re-run the build script on every compile so the timestamp is fresh.
+    println!("cargo:rerun-if-changed=build.rs");
+
     #[cfg(target_os = "macos")]
     {
         println!("cargo:rustc-link-lib=framework=AVFoundation");

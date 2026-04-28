@@ -23,9 +23,12 @@ const STARTUP_GRACE_PERIOD: Duration = Duration::from_secs(30);
 const CONSECUTIVE_FAILURES_THRESHOLD: u32 = 30;
 
 /// Consecutive explicit "unhealthy"/"error" responses from a *responding* server
-/// before showing Error. Lower than connection failures because the server is
-/// actively confirming the problem, but still debounced to survive brief spikes.
-const CONSECUTIVE_UNHEALTHY_THRESHOLD: u32 = 10;
+/// before showing Error. Set high (2 min sustained at 1Hz polling) because the
+/// /health endpoint is a soft signal that flaps on transient backend issues
+/// (DB pool pressure, OCR queue backpressure, slow audio chunk) while recording
+/// itself continues normally. Genuine recording failures surface through the
+/// dedicated `permission_monitor` + capture-module events, not through this debounce.
+const CONSECUTIVE_UNHEALTHY_THRESHOLD: u32 = 120;
 
 // ─────────────────────────────────────────────────────────────────────────
 // Boot phase — tracks where we are inside ServerCore::start.
@@ -286,21 +289,11 @@ fn decide_status(
     match health_result {
         Ok(health) if health.status == "unhealthy" || health.status == "error" => {
             // Server is responding but explicitly reporting a problem.
-            // Debounce: require sustained unhealthy responses before showing Error,
-            // because transient DB pool pressure can cause brief unhealthy blips.
-            if consecutive_unhealthy >= unhealthy_threshold {
-                RecordingStatus::Error
-            } else if current_status == RecordingStatus::Recording {
-                RecordingStatus::Recording
-            } else {
-                current_status
-            }
-        }
-        Ok(health) if health.status == "degraded" && !health.drm_content_paused => {
-            // Server responding but degraded (vision or audio pipeline failed)
-            // and NOT caused by DRM content detection.
-            // Most common cause: screen recording permission revoked.
-            // Show Error after debounce so the tray icon reflects the problem.
+            // Debounce heavily: 2 min sustained before flipping to Error.
+            // /health is a soft signal — DB pool pressure, OCR queue backpressure,
+            // and slow audio chunks all flap "unhealthy" while recording continues.
+            // Genuine failures (permission revoked, capture crashed) surface via
+            // the permission_monitor + capture-module event paths, not here.
             if consecutive_unhealthy >= unhealthy_threshold {
                 RecordingStatus::Error
             } else if current_status == RecordingStatus::Recording {
@@ -310,10 +303,12 @@ fn decide_status(
             }
         }
         Ok(_) => {
-            // Server is responding (healthy, stale, or degraded-with-DRM-pause).
-            // "stale" means timestamps are old but the server process is alive;
-            // this happens during DB pool saturation and resolves on its own.
-            // DRM pause is intentional — don't show error for it.
+            // Server is responding (healthy, stale, or degraded — with or without
+            // DRM-pause). "stale" means timestamps are old but the server process
+            // is alive; this happens during DB pool saturation and resolves on its
+            // own. "degraded" is a soft signal that does NOT mean recording stopped
+            // — real permission/capture failures are detected by permission_monitor
+            // (see line 498-504 below). Don't surface Error in the tray for this.
             RecordingStatus::Recording
         }
         Err(_) => {
@@ -461,11 +456,9 @@ pub async fn start_health_check(app: tauri::AppHandle) -> Result<()> {
             // Connection errors = server unreachable (crash, restart, port conflict).
             // Unhealthy = server responding but reporting a problem (DB issues, stalls).
             match &health_result {
-                Ok(health)
-                    if health.status == "unhealthy"
-                        || health.status == "error"
-                        || health.status == "degraded" =>
-                {
+                Ok(health) if health.status == "unhealthy" || health.status == "error" => {
+                    // Only hard "unhealthy"/"error" counts toward the Error transition.
+                    // "degraded" is treated as healthy in decide_status (see comments there).
                     ever_connected = true;
                     consecutive_failures = 0;
                     consecutive_unhealthy = consecutive_unhealthy.saturating_add(1);

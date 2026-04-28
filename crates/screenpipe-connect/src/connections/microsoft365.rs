@@ -48,6 +48,11 @@ static DEF: IntegrationDef = IntegrationDef {
     category: Category::Productivity,
     description: "Full Microsoft 365 access via OAuth and Microsoft Graph API (https://graph.microsoft.com/v1.0). \
         Connected via OAuth — click 'Connect Microsoft 365'. \
+        Works with both personal Microsoft accounts (Outlook.com/Live) and work/school \
+        Azure AD accounts, BUT: Teams endpoints (/me/chats, /me/joinedTeams, channel messages) \
+        require a work/school account — Microsoft silently drops those scopes for personal \
+        accounts and Graph will return 403 on Teams calls. Mail, Calendar, and OneDrive work \
+        on both account types. \
         Endpoints: \
         GET /connections/microsoft365/me — signed-in user profile. \
         GET /connections/microsoft365/me/messages?$top=<n>&$search=\"<query>\" — list/search emails. \

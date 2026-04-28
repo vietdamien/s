@@ -16,6 +16,21 @@ const MODEL_REMAPS: Record<string, string> = {
 	'qwen/qwen3-coder:free': 'qwen3-coder',
 };
 
+/**
+ * Apply legacy → canonical model alias remap. Callers must use the returned
+ * value for BOTH provider selection AND the upstream request body — earlier
+ * we remapped only inside createProvider, so the body kept the legacy name
+ * and Vertex MaaS rejected it ("Unknown Vertex MaaS model").
+ */
+export function resolveModelAlias(model: string): string {
+	const remapped = MODEL_REMAPS[model];
+	if (remapped) {
+		console.log(`[router] remapping ${model} → ${remapped} (Vertex MaaS)`);
+		return remapped;
+	}
+	return model;
+}
+
 // Models routed through OpenRouter (only those NOT available on Vertex MaaS)
 const OPENROUTER_PREFIXES = ['deepseek/', 'qwen/', 'mistralai/', 'stepfun/'];
 const OPENROUTER_MODELS = ['step-3.5', ':free'];
@@ -27,12 +42,7 @@ function isOpenRouterModel(model: string): boolean {
 }
 
 export function createProvider(model: string, env: Env): AIProvider {
-	// Remap legacy OpenRouter IDs to Vertex MaaS for better data privacy
-	const remapped = MODEL_REMAPS[model];
-	if (remapped) {
-		console.log(`[router] remapping ${model} → ${remapped} (Vertex MaaS)`);
-		model = remapped;
-	}
+	model = resolveModelAlias(model);
 
 	// Screenpipe event classifier — routes to self-hosted vLLM
 	if (model === 'screenpipe-event-classifier') {

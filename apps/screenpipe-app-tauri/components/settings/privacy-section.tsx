@@ -203,6 +203,27 @@ export function PrivacySection() {
   const [filterView, setFilterView] = useState<"all" | "personal" | "team">("all");
   const [pushingFilter, setPushingFilter] = useState<string | null>(null);
 
+  // Live API auth key — fetched from the running server, not user-editable.
+  // Letting users set their own opens the door to weak/known keys; the server
+  // auto-generates a strong `sp-<uuid8>` and persists it to the secret store.
+  const [liveApiKey, setLiveApiKey] = useState<string | null>(null);
+  const [revealApiKey, setRevealApiKey] = useState(false);
+  const [regeneratingKey, setRegeneratingKey] = useState(false);
+
+  const loadLiveApiKey = useCallback(async () => {
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      const config = await invoke<{ key: string | null }>("get_local_api_config");
+      setLiveApiKey(config.key ?? null);
+    } catch {
+      setLiveApiKey(null);
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadLiveApiKey();
+  }, [loadLiveApiKey]);
+
   const { items: windowItems, isLoading: isWindowItemsLoading } =
     useSqlAutocomplete("window");
   const { items: urlItems, isLoading: isUrlItemsLoading } =
@@ -486,7 +507,7 @@ export function PrivacySection() {
                     Require API Authentication
                   </h3>
                   <p className="text-xs text-muted-foreground mt-0.5">
-                    Remote devices must use the same account to access this API. Localhost is always allowed.
+                    All API requests require a valid token when enabled — including local ones. Copy the key below and paste it into the browser extension settings.
                   </p>
                 </div>
               </div>
@@ -497,52 +518,100 @@ export function PrivacySection() {
                 }}
               />
             </div>
+            {hasUnsavedChanges && (
+              <p className="text-xs text-amber-600 dark:text-amber-400 mt-2 flex items-center gap-1">
+                <RefreshCw className="h-3 w-3 shrink-0" />
+                click &quot;Apply &amp; Restart&quot; above for auth changes to take effect
+              </p>
+            )}
             <LockedSetting settingKey="api_key">
             {(settings.apiAuth ?? true) && (
               <div className="mt-2.5 flex items-center space-x-2.5 pl-6.5">
                 <Input
                   type="text"
-                  placeholder="custom API key (leave empty to auto-generate)"
-                  value={settings.apiKey ?? ""}
-                  onChange={(e) => {
-                    handleSettingsChange({ apiKey: e.target.value });
-                  }}
-                  className="h-8 text-xs font-mono"
+                  readOnly
+                  placeholder={liveApiKey ? "" : "(loading…)"}
+                  value={
+                    liveApiKey
+                      ? revealApiKey
+                        ? liveApiKey
+                        : "•".repeat(Math.min(liveApiKey.length, 32))
+                      : ""
+                  }
+                  onClick={(e) => (e.target as HTMLInputElement).select()}
+                  className="h-8 text-xs font-mono cursor-text select-all"
                 />
                 <Button
                   variant="outline"
                   size="sm"
                   className="h-8 px-2 shrink-0"
+                  title={revealApiKey ? "Hide key" : "Reveal key"}
+                  onClick={() => setRevealApiKey((v) => !v)}
+                  disabled={!liveApiKey}
+                >
+                  {revealApiKey ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-8 px-2 shrink-0"
+                  title="Copy key"
+                  disabled={!liveApiKey}
                   onClick={async () => {
-                    let key = settings.apiKey;
-                    if (!key) {
-                      try {
-                        const { invoke } = await import("@tauri-apps/api/core");
-                        const config = await invoke<{ key: string | null }>("get_local_api_config");
-                        key = config.key ?? undefined;
-                      } catch {}
+                    if (!liveApiKey) return;
+                    try {
+                      await navigator.clipboard.writeText(liveApiKey);
+                    } catch {
+                      const el = document.createElement("textarea");
+                      el.value = liveApiKey;
+                      el.style.position = "fixed";
+                      el.style.opacity = "0";
+                      document.body.appendChild(el);
+                      el.select();
+                      document.execCommand("copy");
+                      document.body.removeChild(el);
                     }
-                    if (key) {
-                      try {
-                        await navigator.clipboard.writeText(key);
-                      } catch {
-                        // Fallback: create a temporary input and use execCommand
-                        const el = document.createElement("textarea");
-                        el.value = key;
-                        el.style.position = "fixed";
-                        el.style.opacity = "0";
-                        document.body.appendChild(el);
-                        el.select();
-                        document.execCommand("copy");
-                        document.body.removeChild(el);
-                      }
-                      toast({ title: "API key copied to clipboard" });
-                    } else {
-                      toast({ title: "No API key available", description: "Restart the app to auto-generate a key", variant: "destructive" });
-                    }
+                    toast({ title: "API key copied to clipboard" });
                   }}
                 >
                   <Copy className="h-3.5 w-3.5" />
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-8 px-2 shrink-0"
+                  title="Regenerate key"
+                  disabled={regeneratingKey}
+                  onClick={async () => {
+                    if (
+                      !window.confirm(
+                        "Regenerate API key? The browser extension and any other clients will need the new key. The new key takes effect after you Apply & Restart.",
+                      )
+                    ) {
+                      return;
+                    }
+                    setRegeneratingKey(true);
+                    try {
+                      const { invoke } = await import("@tauri-apps/api/core");
+                      const newKey = await invoke<string>("regenerate_api_auth_key");
+                      setLiveApiKey(newKey);
+                      setRevealApiKey(true);
+                      toast({
+                        title: "API key regenerated",
+                        description: "Click Apply & Restart for the new key to take effect.",
+                      });
+                    } catch (e: any) {
+                      toast({
+                        title: "Failed to regenerate API key",
+                        description: String(e?.message ?? e),
+                        variant: "destructive",
+                      });
+                    } finally {
+                      setRegeneratingKey(false);
+                    }
+                  }}
+                >
+                  <RefreshCw className={cn("h-3.5 w-3.5", regeneratingKey && "animate-spin")} />
                 </Button>
               </div>
             )}

@@ -5,6 +5,67 @@
 import { isSameDay } from "date-fns";
 import { localFetch } from "@/lib/api";
 
+/**
+ * List the local-calendar days that have ANY captured data — screen
+ * frames OR audio chunks. Used by the timeline calendar picker to
+ * disable empty days.
+ *
+ * Returns a Set of "YYYY-MM-DD" local-day strings. SQL applies SQLite's
+ * `'localtime'` modifier so days are bucketed in the user's local
+ * timezone — matches what `format(date, "yyyy-MM-dd")` produces in
+ * the UI. Without this, a UTC timestamp just past midnight could land
+ * on the wrong calendar day in the picker.
+ *
+ * Includes audio_chunks because users with audio-only recording days
+ * (mic on, screen recording paused) would otherwise see those days
+ * greyed out even though the timeline has audio to play.
+ *
+ * Result is cached for 60s — the picker re-runs this on every popover
+ * open, and the underlying day-set rarely changes within a minute.
+ */
+let daysCache: { at: number; days: Set<string> } | null = null;
+const DAYS_CACHE_TTL_MS = 60_000;
+
+export async function listDaysWithFrames(): Promise<Set<string>> {
+	if (daysCache && Date.now() - daysCache.at < DAYS_CACHE_TTL_MS) {
+		return daysCache.days;
+	}
+	try {
+		// UNION ALL is fine — duplicates collapse via the outer DISTINCT.
+		// Both branches use the timestamp index (frames + audio_transcriptions
+		// both have one), so the query is sub-millisecond on typical DBs.
+		// audio_chunks has no timestamp column itself; the recording time
+		// lives on audio_transcriptions, which is what the timeline UI also
+		// uses to render the audio track.
+		const query = `
+			SELECT DISTINCT DATE(timestamp, 'localtime') AS day FROM (
+				SELECT timestamp FROM frames WHERE timestamp IS NOT NULL
+				UNION ALL
+				SELECT timestamp FROM audio_transcriptions WHERE timestamp IS NOT NULL
+			)
+			ORDER BY day
+		`;
+		const response = await localFetch("/raw_sql", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ query }),
+		});
+		if (!response.ok) {
+			const text = await response.text().catch(() => "");
+			console.error("listDaysWithFrames HTTP error:", response.status, text);
+			return new Set();
+		}
+		const rows = (await response.json()) as Array<{ day: string }>;
+		const set = new Set(rows.map((r) => r.day).filter(Boolean));
+		console.log(`[timeline] listDaysWithFrames: ${set.size} days with data`);
+		daysCache = { at: Date.now(), days: set };
+		return set;
+	} catch (e) {
+		console.error("listDaysWithFrames failed:", e);
+		return new Set();
+	}
+}
+
 export async function hasFramesForDate(date: Date): Promise<boolean> {
 	try {
 		// Set up start and end of the day

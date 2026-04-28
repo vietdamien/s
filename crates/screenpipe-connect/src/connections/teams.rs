@@ -38,6 +38,9 @@ static DEF: IntegrationDef = IntegrationDef {
     category: Category::Productivity,
     description: "Microsoft Teams integration with two modes: \
         (1) OAuth — connect your account for full read/write access via Microsoft Graph API. \
+        Requires a work or school Microsoft account (Azure AD) with a Teams license. \
+        Personal Microsoft accounts (consumer Outlook.com/Live accounts) can't access Teams \
+        and will be rejected by the connector. \
         (2) Webhook — paste an Incoming Webhook URL to send messages to a channel without OAuth. \
         OAuth endpoints (all require a connected Teams account): \
         GET /connections/teams/me/chats — list all chats (DMs + group chats). \

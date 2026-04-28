@@ -390,10 +390,12 @@ async fn drain_loop(
         // until resumed. This prevents WAL corruption from I/O errors
         // during sleep transitions.
         if WRITE_PAUSED.load(Ordering::SeqCst) {
-            info!(
-                "write_queue: paused for sleep, holding {} writes",
-                batch.len()
-            );
+            if !batch.is_empty() {
+                info!(
+                    "write_queue: paused for sleep, holding {} writes",
+                    batch.len()
+                );
+            }
             let notify = RESUME_NOTIFY.get_or_init(|| tokio::sync::Notify::new());
             tokio::select! {
                 _ = notify.notified() => {
@@ -557,11 +559,19 @@ async fn execute_batch(
         }
     } else if let Err(e) = sqlx::query("COMMIT").execute(&mut *conn).await {
         warn!("write_queue: COMMIT failed: {}", e);
-        let msg = e.to_string().to_lowercase();
-        if !msg.contains("no transaction is active") {
-            warn!("write_queue: detaching connection due to commit failure");
-            let _raw = conn.detach();
-        }
+        // Always detach. The previous code skipped detaching when the
+        // error was "cannot commit - no transaction is active" on the
+        // theory that a connection without an active txn is fine to
+        // reuse. It isn't: that error means SQLite already implicit-
+        // rolled-back a prior write inside the batch, leaving the
+        // connection's page cache stale. Returning it to the pool is
+        // exactly how the next batch borrowed it and got "(code: 11)
+        // database disk image is malformed" (incident 2026-04-26
+        // 17:25-17:39 — 11 audio chunks lost). A fresh connection
+        // costs ~ms; a poisoned one corrupts every subsequent batch
+        // until its lifetime ends.
+        warn!("write_queue: detaching connection due to commit failure");
+        let _raw = conn.detach();
         // All results become the commit error
         for pw in batch.drain(..) {
             let _ = pw.respond.send(Err(sqlx::Error::WorkerCrashed));
@@ -1333,11 +1343,33 @@ fn send_error_to_all(batch: &mut Vec<PendingWrite>, error: sqlx::Error) {
     error!("write_queue: batch failed: {}", error);
 }
 
+/// Lowercased-message check shared with `is_connection_error`. Pulled
+/// out so it's directly unit-testable without faking a `DatabaseError`
+/// impl — see `is_fatal_sqlite_message_*` tests below.
+///
+/// SQLite returns disk-I/O failures (code 522) and corruption signals
+/// (code 11) via `sqlx::Error::Database`. Both leave the current
+/// connection's page cache inconsistent with disk: SQLite's implicit
+/// rollback discards the failed write, but any subsequent COMMIT (or
+/// even SELECT) on the same handle can return "database disk image is
+/// malformed" until the connection is dropped. Treat them as fatal so
+/// the batch loop drops the connection instead of reusing it for
+/// follow-on writes that will all fail in confusing ways.
+fn is_fatal_sqlite_message(msg_lower: &str) -> bool {
+    msg_lower.contains("disk i/o error") || msg_lower.contains("malformed")
+}
+
 fn is_connection_error(e: &sqlx::Error) -> bool {
-    matches!(
+    if matches!(
         e,
         sqlx::Error::Io(_) | sqlx::Error::PoolClosed | sqlx::Error::PoolTimedOut
-    )
+    ) {
+        return true;
+    }
+    if let sqlx::Error::Database(db) = e {
+        return is_fatal_sqlite_message(&db.message().to_lowercase());
+    }
+    false
 }
 
 fn is_nested_transaction_error(e: &sqlx::Error) -> bool {
@@ -1846,5 +1878,62 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(tx_count.0, 0);
+    }
+
+    /// Regression: 2026-04-26 17:25-17:39 incident.
+    /// SQLite I/O (522) and corruption (11) errors arrive as
+    /// `sqlx::Error::Database` and previously slipped through
+    /// `is_connection_error`. The batch loop kept reusing the poisoned
+    /// connection and minutes later we'd see "malformed" cascades plus
+    /// lost audio chunks (`audio chunk DB insert failed after 3
+    /// retries`). Pin both the message-substring decision and the
+    /// transport-variant fast paths.
+    #[test]
+    fn is_fatal_sqlite_message_recognises_io_and_corruption() {
+        // The two failure modes from the incident.
+        assert!(is_fatal_sqlite_message("disk i/o error"));
+        assert!(is_fatal_sqlite_message(
+            "error returned from database: (code: 522) disk i/o error"
+        ));
+        assert!(is_fatal_sqlite_message("database disk image is malformed"));
+        assert!(is_fatal_sqlite_message(
+            "error returned from database: (code: 11) database disk image is malformed"
+        ));
+
+        // Non-fatal per-row errors must NOT be classified as fatal.
+        // Misclassifying these would force whole batches to roll back
+        // over a single constraint violation.
+        assert!(!is_fatal_sqlite_message("no such table: foo"));
+        assert!(!is_fatal_sqlite_message("unique constraint failed"));
+        assert!(!is_fatal_sqlite_message("database is locked"));
+        assert!(!is_fatal_sqlite_message(""));
+    }
+
+    #[test]
+    fn is_connection_error_classifies_transport_variants() {
+        assert!(is_connection_error(&sqlx::Error::PoolClosed));
+        assert!(is_connection_error(&sqlx::Error::PoolTimedOut));
+        assert!(is_connection_error(&sqlx::Error::Io(
+            std::io::Error::other("broken pipe")
+        )));
+    }
+
+    /// `Database` errors flow through `is_fatal_sqlite_message`: a
+    /// genuinely benign one (no such table) must NOT be classified as
+    /// a connection error or the batch loop would discard whole
+    /// batches on ordinary schema/constraint mistakes.
+    #[tokio::test]
+    async fn is_connection_error_treats_per_row_errors_as_non_fatal() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let per_row = sqlx::query("SELECT * FROM does_not_exist")
+            .execute(&pool)
+            .await
+            .unwrap_err();
+        assert!(matches!(per_row, sqlx::Error::Database(_)));
+        assert!(!is_connection_error(&per_row));
     }
 }

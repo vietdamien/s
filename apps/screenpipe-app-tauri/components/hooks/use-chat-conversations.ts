@@ -185,10 +185,41 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
       }),
       createdAt: existing?.createdAt ?? Date.now(),
       updatedAt: Date.now(),
+      // Preserve sort key across reloads. Source of truth: the in-memory
+      // chat-store, which is bumped exactly once per user-send.
+      ...(await (async () => {
+        const { useChatStore } = await import("@/lib/stores/chat-store");
+        const sid = piSessionIdRef.current;
+        const fromStore = sid
+          ? useChatStore.getState().sessions[sid]?.lastUserMessageAt
+          : undefined;
+        const lastUserMessageAt = fromStore ?? existing?.lastUserMessageAt;
+        return lastUserMessageAt ? { lastUserMessageAt } : {};
+      })()),
     };
 
     await saveConversationFile(conversation);
     await refreshFileConversations();
+
+    // Sync the persisted title back into the in-memory chat-store so the
+    // sidebar (which reads `sessions[id].title` directly) updates immediately.
+    // Without this the row stays labelled "new chat" until the next app
+    // launch — that's the rename-doesn't-stick bug users reported.
+    try {
+      const { useChatStore } = await import("@/lib/stores/chat-store");
+      const sessions = useChatStore.getState().sessions;
+      if (sessions[convId]) {
+        useChatStore.getState().actions.patch(convId, {
+          title: conversation.title,
+          messageCount: conversation.messages.length,
+          ...(conversation.lastUserMessageAt
+            ? { lastUserMessageAt: conversation.lastUserMessageAt }
+            : {}),
+        });
+      }
+    } catch (e) {
+      console.warn("[chat] failed to sync title to store:", e);
+    }
 
     // Update activeConversationId in store (lightweight — no conversation data)
     try {
@@ -241,6 +272,18 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
     if (!conv) return;
     await saveConversationFile({ ...conv, title: trimmed, updatedAt: Date.now() });
     await refreshFileConversations();
+    // Mirror to the in-memory store so the chat sidebar reflects the new
+    // title without waiting for app restart. Some call sites already patch
+    // the store themselves; this is idempotent — patch is a no-op for
+    // non-existent ids.
+    try {
+      const { useChatStore } = await import("@/lib/stores/chat-store");
+      if (useChatStore.getState().sessions[convId]) {
+        useChatStore.getState().actions.patch(convId, { title: trimmed });
+      }
+    } catch (e) {
+      console.warn("[chat] failed to sync rename to store:", e);
+    }
   };
 
   // ---- deleteConversation ----
@@ -272,39 +315,159 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
   };
 
   // ---- loadConversation ----
+  // Phase 3 — true parallel chats. Switching does NOT abort the previous
+  // session's Pi (each chat owns its own subprocess in the pool, capped
+  // at MAX_PI_SESSIONS=20). Three steps on switch:
+  //
+  //   1. Snapshot the local state for the OUTGOING session into the
+  //      chat-store, keyed by piSessionIdRef.current. This captures any
+  //      in-flight tokens / streaming cursor / contentBlocks that the
+  //      user accumulated locally — without this snapshot, the moment
+  //      they switch away their session loses everything that wasn't
+  //      yet on disk.
+  //
+  //   2. Reset the panel's streaming flags so the loading indicator
+  //      doesn't bleed across to the new conversation (the
+  //      "loading…-on-a-paused-chat" symptom Louis hit on 2026-04-25).
+  //
+  //   3. Hydrate from the store if the INCOMING session has live state
+  //      already (because it was viewed earlier this session OR because
+  //      the pi-event router has been accumulating its background
+  //      tokens). Fall back to disk only when the store is cold for
+  //      this id.
   const loadConversation = async (conv: ChatConversation) => {
-    // Abort any ongoing Pi processing on the current session before switching
-    if (isLoading || isStreaming) {
-      try {
-        await commands.piAbort(piSessionIdRef.current);
-      } catch (e) {
-        console.warn("[Pi] Failed to abort:", e);
+    const { useChatStore } = await import("@/lib/stores/chat-store");
+    const store = useChatStore.getState();
+    const outgoingSid = piSessionIdRef.current;
+
+    // (1) Snapshot OUTGOING session — atomic so router writes that
+    //     race against this update can't land between the messages
+    //     write and the streaming-refs write (which would point the
+    //     router at a streamingMessageId not yet present in messages).
+    //     Pipe-watch sessions are owned by `pipe-watch-writer`, which
+    //     keeps the chat-store as the source of truth — snapshotting
+    //     the panel's mirrored copy back over the writer's accumulator
+    //     would be a regression (lossy round-trip via React state).
+    if (outgoingSid && store.sessions[outgoingSid]) {
+      const outgoingKind = store.sessions[outgoingSid].kind;
+      if (outgoingKind !== "pipe-watch") {
+        store.actions.snapshotSession(outgoingSid, {
+          messages: messages as any,
+          streamingText: piStreamingTextRef.current,
+          streamingMessageId: piMessageIdRef.current,
+          contentBlocks: [...piContentBlocksRef.current],
+          isStreaming,
+          isLoading,
+        });
       }
-      piStreamingTextRef.current = "";
-      piMessageIdRef.current = null;
-      piContentBlocksRef.current = [];
-      setIsLoading(false);
-      setIsStreaming(false);
     }
 
-    // Switch to this conversation's session — each conversation is its own Pi process
+    // (2) Reset panel flags — these are panel-local, not session-local.
+    piStreamingTextRef.current = "";
+    piMessageIdRef.current = null;
+    piContentBlocksRef.current = [];
+    setIsLoading(false);
+    setIsStreaming(false);
+
+    // Switch to this conversation's session. Pair the panel's ref
+    // switch with `setCurrent` on the store so the router's
+    // foreground/background skip logic flips at the same instant the
+    // panel's filter does. Without this pairing, callers that reach
+    // loadConversation from a path other than the sidebar (deep-link
+    // from another window, settings-driven activeConversationId, etc.)
+    // would temporarily have the panel and the router disagree on
+    // which session is foreground — producing duplicated writes for
+    // the new session and silently dropped writes for the old one.
     piSessionIdRef.current = conv.id;
+    store.actions.setCurrent(conv.id);
 
-    // Load full conversation from file (conv from list may be metadata-only)
-    const { loadConversationFile } = await import("@/lib/chat-storage");
-    const full = await loadConversationFile(conv.id) || conv;
+    // (3) Prefer the store whenever it has messages for this id. Two
+    //     ways messages get there: (a) `markHydrated` was called on a
+    //     prior view (`hydratedAt` set), or (b) the router accumulated
+    //     them while the session was streaming in the background. Case
+    //     (b) is the up-to-the-millisecond truth — the disk file may
+    //     be one save behind the in-memory state, so falling through to
+    //     disk would silently drop tokens that arrived since the last
+    //     persisted agent_end.
+    const existing = store.sessions[conv.id];
+    let messagesForPanel: any[];
+    if (existing?.messages && existing.messages.length > 0) {
+      messagesForPanel = existing.messages as any[];
+      // Restore in-flight streaming markers so the panel resumes
+      // exactly where the user left it. The router has been keeping
+      // these up-to-date for any tokens that arrived while the user
+      // was elsewhere.
+      piStreamingTextRef.current = existing.streamingText ?? "";
+      piMessageIdRef.current = existing.streamingMessageId ?? null;
+      piContentBlocksRef.current = (existing.contentBlocks as any[]) ?? [];
+      // Self-heal a stuck `isStreaming` flag. The router bumps
+      // `updatedAt` on every token via patchMessage, so silence past
+      // STALE_MS means the stream is dead (Pi process died without
+      // firing agent_end, network cut mid-stream, etc.) — not just
+      // slow. Without this guard, returning to such a session shows
+      // the typing-cursor / loading dots forever.
+      const STALE_MS = 30_000;
+      const isStale =
+        !!existing.isStreaming && Date.now() - existing.updatedAt > STALE_MS;
+      if (isStale) {
+        store.actions.endTurn(conv.id);
+        piStreamingTextRef.current = "";
+        piMessageIdRef.current = null;
+        piContentBlocksRef.current = [];
+      } else {
+        if (existing.isLoading) setIsLoading(true);
+        if (existing.isStreaming) setIsStreaming(true);
+      }
+      store.actions.markHydrated(conv.id);
+    } else {
+      // Cold session — load from disk and seed the store.
+      const { loadConversationFile } = await import("@/lib/chat-storage");
+      const full = (await loadConversationFile(conv.id)) || conv;
+      messagesForPanel = full.messages.map((m) => ({
+        id: m.id,
+        role: m.role,
+        content: m.content,
+        timestamp: m.timestamp,
+        ...(m.contentBlocks?.length ? { contentBlocks: m.contentBlocks } : {}),
+        ...((m as any).images?.length
+          ? { images: (m as any).images }
+          : (m as any).image
+            ? { images: [(m as any).image] }
+            : {}),
+        ...((m as any).model ? { model: (m as any).model } : {}),
+        ...((m as any).provider ? { provider: (m as any).provider } : {}),
+      }));
+      // Make sure a record exists, then seed messages and mark hydrated.
+      if (!store.sessions[conv.id]) {
+        store.actions.upsert({
+          id: conv.id,
+          title: full.title || "untitled",
+          preview: "",
+          status: "idle",
+          messageCount: messagesForPanel.length,
+          createdAt: full.createdAt ?? Date.now(),
+          updatedAt: full.updatedAt ?? Date.now(),
+          pinned: full.pinned === true,
+          unread: false,
+          // Propagate kind / pipeContext from the synthetic conv when
+          // initWatch creates a pipe-watch session — the banner reads
+          // this off the session record so it persists across
+          // foreground/background swaps.
+          ...(conv.kind ? { kind: conv.kind } : full.kind ? { kind: full.kind } : {}),
+          ...(conv.pipeContext ? { pipeContext: conv.pipeContext } : full.pipeContext ? { pipeContext: full.pipeContext } : {}),
+        });
+      } else if (conv.kind || conv.pipeContext) {
+        store.actions.patch(conv.id, {
+          ...(conv.kind ? { kind: conv.kind } : {}),
+          ...(conv.pipeContext ? { pipeContext: conv.pipeContext } : {}),
+        });
+      }
+      store.actions.setMessages(conv.id, messagesForPanel as any);
+      store.actions.markHydrated(conv.id);
+    }
 
-    setMessages(full.messages.map(m => ({
-      id: m.id,
-      role: m.role,
-      content: m.content,
-      timestamp: m.timestamp,
-      ...(m.contentBlocks?.length ? { contentBlocks: m.contentBlocks } : {}),
-      ...((m as any).images?.length ? { images: (m as any).images } : (m as any).image ? { images: [(m as any).image] } : {}),
-      ...((m as any).model ? { model: (m as any).model } : {}),
-      ...((m as any).provider ? { provider: (m as any).provider } : {}),
-    })));
-    setConversationId(full.id);
+    setMessages(messagesForPanel);
+    setConversationId(conv.id);
     setShowHistory(false);
     piSessionSyncedRef.current = false;
 
@@ -318,7 +481,7 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
           ...freshSettings,
           chatHistory: {
             ...freshSettings.chatHistory,
-            activeConversationId: full.id,
+            activeConversationId: conv.id,
           }
         });
         await store.save();
@@ -408,8 +571,33 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
   // process. The old session stays alive (backend evicts LRU when > 4).
   // No kill/restart needed — true multi-session means each conversation
   // has its own process that persists across conversation switches.
-  const startNewConversation = async () => {
-    // Clear frontend state
+  // Optional `explicitId` — when the caller has a specific session id it
+  // wants the panel to adopt (e.g. sidebar's "+ new chat" generates the
+  // id locally and emits chat-load-conversation with it so the row + the
+  // chat agree from message 0). Passing one avoids the
+  // generate-then-overwrite dance which left store.currentId pointing
+  // at the throwaway uuid.
+  const startNewConversation = async (explicitId?: string) => {
+    // Snapshot OUTGOING session into the store so the previous chat's
+    // in-flight state survives the switch to "new chat". Without this,
+    // hitting "+ new chat" in the middle of a stream would silently
+    // discard everything the user couldn't yet see, even though the
+    // Pi process keeps running. Mirrors the snapshot in loadConversation.
+    const { useChatStore } = await import("@/lib/stores/chat-store");
+    const store = useChatStore.getState();
+    const outgoingSid = piSessionIdRef.current;
+    if (outgoingSid && store.sessions[outgoingSid]) {
+      store.actions.snapshotSession(outgoingSid, {
+        messages: messages as any,
+        streamingText: piStreamingTextRef.current,
+        streamingMessageId: piMessageIdRef.current,
+        contentBlocks: [...piContentBlocksRef.current],
+        isStreaming,
+        isLoading,
+      });
+    }
+
+    // Clear panel state
     piStreamingTextRef.current = "";
     piMessageIdRef.current = null;
     piContentBlocksRef.current = [];
@@ -422,9 +610,23 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
     setShowHistory(false);
     setPastedImages([]);
 
-    // New session ID — Pi will be started fresh when the first message is sent
-    piSessionIdRef.current = crypto.randomUUID();
+    // New session ID — Pi will be started fresh when the first message is sent.
+    // Pair with setCurrent so the router immediately knows the new id is
+    // foreground (and won't accumulate writes for it). See the matching
+    // pairing in loadConversation for the same reasoning.
+    const newSid = explicitId ?? crypto.randomUUID();
+    piSessionIdRef.current = newSid;
     piSessionSyncedRef.current = true;
+    store.actions.setCurrent(newSid);
+    // Set conversationId to the new Pi session id immediately. The chat
+    // panel's foreground bus registration (registerForeground) is keyed by
+    // conversationId, and Pi events arrive with sessionId === piSessionId.
+    // If we leave conversationId null until first save, the panel never
+    // registers — Pi events go to the default handler, the chat-shaped
+    // handlers in the panel never fire, and isLoading stays true forever
+    // ("analyzing…" stuck). Setting conversationId here keeps the
+    // foreground key in sync with piSessionIdRef from message 0.
+    setConversationId(newSid);
   };
 
   // ---- filteredConversations ----

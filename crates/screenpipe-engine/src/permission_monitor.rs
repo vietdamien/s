@@ -120,6 +120,9 @@ pub fn start() -> Option<JoinHandle<()>> {
         state.screen = LastKnown::new(perms.screen_recording.is_granted());
         state.mic = LastKnown::new(perms.microphone.is_granted());
         state.accessibility = LastKnown::new(perms.accessibility.is_granted());
+        // For keychain, avoid probing the keychain key until encryption is actually
+        // requested by the app (via encrypted settings/explicit opt-in). Otherwise
+        // macOS can show a keychain permission modal before onboarding.
         state.keychain = LastKnown::new(keychain_accessible());
         info!(
             screen = state.screen.granted,
@@ -255,6 +258,14 @@ fn granted(status: PermissionStatus) -> bool {
 fn keychain_accessible() -> bool {
     use screenpipe_secrets::keychain::{get_key, is_keychain_available, KeyResult};
     if !is_keychain_available() {
+        return true;
+    }
+    // Only check the keychain when encryption is opted in.
+    // This avoids showing the macOS keychain permission modal before onboarding for
+    // users who haven't opted into secrets encryption yet.
+    if !screenpipe_secrets::is_encryption_requested(
+        &screenpipe_core::paths::default_screenpipe_data_dir(),
+    ) {
         return true;
     }
     match get_key() {

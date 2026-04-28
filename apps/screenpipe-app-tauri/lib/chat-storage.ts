@@ -11,7 +11,11 @@ import {
   remove,
   exists,
 } from "@tauri-apps/plugin-fs";
-import type { ChatConversation } from "@/lib/hooks/use-settings";
+import type {
+  ChatConversation,
+  ConversationKind,
+  PipeContext,
+} from "@/lib/hooks/use-settings";
 
 let _chatsDir: string | null = null;
 
@@ -74,6 +78,22 @@ export interface ConversationMeta {
   createdAt: number;
   updatedAt: number;
   messageCount: number;
+  /** User-pinned (keeps row at the top of the sidebar). Defaults to false. */
+  pinned: boolean;
+  /** User-closed (excluded from default sidebar listing). Defaults to false.
+   *  Conversation file is still on disk; only an explicit delete action removes
+   *  it. The sidebar filters these out by default. */
+  hidden: boolean;
+  /** ms since epoch of the most recent user-sent message. Drives the
+   *  sidebar sort order. Falls back to derive-from-messages on legacy
+   *  files that pre-date the field. */
+  lastUserMessageAt?: number;
+  /** Conversation kind — `chat` for chats, `pipe-watch` / `pipe-run` for
+   *  pipe sessions. Sidebar uses this to split rows into separate
+   *  sections. Older files default to `chat`. */
+  kind: ConversationKind;
+  /** Pipe metadata for `pipe-*` kinds. Undefined for plain chats. */
+  pipeContext?: PipeContext;
 }
 
 export async function listConversations(): Promise<ConversationMeta[]> {
@@ -88,12 +108,29 @@ export async function listConversations(): Promise<ConversationMeta[]> {
     try {
       const text = await readTextFile(`${dir}/${entry.name}`);
       const conv = JSON.parse(text) as ChatConversation;
+      // Derive lastUserMessageAt from messages for files that pre-date
+      // the field on disk. Picks the latest user-role message timestamp.
+      let lastUserMessageAt = conv.lastUserMessageAt;
+      if (lastUserMessageAt == null) {
+        for (const m of conv.messages) {
+          if (m.role === "user" && typeof m.timestamp === "number") {
+            if (lastUserMessageAt == null || m.timestamp > lastUserMessageAt) {
+              lastUserMessageAt = m.timestamp;
+            }
+          }
+        }
+      }
       metas.push({
         id: conv.id,
         title: conv.title,
         createdAt: conv.createdAt,
         updatedAt: conv.updatedAt,
         messageCount: conv.messages.length,
+        pinned: conv.pinned === true,
+        hidden: conv.hidden === true,
+        lastUserMessageAt,
+        kind: conv.kind ?? "chat",
+        pipeContext: conv.pipeContext,
       });
     } catch {
       // skip corrupt files
@@ -103,6 +140,25 @@ export async function listConversations(): Promise<ConversationMeta[]> {
   // Sort by updatedAt descending (most recent first)
   metas.sort((a, b) => b.updatedAt - a.updatedAt);
   return metas;
+}
+
+/**
+ * Patch a single field on a conversation file in place. Used by the chat
+ * sidebar to persist `pinned` / `hidden` toggles without rewriting messages.
+ *
+ * No-op if the file doesn't exist (caller may be acting on a session that
+ * was never sent to disk yet — sidebar's row exists in memory only). The
+ * read+write is not atomic across processes, but conflicts are functionally
+ * harmless for these flags (last writer wins, no data loss).
+ */
+export async function updateConversationFlags(
+  id: string,
+  patch: Partial<Pick<ChatConversation, "pinned" | "hidden" | "title" | "browserState">>
+): Promise<void> {
+  const conv = await loadConversationFile(id);
+  if (!conv) return;
+  const next: ChatConversation = { ...conv, ...patch };
+  await saveConversationFile(next);
 }
 
 export async function loadAllConversations(): Promise<ChatConversation[]> {

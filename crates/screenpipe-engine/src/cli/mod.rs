@@ -6,6 +6,8 @@ pub mod audio;
 pub mod auth;
 pub mod backup;
 pub mod connection;
+pub mod db;
+pub mod install;
 pub mod login;
 pub mod mcp;
 pub mod pipe;
@@ -218,6 +220,16 @@ pub enum Command {
         subcommand: VaultCommand,
     },
 
+    /// Install a bundle of pipes from a manifest URL
+    Install {
+        /// Manifest URL (HTTPS, JSON). Defaults to the screenpipe starter bundle.
+        #[arg(default_value = "https://screenpi.pe/start.json")]
+        url: String,
+        /// Allow manifests hosted outside the trusted host list
+        #[arg(long, default_value_t = false)]
+        allow_untrusted: bool,
+    },
+
     /// Authenticate with screenpipe cloud
     Login,
 
@@ -234,6 +246,12 @@ pub enum Command {
     Auth {
         #[command(subcommand)]
         subcommand: AuthCommand,
+    },
+
+    /// Database recovery + storage cleanup (corruption repair, free disk)
+    Db {
+        #[command(subcommand)]
+        subcommand: DbCommand,
     },
 
     /// Database backup & maintenance (checkpoint WAL, export snapshot)
@@ -720,6 +738,42 @@ pub enum VaultCommand {
 // =============================================================================
 
 #[derive(Subcommand)]
+pub enum DbCommand {
+    /// Run PRAGMA quick_check on the live db.sqlite
+    Check,
+    /// Recover a corrupt db.sqlite via SQLite's `.recover` page-level scan.
+    /// Snapshots the corrupt file aside, repairs into a sidecar, integrity-checks,
+    /// and atomically swaps in the recovered db. Refuses to run while screenpipe
+    /// is open (the desktop app would race the swap).
+    Recover {
+        /// Run even if the screenpipe HTTP server is reachable. Dangerous —
+        /// quitting the app cleanly is preferred.
+        #[arg(long)]
+        force: bool,
+    },
+    /// List stale recovery/backup artifacts (db.sqlite.corrupt-*, db_corrupted.sqlite,
+    /// db.sqlite.backup, db-recovery-* dirs, db-hotfix-* dirs, db.sqlite.pre-recover-*).
+    /// Defaults to dry-run; pass `--apply` to actually delete. Never touches live
+    /// db.sqlite, recordings under data/, pipes/, or settings.
+    Cleanup {
+        /// Actually delete (default is dry-run for safety).
+        #[arg(long)]
+        apply: bool,
+        /// Run even if the screenpipe HTTP server is reachable.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Force-clear the .db_recovery.lock file (escape hatch if a previous
+    /// `screenpipe db ...` run was killed without releasing the lock).
+    Unlock {
+        /// Remove the lock even if it appears alive — only do this if you're
+        /// certain no real op is in progress.
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+#[derive(Subcommand)]
 pub enum BackupCommand {
     /// Flush WAL into the main database file so it can be safely copied
     Checkpoint,
@@ -809,6 +863,62 @@ pub enum SyncCommand {
         #[arg(short = 'p', long, default_value_t = 3030)]
         port: u16,
     },
+    /// Sync ~/.screenpipe to a remote SSH server (SFTP, no cloud account)
+    Remote {
+        #[command(subcommand)]
+        subcommand: RemoteSyncCommand,
+    },
+}
+
+/// SSH/SFTP-based sync of `~/.screenpipe` to a remote server.
+///
+/// No cloud account or screenpipe-cloud dependency — pushes the entire data
+/// directory over SFTP using a private key from `~/.ssh/`. Use this to
+/// centralize multiple machines onto a server you control (home box, VPS).
+#[derive(Subcommand)]
+pub enum RemoteSyncCommand {
+    /// Test SSH connectivity (dry-run, no upload)
+    Test {
+        #[command(flatten)]
+        cfg: RemoteSyncArgs,
+    },
+    /// Push `~/.screenpipe/` to the remote once
+    Now {
+        #[command(flatten)]
+        cfg: RemoteSyncArgs,
+        /// Override the local data directory (default: $HOME/.screenpipe)
+        #[arg(long)]
+        data_dir: Option<String>,
+    },
+    /// Scan ~/.ssh/config and ~/.ssh/known_hosts for candidate hosts
+    Discover {
+        /// Output as JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+}
+
+/// Shared connection flags for `screenpipe sync remote {test,now}`.
+///
+/// All values can also come from env vars: SCREENPIPE_REMOTE_HOST,
+/// SCREENPIPE_REMOTE_USER, SCREENPIPE_REMOTE_KEY, SCREENPIPE_REMOTE_PATH.
+#[derive(clap::Args, Debug)]
+pub struct RemoteSyncArgs {
+    /// Remote host (IP or DNS, e.g. "myserver.tail-scale.ts.net")
+    #[arg(long, env = "SCREENPIPE_REMOTE_HOST")]
+    pub host: String,
+    /// SSH user
+    #[arg(long, env = "SCREENPIPE_REMOTE_USER")]
+    pub user: String,
+    /// Path to SSH private key (e.g. ~/.ssh/id_ed25519)
+    #[arg(long, env = "SCREENPIPE_REMOTE_KEY")]
+    pub key_path: String,
+    /// Absolute path on the remote where ~/.screenpipe/ should land
+    #[arg(long, env = "SCREENPIPE_REMOTE_PATH")]
+    pub remote_path: String,
+    /// SSH port
+    #[arg(long, default_value_t = 22)]
+    pub port: u16,
 }
 
 // =============================================================================

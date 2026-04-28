@@ -1,7 +1,7 @@
 ---
 title: "OpenClaw - AI assistant with screenpipe memory"
 sidebarTitle: "OpenClaw"
-description: "Connect screenpipe to OpenClaw to give your personal AI assistant access to everything you've seen and heard."
+description: "Connect screenpipe to OpenClaw, a self-hosted personal AI that ties into WhatsApp, Telegram, Discord, and iMessage, so it can recall your screen history."
 icon: "robot"
 ---
 
@@ -131,13 +131,41 @@ curl -s "http://SCREENPIPE_IP:3030/meetings?limit=20"
 
 Replace `SCREENPIPE_IP` with the IP of the machine running screenpipe. If the machines aren't on the same network, use [Tailscale](https://tailscale.com) to create a private network between them.
 
-### option 2: sync data to the OpenClaw machine
+### option 2: push data to the OpenClaw machine over SSH
 
-Use screenpipe's built-in **cloud sync** feature to synchronize your data to the machine running OpenClaw:
+Use screenpipe's built-in **remote sync** to push your `~/.screenpipe/` directory to the OpenClaw machine over SFTP. No screenpipe-cloud account needed — just SSH access to your server.
 
-1. In the screenpipe app, go to **Settings → Cloud** and enable sync
-2. On the OpenClaw machine, install screenpipe and log in with the same account
-3. Your data will sync automatically — OpenClaw can then query `localhost:3030` as if it were running on the same machine
+On the laptop (or any machine recording):
+
+```bash
+# one-shot push
+screenpipe sync remote now \
+  --host openclaw.example.com \
+  --user ubuntu \
+  --key-path ~/.ssh/id_ed25519 \
+  --remote-path /home/ubuntu/.screenpipe
+
+# verify SSH first if you want
+screenpipe sync remote test --host ... --user ... --key-path ... --remote-path ...
+
+# auto-discover candidate hosts from ~/.ssh/config
+screenpipe sync remote discover
+```
+
+Run that on a cron / launchd / systemd timer for continuous sync:
+
+```bash
+# crontab -e — every 15 minutes
+*/15 * * * * /usr/local/bin/screenpipe sync remote now \
+  --host openclaw.example.com --user ubuntu \
+  --key-path /home/me/.ssh/id_ed25519 --remote-path /home/ubuntu/.screenpipe
+```
+
+Or set env vars instead of flags: `SCREENPIPE_REMOTE_HOST`, `SCREENPIPE_REMOTE_USER`, `SCREENPIPE_REMOTE_KEY`, `SCREENPIPE_REMOTE_PATH`.
+
+On the OpenClaw machine, point its skill at the synced directory or run a local screenpipe pointing to the same data dir — OpenClaw can then query `localhost:3030` as if the data were captured locally.
+
+> The deprecated **cloud sync** flow (Settings → Cloud, screenpipe-cloud account) is being phased out in favor of self-hosted remote sync. Use `screenpipe sync remote` for new setups.
 
 ## available MCP tools
 

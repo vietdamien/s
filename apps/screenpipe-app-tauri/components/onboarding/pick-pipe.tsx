@@ -67,6 +67,21 @@ async function waitForServer(maxWaitMs = 30000): Promise<void> {
   throw new Error("server not ready");
 }
 
+// Best-effort immediate run after install/enable so `pipe_scheduled_run`
+// fires within seconds of the user picking a path, instead of waiting for
+// the next cron tick (hours/days). Closes the 41% pick→run gap measured
+// in PostHog (last 14d: 218 picked pipe-step → 128 had pipe actually run).
+// Silent on failure — never blocks onboarding completion.
+async function triggerImmediateRun(slug: string): Promise<void> {
+  try {
+    await localFetch(`/pipes/${slug}/run`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+  } catch {}
+}
+
 async function installAndEnable(slug: string, retries = 3): Promise<void> {
   await waitForServer();
 
@@ -82,7 +97,10 @@ async function installAndEnable(slug: string, retries = 3): Promise<void> {
       });
       if (enableRes.ok) {
         const enableBody = await enableRes.json().catch(() => ({}));
-        if (!enableBody.error) return; // pipe was already installed and is now enabled
+        if (!enableBody.error) {
+          await triggerImmediateRun(slug);
+          return; // pipe was already installed and is now enabled
+        }
       }
 
       // Not installed — install from store
@@ -105,7 +123,10 @@ async function installAndEnable(slug: string, retries = 3): Promise<void> {
       });
       if (enable2.ok) {
         const enable2Body = await enable2.json().catch(() => ({}));
-        if (!enable2Body.error) return;
+        if (!enable2Body.error) {
+          await triggerImmediateRun(slug);
+          return;
+        }
         throw new Error(`enable ${slug} after install: ${enable2Body.error}`);
       }
       throw new Error(`enable ${slug} after install: ${enable2.status}`);

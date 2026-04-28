@@ -131,3 +131,4 @@ Saves to `e2e/videos/`.
 | `timeline.spec.ts` | Navigates to Timeline; seeds a capture event; verifies at least one frame renders |
 | `settings-sections.spec.ts` | Navigates General → Recording → AI → Speakers settings; verifies content and no crash |
 | `pipes.spec.ts` | Opens Pipes section; verifies pipe store mounts without crash; navigates back to Home |
+| `parallel-chat.spec.ts` | Drives chat-load-conversation + fake `pi_event` envelopes from the webview to walk Louis's repro: chat A → chat B → back to A. Asserts A's messages are still in the DOM (catches the "switch wipes A" regression) and that backgrounded streaming does NOT reorder sidebar rows. |

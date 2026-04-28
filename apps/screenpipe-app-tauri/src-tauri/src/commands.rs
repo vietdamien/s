@@ -259,6 +259,18 @@ pub async fn get_local_api_config(app_handle: tauri::AppHandle) -> serde_json::V
     })
 }
 
+/// Wipe the persisted API auth key and write a fresh `sp-<uuid8>` to the
+/// secret store. Returns the new key. The running server keeps its old key
+/// in memory until restart — the UI should prompt the user to apply & restart.
+#[tauri::command]
+#[specta::specta]
+pub async fn regenerate_api_auth_key() -> Result<String, String> {
+    let data_dir = screenpipe_core::paths::default_screenpipe_data_dir();
+    screenpipe_engine::auth_key::regenerate_api_auth_key(&data_dir)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// Read the enterprise license key from `enterprise.json`.
 /// Checks in order:
 /// 1. Next to executable (pushed via Intune/MDM to Program Files / .app bundle)
@@ -440,6 +452,7 @@ pub fn set_tray_health_icon(app_handle: tauri::AppHandle) {
 #[specta::specta]
 pub fn show_main_window(app_handle: &tauri::AppHandle, _overlay: bool) {
     info!("show_main_window called");
+    set_main_close_in_progress(false);
     let window_to_show = ShowRewindWindow::Main;
 
     match window_to_show.show(app_handle) {
@@ -461,10 +474,13 @@ pub fn show_main_window(app_handle: &tauri::AppHandle, _overlay: bool) {
             // already "focused" or never lost focus) wouldn't trigger a re-fetch.
             let _ = app_handle.emit("window-focused", true);
 
-            // NOTE: Window shortcuts (Escape) are registered by the focus-gain
-            // handler in window/show.rs. Do NOT also register them here — doing
-            // so races with the focus handler and causes duplicate
-            // RegisterEventHotKey calls that fail on macOS.
+            // NOTE: On macOS, Escape is registered only from the focus-gain handler
+            // in window/show.rs (duplicate RegisterEventHotKey fails there).
+            // On Windows/Linux, set_focus can succeed without delivering a new
+            // Focused(true) event when Home already had focus — then Escape never
+            // re-registers until another focus cycle. Sync once after show.
+            #[cfg(not(target_os = "macos"))]
+            register_window_shortcuts_if_main_visible(app_handle.clone());
         }
         Err(e) => {
             error!("ShowRewindWindow::Main.show failed: {}", e);
@@ -1061,10 +1077,22 @@ pub async fn close_window(
     // If closing the main window, also unregister window-specific shortcuts
     // (Escape, search shortcut) so they don't interfere with other apps
     if matches!(window, ShowRewindWindow::Main) {
+        set_main_close_in_progress(true);
+        info!("shortcut-sync: scheduling unregister (reason=close_window_main)");
+        let expected_gen =
+            WINDOW_SHORTCUTS_GEN.load(std::sync::atomic::Ordering::SeqCst);
         let app_clone = app_handle.clone();
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(10));
-            let _ = unregister_window_shortcuts(app_clone);
+            info!("shortcut-sync: unregister execute (reason=close_window_main)");
+            let _ = unregister_window_shortcuts_if_generation_unchanged(
+                app_clone,
+                expected_gen,
+                "close_window_main",
+            );
+            // Allow register_if_visible on Home focus again; stale blur debounce paths
+            // still skip extra unregister while this was true (see show.rs guards).
+            set_main_close_in_progress(false);
         });
     }
 
@@ -1194,12 +1222,25 @@ pub struct KeychainStatus {
 #[tauri::command]
 #[specta::specta]
 pub async fn get_keychain_status() -> Result<KeychainStatus, String> {
-    let state = match crate::secrets::get_key() {
-        crate::secrets::KeyResult::Found(_) => "enabled",
-        crate::secrets::KeyResult::NotFound => "disabled",
-        crate::secrets::KeyResult::AccessDenied => "disabled",
-        crate::secrets::KeyResult::Unavailable => "unavailable",
+    // Check if encryption is enabled WITHOUT accessing keychain.
+    // We only touch keychain when the user explicitly opts in via enable_keychain_encryption().
+    // This prevents prompts during onboarding permission checks.
+    let is_enabled = crate::secrets::is_encryption_enabled();
+
+    let state = if !is_enabled {
+        // Encryption not enabled in settings — definitely disabled
+        "disabled"
+    } else {
+        // Encryption is enabled, but only check keychain key if we actually need it
+        // (e.g., when loading secrets). Don't touch keychain just to report status.
+        match crate::secrets::get_key() {
+            crate::secrets::KeyResult::Found(_) => "enabled",
+            crate::secrets::KeyResult::NotFound => "disabled",
+            crate::secrets::KeyResult::AccessDenied => "disabled",
+            crate::secrets::KeyResult::Unavailable => "unavailable",
+        }
     };
+
     Ok(KeychainStatus {
         state: state.to_string(),
     })
@@ -1213,6 +1254,10 @@ pub async fn enable_keychain_encryption() -> Result<KeychainStatus, String> {
     })?;
 
     let data_dir = screenpipe_core::paths::default_screenpipe_data_dir();
+    if let Err(e) = screenpipe_secrets::mark_encryption_enabled(&data_dir) {
+        tracing::warn!("failed to write .encrypt-store flag: {}", e);
+    }
+
     let db_path = data_dir.join("db.sqlite");
     let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
 
@@ -1232,6 +1277,20 @@ pub async fn enable_keychain_encryption() -> Result<KeychainStatus, String> {
 
     Ok(KeychainStatus {
         state: "enabled".to_string(),
+    })
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn disable_keychain_encryption() -> Result<KeychainStatus, String> {
+    let data_dir = screenpipe_core::paths::default_screenpipe_data_dir();
+    screenpipe_secrets::mark_encryption_disabled(&data_dir)
+        .map_err(|e| format!("failed to remove .encrypt-store flag: {e}"))?;
+    if let Err(e) = crate::secrets::delete_key() {
+        tracing::warn!("failed to delete keychain key on opt-out: {}", e);
+    }
+    Ok(KeychainStatus {
+        state: "disabled".to_string(),
     })
 }
 
@@ -1903,7 +1962,24 @@ pub fn register_window_shortcuts(app_handle: tauri::AppHandle) -> Result<(), Str
         if matches!(event.state, ShortcutState::Pressed) {
             if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 info!("Escape pressed, emitting escape-pressed event");
-                let _ = app.emit("escape-pressed", ());
+                // Target the Main overlay webview explicitly. `app.emit` can be
+                // delivered only to the focused Tauri window; when Home stays
+                // focused while the fullscreen overlay is visible on top, the
+                // overlay never saw escape-pressed (and no keydown reaches it),
+                // so Esc looked broken until a focus change re-routed events.
+                let mut delivered = false;
+                for label in [RewindWindowId::Main.label(), "main-window"] {
+                    if let Some(w) = app.get_webview_window(label) {
+                        if w.is_visible().unwrap_or(false) {
+                            let _ = app.emit_to(label, "escape-pressed", ());
+                            delivered = true;
+                            break;
+                        }
+                    }
+                }
+                if !delivered {
+                    let _ = app.emit("escape-pressed", ());
+                }
             })) {
                 tracing::error!("panic in escape handler: {:?}", e);
             }
@@ -1927,6 +2003,11 @@ pub fn register_window_shortcuts(app_handle: tauri::AppHandle) -> Result<(), Str
     Ok(())
 }
 
+static WINDOW_SHORTCUTS_GEN: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static MAIN_CLOSE_IN_PROGRESS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Unregister window-specific shortcuts when main window is hidden.
 /// Only unregisters Escape and arrow keys. Global shortcuts (search, show, chat)
 /// are NOT touched here — they must persist across window show/hide cycles.
@@ -1948,6 +2029,82 @@ pub fn unregister_window_shortcuts(app_handle: tauri::AppHandle) -> Result<(), S
 
     info!("Window-specific shortcuts unregistered");
     Ok(())
+}
+
+/// Register Escape and return the current generation token. Any delayed
+/// unregister should check this token before unregistering to avoid races.
+pub(crate) fn register_window_shortcuts_with_generation(
+    app_handle: tauri::AppHandle,
+) -> Result<u64, String> {
+    register_window_shortcuts(app_handle.clone())?;
+    let gen = WINDOW_SHORTCUTS_GEN
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        .saturating_add(1);
+    info!("shortcut-sync: register generation bumped to {}", gen);
+    Ok(gen)
+}
+
+pub(crate) fn current_window_shortcuts_generation() -> u64 {
+    WINDOW_SHORTCUTS_GEN.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+pub(crate) fn set_main_close_in_progress(in_progress: bool) {
+    MAIN_CLOSE_IN_PROGRESS.store(in_progress, std::sync::atomic::Ordering::SeqCst);
+    info!("shortcut-sync: main_close_in_progress={}", in_progress);
+}
+
+pub(crate) fn is_main_close_in_progress() -> bool {
+    MAIN_CLOSE_IN_PROGRESS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Unregister only if no newer register happened after `expected_gen`.
+pub(crate) fn unregister_window_shortcuts_if_generation_unchanged(
+    app_handle: tauri::AppHandle,
+    expected_gen: u64,
+    reason: &str,
+) -> Result<(), String> {
+    let current = WINDOW_SHORTCUTS_GEN.load(std::sync::atomic::Ordering::SeqCst);
+    if current != expected_gen {
+        info!(
+            "shortcut-sync: skip unregister (reason={}, expected_gen={}, current_gen={})",
+            reason, expected_gen, current
+        );
+        return Ok(());
+    }
+    unregister_window_shortcuts(app_handle)
+}
+
+/// True if any Tauri webview in this process currently holds keyboard focus.
+/// Used on Windows/Linux to tell "focus left Main for another app" from
+/// "focus moved to Home while overlay stays visible".
+pub(crate) fn any_screenpipe_webview_has_focus(app: &tauri::AppHandle) -> bool {
+    app.webview_windows()
+        .values()
+        .any(|w| w.is_focused().unwrap_or(false))
+}
+
+pub(crate) fn main_overlay_is_visible(app: &tauri::AppHandle) -> bool {
+    for label in [RewindWindowId::Main.label(), "main-window"] {
+        if let Some(w) = app.get_webview_window(label) {
+            if w.is_visible().unwrap_or(false) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Re-register Escape when a non-Main window (e.g. Home) gains focus while the
+/// overlay is still shown — otherwise Main's blur path unregisters Escape and
+/// Esc stops working until Main is focused again.
+pub(crate) fn register_window_shortcuts_if_main_visible(app: tauri::AppHandle) {
+    if is_main_close_in_progress() {
+        info!("shortcut-sync: skip register_if_visible (reason=main_close_in_progress)");
+        return;
+    }
+    if main_overlay_is_visible(&app) {
+        let _ = register_window_shortcuts_with_generation(app);
+    }
 }
 
 /// Install a specific older version from R2. Downloads and installs via Tauri updater,

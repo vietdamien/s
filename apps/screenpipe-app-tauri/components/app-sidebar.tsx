@@ -79,7 +79,10 @@ export function AppSidebar({ children, collapsed = false, className }: AppSideba
   return (
     <div
       className={cn(
-        "border-r flex flex-col min-h-0 transition-all duration-300 overflow-x-hidden overflow-y-auto flex-shrink-0 pt-8",
+        // `relative` so callers can absolutely-position items into the
+        // top reservation area (e.g. the sidebar collapse icon next to
+        // the macOS traffic lights — Claude-style).
+        "relative border-r flex flex-col min-h-0 transition-all duration-300 overflow-x-hidden overflow-y-auto flex-shrink-0 pt-8",
         isTranslucent ? "vibrant-sidebar" : "bg-background",
         isTranslucent ? "vibrant-sidebar-border" : "border-border",
         collapsed ? SIDEBAR_WIDTH_COLLAPSED : SIDEBAR_WIDTH_EXPANDED,

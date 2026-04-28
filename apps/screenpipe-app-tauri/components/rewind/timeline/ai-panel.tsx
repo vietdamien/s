@@ -13,6 +13,10 @@ import { useTimelineSelection } from "@/lib/hooks/use-timeline-selection";
 import { Agent } from "./agents";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import {
+	mountAgentEventBus,
+	registerDefault as registerAgentDefault,
+} from "@/lib/events/bus";
+import {
 	reducePiEvent,
 	createInitialState,
 	formatPiMessage,
@@ -297,14 +301,19 @@ export function AIPanel({
 	const piMessageStateRef = useRef(createInitialState());
 	const piStreamingRef = useRef(false);
 
-	// Listen for Pi events to stream responses in ai-panel
+	// Listen for Pi events on the agent_event bus to stream responses
+	// in ai-panel. Filters source==pi + the legacy "chat" sessionId
+	// reserved by this panel's reducer.
 	useEffect(() => {
-		let unlisten: UnlistenFn | null = null;
-		const setup = async () => {
-			unlisten = await listen<any>("pi_event", (event) => {
+		let off: (() => void) | null = null;
+		let cancelled = false;
+		void mountAgentEventBus().then(() => {
+			if (cancelled) return;
+			off = registerAgentDefault((envelope) => {
 				if (!piStreamingRef.current) return;
-				const { sessionId, event: piEvent } = event.payload;
-				if (sessionId !== "chat") return;
+				if (envelope.source !== "pi") return;
+				if (envelope.sessionId !== "chat") return;
+				const piEvent = envelope.event as PiEvent;
 
 				const newState = reducePiEvent(piMessageStateRef.current, piEvent);
 				piMessageStateRef.current = newState;
@@ -321,9 +330,11 @@ export function AIPanel({
 					setIsStreaming(false);
 				}
 			});
+		});
+		return () => {
+			cancelled = true;
+			try { off?.(); } catch { /* ignore */ }
 		};
-		setup();
-		return () => { unlisten?.(); };
 	}, []);
 
 	const handleStopStreaming = async () => {

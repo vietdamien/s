@@ -1789,13 +1789,13 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                     CoreAudio system audio capture
                   </h3>
                   <p className="text-xs text-muted-foreground">
-                    Captures system audio via the CoreAudio Process Tap API (macOS 14.4+). Survives sleep/wake, lighter permission, and captures output routed to Bluetooth headsets (AirPods) that ScreenCaptureKit can't see. Falls back to ScreenCaptureKit automatically if unavailable. Restart recording after changing.
+                    Captures system audio via the CoreAudio Process Tap API (macOS 14.4+). Survives SCK display-enumeration failures after sleep/wake. <strong>Off by default</strong> — the Process Tap can't see audio from voice-processing apps (Zoom / Google Meet / Microsoft Teams), so turning it on will silently drop all meeting audio. Leave off unless you specifically need the sleep/wake resilience. Falls back to ScreenCaptureKit automatically if unavailable. Restart recording after changing.
                   </p>
                 </div>
               </div>
               <Switch
                 id="experimentalCoreaudioSystemAudio"
-                checked={Boolean(settings.experimentalCoreaudioSystemAudio ?? true)}
+                checked={Boolean(settings.experimentalCoreaudioSystemAudio ?? false)}
                 onCheckedChange={(checked) => handleSettingsChange({ experimentalCoreaudioSystemAudio: checked }, true)}
               />
             </div>

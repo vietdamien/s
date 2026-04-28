@@ -172,6 +172,14 @@ pub struct AppState {
     pub manual_meeting: Arc<tokio::sync::RwLock<Option<i64>>>,
     /// Browser extension bridge — relays JS eval requests to the connected extension
     pub browser_bridge: Arc<crate::routes::browser::BrowserBridge>,
+    /// Registry of every browser the agent can drive — user's real browser via
+    /// the extension, the app-managed owned webview, future remote-CDP backends.
+    /// `GET /connections/browsers` lists what's here.
+    pub browser_registry: Arc<screenpipe_connect::connections::browser::BrowserRegistry>,
+    /// The owned-browser instance (Tauri-managed webview) registered into
+    /// `browser_registry`. Held separately so the desktop shell can attach a
+    /// transport handle after the engine has started.
+    pub owned_browser: Arc<screenpipe_connect::connections::browser::OwnedBrowser>,
     /// When true, non-localhost requests require Authorization: Bearer <api_key>
     pub api_auth: bool,
     /// The API key to validate against (from SCREENPIPE_API_KEY or auth.json)
@@ -202,6 +210,11 @@ pub struct SCServer {
         Arc<DashMap<String, Arc<screenpipe_core::pipes::permissions::PipePermissions>>>,
     /// Shared manual meeting lock — pass in from binary so persister and server share the same state.
     pub manual_meeting: Option<Arc<tokio::sync::RwLock<Option<i64>>>>,
+    /// Owned browser instance — set by the desktop shell so it can attach an
+    /// OwnedWebviewHandle once the Tauri WebviewWindow is created. If unset,
+    /// the engine creates a default unattached instance and owned-browser
+    /// requests return 503 until a handle is wired up.
+    pub owned_browser: Option<Arc<screenpipe_connect::connections::browser::OwnedBrowser>>,
     /// Require auth for remote API access
     pub api_auth: bool,
     /// API key for remote auth validation
@@ -240,6 +253,7 @@ impl SCServer {
             power_manager: None,
             pipe_permissions: Arc::new(DashMap::new()),
             manual_meeting: None,
+            owned_browser: None,
             api_auth: false,
             api_auth_key: None,
             secret_store: None,
@@ -484,10 +498,32 @@ impl SCServer {
                 .clone()
                 .unwrap_or_else(|| Arc::new(tokio::sync::RwLock::new(None))),
             browser_bridge: crate::routes::browser::BrowserBridge::new(),
+            browser_registry: screenpipe_connect::connections::browser::BrowserRegistry::new(),
+            // Reuse the desktop-shell-supplied owned browser if present so its
+            // already-attached OwnedWebviewHandle survives. Otherwise fall back
+            // to a default unattached instance — useful for CLI / tests /
+            // headless deployments.
+            owned_browser: self.owned_browser.clone().unwrap_or_else(
+                screenpipe_connect::connections::browser::OwnedBrowser::default_instance,
+            ),
             api_auth: self.api_auth,
             api_auth_key: self.api_auth_key.clone(),
             secret_store: self.secret_store.clone(),
         });
+
+        // Populate the registry so /connections/browsers shows both kinds
+        // immediately. The user-browser is wired to the existing bridge;
+        // the owned-browser is a stub until the desktop shell attaches its
+        // OwnedWebviewHandle.
+        {
+            use screenpipe_connect::connections::browser::UserBrowser;
+            let user = UserBrowser::default_instance(app_state.browser_bridge.clone());
+            app_state.browser_registry.register(user).await;
+            app_state
+                .browser_registry
+                .register(app_state.owned_browser.clone())
+                .await;
+        }
 
         // Restrict CORS to localhost origins (Tauri webview + local development).
         // Remote origins are blocked to prevent malicious websites from making
@@ -748,7 +784,13 @@ impl SCServer {
 
         let router = router.nest(
             "/connections",
-            crate::connections_api::router(cm, wa, self.secret_store.clone()),
+            crate::connections_api::router(
+                cm,
+                wa,
+                self.secret_store.clone(),
+                app_state.browser_bridge.clone(),
+                app_state.browser_registry.clone(),
+            ),
         );
 
         // Power management routes (if power manager is available)
@@ -771,7 +813,11 @@ impl SCServer {
             .route("/ws/events", get(ws_events_handler))
             .route("/ws/health", get(ws_health_handler))
             .route("/ws/metrics", get(ws_metrics_handler))
-            // Browser extension bridge
+            // Browser extension bridge — DEPRECATED top-level paths.
+            // Canonical paths now live under /connections/browser/* (see connections_api.rs).
+            // These aliases stay in place because deployed Chrome extensions hardcode
+            // /browser/ws (packages/browser-extension/src/config.ts). Remove only after
+            // a coordinated extension update has shipped to all users.
             .route(
                 "/browser/ws",
                 get({
@@ -832,18 +878,11 @@ impl SCServer {
                 crate::routes::timezone::timestamp_middleware,
             ))
             .layer({
-                // API auth middleware — when api_auth is enabled,
-                // non-localhost requests must include a valid bearer token.
-                //
-                // Localhost is bypassed because the Tauri webview can't
-                // synchronously inject auth before React renders. Tauri's
-                // invoke() is async, so there's always a window where
-                // useEffect fires fetch calls before the key is available.
-                //
-                // Auth middleware: requires Bearer token for ALL requests (including
-                // localhost) when api_auth is enabled. The Tauri frontend injects the
-                // token via localFetch (loaded from get_local_api_config IPC on import).
-                // Health endpoint is exempt so status polling works before auth init.
+                // API auth middleware — when api_auth is enabled, ALL requests
+                // (including localhost) must include a valid bearer token.
+                // The Tauri frontend injects it via localFetch (key loaded once
+                // via get_local_api_config IPC). /health and a few other paths
+                // are exempt so polling works before the frontend has the key.
                 let auth_enabled = self.api_auth;
                 let auth_key = self.api_auth_key.clone();
                 axum::middleware::from_fn(

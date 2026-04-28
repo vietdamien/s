@@ -53,6 +53,7 @@ mod livetext;
 #[cfg(target_os = "macos")]
 mod livetext_ffi;
 mod oauth;
+mod owned_browser;
 mod permission_events;
 mod permissions;
 mod pi;
@@ -317,6 +318,45 @@ async fn is_server_running(app: AppHandle) -> Result<bool, String> {
 async fn main() {
     let _ = fix_path_env::fix();
 
+    // Refuse to launch while a `screenpipe db recover|cleanup` operation is in
+    // progress. The CLI writes ~/.screenpipe/.db_recovery.lock before doing
+    // anything destructive; if the user double-clicks the app icon mid-recovery,
+    // we'd otherwise race the swap and corrupt the DB again. The CLI heartbeats
+    // the lock every 30 s, so a fresh mtime means the op is genuinely live.
+    //
+    // Escape hatches (in order of preference):
+    //   1. `screenpipe db unlock` — friendly path
+    //   2. SCREENPIPE_IGNORE_DB_LOCK=1 env var — bypass on this launch only
+    //   3. `rm ~/.screenpipe/.db_recovery.lock` — manual
+    //
+    // See `crates/screenpipe-engine/src/cli/db.rs`.
+    if std::env::var("SCREENPIPE_IGNORE_DB_LOCK").ok().as_deref() != Some("1") {
+        let lock_path =
+            screenpipe_core::paths::default_screenpipe_data_dir().join(".db_recovery.lock");
+        if let Ok(metadata) = std::fs::metadata(&lock_path) {
+            let stale = metadata
+                .modified()
+                .ok()
+                .and_then(|m| m.elapsed().ok())
+                .map(|d| d.as_secs() > 3600)
+                .unwrap_or(false);
+            if stale {
+                let _ = std::fs::remove_file(&lock_path);
+            } else {
+                let body = std::fs::read_to_string(&lock_path).unwrap_or_default();
+                eprintln!(
+                    "screenpipe: a `screenpipe db ...` operation is in progress.\n\
+                     lock: {}\n\
+                     content: {}\n\
+                     options:\n  • wait for the op to finish, then re-open the app\n  • run `screenpipe db unlock` if you're sure it's stuck\n  • set SCREENPIPE_IGNORE_DB_LOCK=1 and retry to bypass this check",
+                    lock_path.display(),
+                    body.trim(),
+                );
+                std::process::exit(2);
+            }
+        }
+    }
+
     // Export the Windows root/CA cert stores to a PEM file and set
     // NODE_EXTRA_CA_CERTS before any bun/node subprocess can spawn. Fixes
     // "unable to verify the first certificate" on corporate networks where
@@ -381,7 +421,8 @@ async fn main() {
     let store_json = std::fs::read(&store_path).ok().and_then(|data| {
         if data.len() >= 8 && &data[..8] == b"SPSTORE1" {
             // Encrypted store — try to decrypt with keychain key
-            let key = match secrets::get_key() {
+            // Only attempt if encryption is enabled (file being encrypted is the signal)
+            let key = match secrets::get_key_if_encryption_enabled() {
                 secrets::KeyResult::Found(k) => k,
                 _ => return None,
             };
@@ -419,6 +460,30 @@ async fn main() {
                 send_default_pii: false,
                 server_name: Some("screenpipe-app".into()),
                 before_send: Some(std::sync::Arc::new(|mut event| {
+                    // Self-expiring Sentry reports. Each build stamps the
+                    // unix epoch seconds of its build time (see build.rs) and
+                    // we refuse to emit events once it's > 90 days old. This
+                    // is the "never get an error from an older version" lever:
+                    // users who never update gradually fall silent, so the
+                    // inbox reflects what's running on current releases
+                    // instead of a 6-month tail of ancient builds. 90d is
+                    // loose enough that even slow updaters stay reporting
+                    // for a full release cycle but tight enough that truly
+                    // stale installs age out.
+                    const SENTRY_REPORT_TTL_SECS: u64 = 90 * 24 * 60 * 60;
+                    let build_time: u64 = env!("SCREENPIPE_BUILD_UNIX_TIME")
+                        .parse()
+                        .unwrap_or(0);
+                    if build_time > 0 {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        if now.saturating_sub(build_time) > SENTRY_REPORT_TTL_SECS {
+                            return None;
+                        }
+                    }
+
                     fn strip_user_paths(s: &str) -> String {
                         let re_unix = regex::Regex::new(r"/Users/[^/\s]+").unwrap();
                         let re_win = regex::Regex::new(r"(?i)C:\\Users\\[^\\\s]+").unwrap();
@@ -428,12 +493,48 @@ async fn main() {
                     if let Some(ref mut msg) = event.message {
                         *msg = strip_user_paths(msg);
                     }
-                    // Filter out IndexedDB disconnect errors (APP-2E)
-                    // WKWebView's IndexedDB server crashes are handled via auto-reload
-                    // in layout.tsx — no need to report to Sentry
+
+                    // Noise filter: drop events whose root cause is a user
+                    // environment problem we can't fix from code. These were
+                    // cluttering the Sentry inbox and drowning real bugs.
+                    // Patterns compiled lazily and shared across calls to
+                    // avoid per-event regex recompilation overhead.
+                    static USER_ENV_PATTERNS: std::sync::OnceLock<Vec<regex::Regex>> =
+                        std::sync::OnceLock::new();
+                    let env_patterns = USER_ENV_PATTERNS.get_or_init(|| {
+                        [
+                            // WKWebView IndexedDB crash — handled via auto-reload in layout.tsx (APP-2E)
+                            r"Indexed Database server lost",
+                            // User hasn't granted screen recording permission (CLI-49 — 706 users)
+                            r"Screen recording permission denied",
+                            // Linux system library missing — distro-local, not our bug (APP-70)
+                            r"Failed to load ayatana-appindicator3 or appindicator3 dynamic library",
+                            // Broken Homebrew install — external dylib missing (CLI-NN)
+                            r"Library not loaded.*libx265\.",
+                            // Local DB corruption — user dropped/restored part of their db.sqlite
+                            r"no such table: main\.speaker_embeddings",
+                            // Concurrent DB access / user ran CLI while app was running
+                            r"database is locked",
+                            // Transient network failures on /api/app-update — offline / DNS blip (APP-8X)
+                            r"failed to check for updates: error sending request",
+                            r"failed to lookup address information",
+                            // WebView2 runtime errors — Windows user env (APP-8T, APP-91)
+                            r"WebView2 error: WindowsError",
+                            // Deepgram DNS / connectivity blips — already logged locally, not Sentry-worthy
+                            r"deepgram transcription failed: Cannot resolve audio transcription server",
+                        ]
+                        .into_iter()
+                        .filter_map(|p| regex::Regex::new(p).ok())
+                        .collect()
+                    });
+
+                    let matches_noise = |text: &str| env_patterns.iter().any(|re| re.is_match(text));
+                    if event.message.as_deref().map(matches_noise).unwrap_or(false) {
+                        return None;
+                    }
                     for val in event.exception.values.iter() {
                         if let Some(ref v) = val.value {
-                            if v.contains("Indexed Database server lost") {
+                            if matches_noise(v) {
                                 return None;
                             }
                         }
@@ -627,6 +728,7 @@ async fn main() {
                 commands::show_onboarding_window,
                 commands::get_keychain_status,
                 commands::enable_keychain_encryption,
+                commands::disable_keychain_encryption,
                 commands::open_search_window,
                 // Shortcut reminder commands
                 commands::show_shortcut_reminder,
@@ -691,6 +793,7 @@ async fn main() {
                 // Calendar commands
                 calendar::calendar_status,
                 calendar::calendar_authorize,
+                calendar::calendar_reset_permission,
                 calendar::calendar_get_events,
                 calendar::calendar_get_current_meeting,
                 // ICS Calendar commands
@@ -851,6 +954,7 @@ async fn main() {
         .invoke_handler(tauri::generate_handler![
             commands::is_enterprise_build_cmd,
             commands::get_local_api_config,
+            commands::regenerate_api_auth_key,
             commands::get_enterprise_license_key,
             enterprise_policy::set_enterprise_policy,
             commands::save_enterprise_license_key,
@@ -867,6 +971,9 @@ async fn main() {
             permissions::check_microphone_permission,
             permissions::check_screen_recording_permission,
             permissions::check_accessibility_permission_cmd,
+            owned_browser::owned_browser_set_bounds,
+            owned_browser::owned_browser_navigate,
+            owned_browser::owned_browser_hide,
             permissions::reset_and_request_permission,
             permissions::get_missing_permissions,
             permissions::check_arc_installed,
@@ -901,6 +1008,7 @@ async fn main() {
             commands::show_onboarding_window,
             commands::get_keychain_status,
             commands::enable_keychain_encryption,
+            commands::disable_keychain_encryption,
             commands::open_search_window,
             // Shortcut reminder commands
             commands::show_shortcut_reminder,
@@ -972,6 +1080,7 @@ async fn main() {
             // Calendar commands
             calendar::calendar_status,
             calendar::calendar_authorize,
+            calendar::calendar_reset_permission,
             calendar::calendar_get_events,
             calendar::calendar_get_current_meeting,
             // ICS Calendar commands
@@ -1455,24 +1564,28 @@ async fn main() {
                 let capture_arc = recording_state.capture.clone();
                 let is_starting_clone = recording_state.is_starting.clone();
 
-                // Pipe output callback
+                // Pipe output callback. Stage 5: legacy `pipe_event`
+                // topic dropped — every pipe stdout line goes out on
+                // `agent_event` with sessionId `pipe:<name>:<execId>`.
                 let app_for_pipe = app_handle.clone();
+                // Separate clone for the owned-browser install path — the
+                // on_pipe_output closure below captures app_for_pipe by
+                // move, so we need a distinct handle that survives into
+                // the server thread.
+                let app_for_owned = app_handle.clone();
                 let on_pipe_output: Option<screenpipe_core::pipes::OnPipeOutputLine> = Some(
                     std::sync::Arc::new(move |pipe_name: &str, exec_id: i64, line: &str| {
-                        let payload = if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(line) {
-                            serde_json::json!({
-                                "pipeName": pipe_name,
-                                "executionId": exec_id,
-                                "event": parsed,
-                            })
+                        let inner = if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(line) {
+                            parsed
                         } else {
-                            serde_json::json!({
-                                "pipeName": pipe_name,
-                                "executionId": exec_id,
-                                "event": { "type": "raw_line", "text": line },
-                            })
+                            serde_json::json!({ "type": "raw_line", "text": line })
                         };
-                        let _ = app_for_pipe.emit("pipe_event", &payload);
+                        let unified = serde_json::json!({
+                            "source": "pipe",
+                            "sessionId": format!("pipe:{}:{}", pipe_name, exec_id),
+                            "event": inner,
+                        });
+                        let _ = app_for_pipe.emit("agent_event", &unified);
                     }),
                 );
 
@@ -1550,8 +1663,38 @@ async fn main() {
 
                             info!("Starting server core + capture on dedicated runtime...");
 
+                            // Owned-browser: create the connect-side instance now so the
+                            // engine can register it in the BrowserRegistry on startup.
+                            // Webview build is async — kick it off in the background and
+                            // attach the handle once the WebviewWindow is ready. Until
+                            // then, /connections/browsers/owned-default/eval returns 503.
+                            let owned_browser =
+                                screenpipe_connect::connections::browser::OwnedBrowser::default_instance();
+                            {
+                                let owned_for_install = owned_browser.clone();
+                                let app_for_install = app_for_owned.clone();
+                                let data_dir_for_install = config.data_dir.clone();
+                                tauri::async_runtime::spawn(async move {
+                                    match crate::owned_browser::install_with_retry(&app_for_install, data_dir_for_install).await {
+                                        Ok(handle) => {
+                                            owned_for_install.attach(handle).await;
+                                            info!("owned-browser ready");
+                                        }
+                                        Err(e) => {
+                                            warn!("owned-browser install failed: {e} — agent will see ready=false");
+                                        }
+                                    }
+                                });
+                            }
+
                             // Phase 1: Start server core
-                            let server = match server_core::ServerCore::start(&config, on_pipe_output).await {
+                            let server = match server_core::ServerCore::start(
+                                &config,
+                                on_pipe_output,
+                                Some(owned_browser),
+                            )
+                            .await
+                            {
                                 Ok(s) => s,
                                 Err(e) => {
                                     error!("Failed to start server core: {}", e);

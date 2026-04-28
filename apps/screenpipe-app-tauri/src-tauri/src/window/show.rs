@@ -275,6 +275,12 @@ impl ShowRewindWindow {
                 }
                 window.unminimize().ok();
                 window.show().ok();
+                #[cfg(target_os = "windows")]
+                if let Err(e) =
+                    crate::windows_overlay::center_window_mode_on_cursor_monitor(window, app)
+                {
+                    tracing::warn!("Failed to center window-mode overlay: {}", e);
+                }
                 window.set_focus().ok();
                 let _ = app.emit("window-focused", true);
             }
@@ -715,6 +721,18 @@ impl ShowRewindWindow {
                                         tracing::error!("Failed to set display affinity: {}", e);
                                     }
                                     win.show().ok();
+                                    #[cfg(target_os = "windows")]
+                                    if let Err(e) =
+                                        crate::windows_overlay::center_window_mode_on_cursor_monitor(
+                                            &win,
+                                            &app_clone,
+                                        )
+                                    {
+                                        tracing::warn!(
+                                            "Failed to center new window-mode overlay: {}",
+                                            e
+                                        );
+                                    }
                                     win.set_focus().ok();
                                     let _ = app_clone.emit("window-focused", true);
                                 }
@@ -817,10 +835,44 @@ impl ShowRewindWindow {
                                                 }
                                             });
                                         }
+                                        #[cfg(not(target_os = "macos"))]
+                                        {
+                                            // Only keep Escape when the overlay is still visible.
+                                            // Otherwise Home (or another app window) can hold focus while
+                                            // the overlay is already gone — returning here would skip
+                                            // blur unregister and leave the global Escape hook stuck on.
+                                            if crate::commands::any_screenpipe_webview_has_focus(&app)
+                                                && crate::commands::main_overlay_is_visible(&app)
+                                            {
+                                                info!(
+                                                    "main-window blur: another screenpipe window has focus, keep Escape registered"
+                                                );
+                                                let _ = app.emit("window-focused", false);
+                                                return;
+                                            }
+                                        }
+                                        // Stale blur debounce: close_window already set MAIN_CLOSE_IN_PROGRESS
+                                        // and scheduled unregister — do not schedule a second unregister here.
+                                        if crate::commands::is_main_close_in_progress() {
+                                            let _ = app.emit("window-focused", false);
+                                            return;
+                                        }
                                         // Unregister window shortcuts on focus loss (#2219)
+                                        info!(
+                                            "shortcut-sync: scheduling unregister (reason=main_window_blur_debounce)"
+                                        );
+                                        let expected_gen =
+                                            crate::commands::current_window_shortcuts_generation();
                                         let app3 = app.clone();
                                         std::thread::spawn(move || {
-                                            let _ = crate::commands::unregister_window_shortcuts(app3);
+                                            info!(
+                                                "shortcut-sync: unregister execute (reason=main_window_blur_debounce)"
+                                            );
+                                            let _ = crate::commands::unregister_window_shortcuts_if_generation_unchanged(
+                                                app3,
+                                                expected_gen,
+                                                "main_window_blur_debounce",
+                                            );
                                         });
                                         let _ = app.emit("window-focused", false);
                                     });
@@ -851,7 +903,7 @@ impl ShowRewindWindow {
                                     // Re-register window shortcuts on focus gain
                                     let app_reg = app_clone.clone();
                                     std::thread::spawn(move || {
-                                        let _ = crate::commands::register_window_shortcuts(app_reg);
+                                        let _ = crate::commands::register_window_shortcuts_with_generation(app_reg);
                                     });
                                     let _ = app_clone.emit("window-focused", true);
                                 }
@@ -1192,11 +1244,40 @@ impl ShowRewindWindow {
                                             }
                                         });
                                     }
+                                    #[cfg(target_os = "windows")]
+                                    {
+                                        if crate::commands::any_screenpipe_webview_has_focus(&app)
+                                            && crate::commands::main_overlay_is_visible(&app)
+                                        {
+                                            info!(
+                                                "Main overlay blur: another screenpipe window has focus, keep Escape registered"
+                                            );
+                                            let _ = app.emit("window-focused", false).ok();
+                                            return;
+                                        }
+                                    }
+                                    // Stale debounce after close_window: same as main-window path (#2219).
+                                    if crate::commands::is_main_close_in_progress() {
+                                        let _ = app.emit("window-focused", false).ok();
+                                        return;
+                                    }
                                     // Unregister window-specific shortcuts (arrows, Escape)
                                     // so they don't steal keys from other apps (#2219)
+                                    info!(
+                                        "shortcut-sync: scheduling unregister (reason=main_overlay_blur_debounce)"
+                                    );
+                                    let expected_gen =
+                                        crate::commands::current_window_shortcuts_generation();
                                     let app3 = app.clone();
                                     std::thread::spawn(move || {
-                                        let _ = crate::commands::unregister_window_shortcuts(app3);
+                                        info!(
+                                            "shortcut-sync: unregister execute (reason=main_overlay_blur_debounce)"
+                                        );
+                                        let _ = crate::commands::unregister_window_shortcuts_if_generation_unchanged(
+                                            app3,
+                                            expected_gen,
+                                            "main_overlay_blur_debounce",
+                                        );
                                     });
                                     let _ = app.emit("window-focused", false).ok();
                                 });
@@ -1225,7 +1306,7 @@ impl ShowRewindWindow {
                                 // Re-register window-specific shortcuts on focus gain
                                 let app_reg = app_clone.clone();
                                 std::thread::spawn(move || {
-                                    let _ = crate::commands::register_window_shortcuts(app_reg);
+                                    let _ = crate::commands::register_window_shortcuts_with_generation(app_reg);
                                 });
                                 let _ = app_clone.emit("window-focused", true).ok();
                             }
@@ -1274,6 +1355,63 @@ impl ShowRewindWindow {
                         })
                 };
                 let window = builder.build()?;
+
+                // When Main loses focus to Home, Main's debounce used to unregister Escape
+                // while the overlay stayed visible. Re-register on Home focus; unregister
+                // when Home blurs and no screenpipe window has focus (user left the app).
+                #[cfg(not(target_os = "macos"))]
+                {
+                    use std::sync::atomic::{AtomicBool, Ordering};
+                    use std::sync::Arc;
+                    use std::time::Duration;
+                    let app_h = app.clone();
+                    let home_blur_cancel = Arc::new(AtomicBool::new(false));
+                    window.on_window_event(move |event| {
+                        if let tauri::WindowEvent::Focused(focused) = event {
+                            if !focused {
+                                home_blur_cancel.store(false, Ordering::SeqCst);
+                                let cancel = home_blur_cancel.clone();
+                                let app_c = app_h.clone();
+                                std::thread::spawn(move || {
+                                    std::thread::sleep(Duration::from_millis(300));
+                                    if cancel.load(Ordering::SeqCst) {
+                                        return;
+                                    }
+                                    if crate::commands::any_screenpipe_webview_has_focus(&app_c) {
+                                        return;
+                                    }
+                                    if crate::commands::is_main_close_in_progress() {
+                                        return;
+                                    }
+                                    let expected_gen =
+                                        crate::commands::current_window_shortcuts_generation();
+                                    let app2 = app_c.clone();
+                                    std::thread::spawn(move || {
+                                        info!(
+                                            "shortcut-sync: unregister execute (reason=home_blur_no_screenpipe_focus)"
+                                        );
+                                        let _ = crate::commands::unregister_window_shortcuts_if_generation_unchanged(
+                                            app2,
+                                            expected_gen,
+                                            "home_blur_no_screenpipe_focus",
+                                        );
+                                    });
+                                });
+                            } else {
+                                home_blur_cancel.store(true, Ordering::SeqCst);
+                                let app_c = app_h.clone();
+                                std::thread::spawn(move || {
+                                    info!(
+                                        "shortcut-sync: register_if_visible execute (reason=home_focus)"
+                                    );
+                                    crate::commands::register_window_shortcuts_if_main_visible(
+                                        app_c,
+                                    );
+                                });
+                            }
+                        }
+                    });
+                }
 
                 // Disable WKWebView's native scroll so wheel events reach JavaScript
                 // (needed for embedded timeline scroll gestures)

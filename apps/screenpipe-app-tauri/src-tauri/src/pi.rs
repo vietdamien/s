@@ -1011,8 +1011,15 @@ fn resolve_screenpipe_model(requested: &str, provider: &str) -> String {
     base.to_string()
 }
 
-/// Maximum number of concurrent Pi sessions before evicting old ones.
-const MAX_PI_SESSIONS: usize = 4;
+/// Soft cap on concurrent Pi sessions. Each session is its own bun + node
+/// subprocess holding ~150–300 MB RSS plus a live LLM connection, so we
+/// guard against accidental fork-bombs (a misbehaving caller spawning
+/// hundreds of sessions). Originally 4, raised to 20 on 2026-04-24 because
+/// 4 was too small for normal multi-tab chat use — opening a 5th tab would
+/// silently kill the least-recently-active session mid-stream, which was
+/// confusing UX. 20 leaves enough headroom that real users won't hit it
+/// while still preventing a runaway loop from melting the machine.
+const MAX_PI_SESSIONS: usize = 20;
 
 /// Core Pi start logic — callable from both Tauri commands and Rust boot code.
 pub async fn pi_start_inner(
@@ -1086,19 +1093,53 @@ pub async fn pi_start_inner(
     // Only kill orphans when pool has no live sessions (app startup scenario)
     kill_orphan_pi_processes(any_alive);
 
-    // Evict least-recently-active non-"chat" session if at capacity
+    // Evict least-recently-active idle session if at capacity. Two safety
+    // properties beyond the prior LRU-only scheme:
+    //   1. Skip sessions with in-flight RPC responses — those are mid-turn
+    //      (streaming a reply, running a tool). Killing them mid-stream is
+    //      a worse UX than refusing to open a new session.
+    //   2. Emit `pi_session_evicted` so the UI can reflect the loss instead
+    //      of the chat tab silently going dark. Frontend listens, marks the
+    //      tab as closed and explains why.
+    // The "chat" key (legacy singleton chat session) and the requesting sid
+    // remain exempt — same as before.
     if pool.sessions.len() >= MAX_PI_SESSIONS && !pool.sessions.contains_key(&sid) {
         let evict_key = pool
             .sessions
             .iter()
-            .filter(|(k, _)| k.as_str() != "chat" && k.as_str() != sid.as_str())
+            .filter(|(k, m)| {
+                k.as_str() != "chat"
+                    && k.as_str() != sid.as_str()
+                    && m.pending_responses
+                        .lock()
+                        .map(|r| r.is_empty())
+                        .unwrap_or(true)
+            })
             .min_by_key(|(_, m)| m.last_activity)
             .map(|(k, _)| k.clone());
         if let Some(key) = evict_key {
-            info!("Evicting Pi session '{}' to make room for '{}'", key, sid);
+            info!("Evicting idle Pi session '{}' to make room for '{}'", key, sid);
             if let Some(mut m) = pool.sessions.remove(&key) {
                 m.stop();
             }
+            // Stage 5: legacy `pi_session_evicted` topic dropped.
+            // Consumers read from `agent_session_evicted` via the bus.
+            let _ = app.emit(
+                "agent_session_evicted",
+                serde_json::json!({
+                    "sessionId": key,
+                    "source": "pi",
+                    "reason": "pool_full",
+                }),
+            );
+        } else {
+            // Every session in the pool is busy. Refuse rather than kill a
+            // streaming session — caller surfaces a "too many active chats"
+            // toast, user can close one manually.
+            return Err(format!(
+                "pi pool full ({} active sessions, all busy) — close one before opening a new chat",
+                MAX_PI_SESSIONS
+            ));
         }
     }
 
@@ -1291,6 +1332,26 @@ pub async fn pi_start_inner(
         cmd.env("BASH_ENV", p);
     }
 
+    // Privacy filter: if the user enabled the toggle in chat, set the env
+    // var the shim reads so every `curl .../search*` gets rewritten with
+    // `filter_pii=1`. Pro-gated client-side — non-pro can't flip the UI
+    // toggle so this branch won't fire for them.
+    if let Some(home) = dirs::home_dir() {
+        let store_path = home.join(".screenpipe").join("store.bin");
+        if let Ok(data) = std::fs::read_to_string(&store_path) {
+            if let Ok(store) = serde_json::from_str::<serde_json::Value>(&data) {
+                let settings = store.get("settings").unwrap_or(&store);
+                if settings
+                    .get("piPrivacyFilter")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
+                    cmd.env("SCREENPIPE_FILTER_PII", "1");
+                }
+            }
+        }
+    }
+
     // Pass the user's API key as env var for non-screenpipe providers
     if let Some(ref config) = provider_config {
         // ChatGPT OAuth: inject token from secret store (no api_key in config)
@@ -1479,10 +1540,17 @@ pub async fn pi_start_inner(
                             }
                         }
                     }
-                    // Always emit as Tauri event too (frontend may need response events)
-                    let tagged = json!({ "sessionId": sid_clone, "event": event });
-                    if let Err(e) = app_handle.emit("pi_event", &tagged) {
-                        error!("Failed to emit pi_event: {}", e);
+                    // Frontend subscribes via the agent-event bus
+                    // (`apps/screenpipe-app-tauri/lib/events/bus.ts`).
+                    // Stage 5 cleanup: legacy `pi_event` topic removed
+                    // — every consumer now reads from `agent_event`.
+                    let unified = json!({
+                        "source": "pi",
+                        "sessionId": sid_clone,
+                        "event": event,
+                    });
+                    if let Err(e) = app_handle.emit("agent_event", &unified) {
+                        error!("Failed to emit agent_event: {}", e);
                     }
                 }
                 None => {
@@ -1508,9 +1576,15 @@ pub async fn pi_start_inner(
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
+            // Stage 5 cleanup: legacy `pi_terminated` topic removed.
+            // Consumers read from `agent_terminated` via the bus.
             let _ = app_handle.emit(
-                "pi_terminated",
-                json!({ "sessionId": sid_clone, "pid": pid }),
+                "agent_terminated",
+                json!({
+                    "sessionId": sid_clone,
+                    "source": "pi",
+                    "pid": pid,
+                }),
             );
         } else {
             debug!("Pi stdout reader: pi_terminated already emitted for this session, skipping");
@@ -1533,9 +1607,15 @@ pub async fn pi_start_inner(
                         "Pi stderr JSON (session {}): type={}",
                         sid_stderr, event_type
                     );
-                    let tagged = json!({ "sessionId": sid_stderr, "event": event });
-                    if let Err(e) = app_handle.emit("pi_event", &tagged) {
-                        error!("Failed to emit pi_event from stderr: {}", e);
+                    // Stage 5: stderr JSON forwarded on the unified bus
+                    // (legacy `pi_event` topic dropped).
+                    let unified = json!({
+                        "source": "pi",
+                        "sessionId": sid_stderr,
+                        "event": event,
+                    });
+                    if let Err(e) = app_handle.emit("agent_event", &unified) {
+                        error!("Failed to emit agent_event from stderr: {}", e);
                     }
                     if let Err(e) = app_handle.emit("pi_output", &line) {
                         error!("Failed to emit pi_output from stderr: {}", e);

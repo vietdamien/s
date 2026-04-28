@@ -296,8 +296,6 @@ mod tests {
     #[tokio::test]
     async fn test_poll_power_state_returns() {
         // Just verify it doesn't panic — actual values depend on hardware
-        let state = poll_power_state().await;
-        // on_ac should be a valid bool (always true)
-        assert!(state.on_ac || !state.on_ac);
+        let _ = poll_power_state().await;
     }
 }

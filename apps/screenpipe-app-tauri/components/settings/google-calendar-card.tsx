@@ -32,7 +32,7 @@ interface CalendarEventItem {
   isAllDay: boolean;
 }
 
-export function GoogleCalendarCard() {
+export function GoogleCalendarCard({ onConnected, onDisconnected }: { onConnected?: () => void; onDisconnected?: () => void } = {}) {
   const [connected, setConnected] = useState(false);
   const [email, setEmail] = useState<string | null>(null);
   const [isConnecting, setIsConnecting] = useState(false);
@@ -139,6 +139,7 @@ export function GoogleCalendarCard() {
         try {
           localStorage?.setItem("google-calendar-enabled", "true");
         } catch {}
+        onConnected?.();
       }
     } catch (e) {
       console.error("google calendar oauth failed:", e);
@@ -155,6 +156,7 @@ export function GoogleCalendarCard() {
       setEmail(null);
       setUpcomingEvents([]);
       posthog.capture("google_calendar_disconnected");
+      onDisconnected?.();
     } catch (e) {
       console.error("failed to disconnect google calendar:", e);
     }

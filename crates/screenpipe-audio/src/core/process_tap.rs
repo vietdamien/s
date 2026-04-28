@@ -85,14 +85,42 @@ struct TapCallbackCtx {
     is_disconnected: Arc<AtomicBool>,
 }
 
-// Diagnostic counters — report callback rate + peak amplitude once per
-// second when `screenpipe_audio::core::process_tap=debug` is enabled.
-// Stays silent at default log level. Lets us tell from a user's log whether
-// the tap "isn't firing" vs "fires but captures zeros" vs "captures real
-// audio" without forcing the user to rebuild with extra instrumentation.
+// Diagnostic counters — report callback rate + peak amplitude at INFO level
+// so the data is visible in every user's default log. Lets us tell from a
+// support log whether the tap "isn't firing" vs "fires but captures zeros"
+// vs "captures real audio" without forcing a debug rebuild.
+//
+// Callbacks also feed the silence watchdog in the spawn thread, which
+// triggers a rebuild if the tap delivers only zeros for too long (typical
+// symptom when the aggregate's sub-device goes idle because the user's
+// per-app output routing bypasses the system default).
 static TAP_CALLBACKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static TAP_LAST_LOG_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static TAP_MAX_AMP_BITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+// Rolling peak for the silence watchdog. Separate from TAP_MAX_AMP_BITS
+// (which is zeroed each log tick) so the spawn thread can observe peak
+// amplitude across a longer window independently of log cadence.
+static TAP_WATCHDOG_AMP_BITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static TAP_WATCHDOG_CALLBACKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Monotonic max update for the atomic peak-amplitude trackers. f32 values
+/// are non-negative (callers pass abs()), so bit-ordering matches numeric
+/// ordering and CAS is safe.
+#[inline]
+fn bump_max_amp(slot: &std::sync::atomic::AtomicU32, value: f32, value_bits: u32) {
+    loop {
+        let cur_bits = slot.load(Ordering::Relaxed);
+        if value <= f32::from_bits(cur_bits) {
+            return;
+        }
+        if slot
+            .compare_exchange(cur_bits, value_bits, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            return;
+        }
+    }
+}
 
 extern "C" fn tap_io_proc(
     _device: ca::Device,
@@ -104,6 +132,7 @@ extern "C" fn tap_io_proc(
     ctx: Option<&mut TapCallbackCtx>,
 ) -> os::Status {
     TAP_CALLBACKS.fetch_add(1, Ordering::Relaxed);
+    TAP_WATCHDOG_CALLBACKS.fetch_add(1, Ordering::Relaxed);
 
     let ctx = match ctx {
         Some(c) => c,
@@ -131,42 +160,28 @@ extern "C" fn tap_io_proc(
     // always >= 0 and compare-ordering works in that half of the float range.
     let local_max = samples.iter().copied().fold(0.0f32, |a, b| a.max(b.abs()));
     let local_max_bits = local_max.to_bits();
-    loop {
-        let cur_bits = TAP_MAX_AMP_BITS.load(Ordering::Relaxed);
-        if f32::from_bits(local_max_bits) <= f32::from_bits(cur_bits) {
-            break;
-        }
-        if TAP_MAX_AMP_BITS
-            .compare_exchange(
-                cur_bits,
-                local_max_bits,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            )
-            .is_ok()
-        {
-            break;
-        }
-    }
+    bump_max_amp(&TAP_MAX_AMP_BITS, local_max, local_max_bits);
+    bump_max_amp(&TAP_WATCHDOG_AMP_BITS, local_max, local_max_bits);
 
-    // ~1s throttled log. `debug!` is a no-op when the module's level is
-    // below debug, so the per-call syscall to SystemTime::now() here is
-    // the only real overhead — call rate is ~200Hz which is negligible.
+    // Throttled log every 10s, emitted at INFO so it lands in every user's
+    // default log. The per-callback SystemTime::now() syscall is the only
+    // real overhead; tap callback rate is ~200Hz which is negligible.
     let now_ns = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
     let last = TAP_LAST_LOG_NS.load(Ordering::Relaxed);
-    if now_ns.saturating_sub(last) > 1_000_000_000
+    if now_ns.saturating_sub(last) > 10_000_000_000
         && TAP_LAST_LOG_NS
             .compare_exchange(last, now_ns, Ordering::Relaxed, Ordering::Relaxed)
             .is_ok()
     {
         let count = TAP_CALLBACKS.swap(0, Ordering::Relaxed);
         let max_amp = f32::from_bits(TAP_MAX_AMP_BITS.swap(0, Ordering::Relaxed));
-        debug!(
-            "[tap_io_proc] {} callbacks/s, {} samples/call, peak_amp={:.4} ch={}",
-            count, sample_count, max_amp, ctx.channels
+        let rate = count as f64 / 10.0;
+        info!(
+            "[tap_io_proc] {:.1} callbacks/s over 10s, {} samples/call, peak_amp={:.5}, ch={}",
+            rate, sample_count, max_amp, ctx.channels
         );
     }
 
@@ -322,8 +337,57 @@ pub fn spawn_process_tap_capture(
         // enough that we don't hammer CoreAudio.
         const POLL: std::time::Duration = std::time::Duration::from_millis(500);
 
+        // Silence watchdog — if the tap runs for this long with zero non-
+        // silent audio (AND the callback is firing, so it's not just that
+        // the IO proc stalled), rebuild the aggregate once. This catches
+        // the "tap anchored to BuiltInSpeaker while all app audio is
+        // routed to AirPods" failure mode that Ruark hit on v2.4.46 — the
+        // tap runs happily, the callback fires, but every buffer is
+        // zeros because the aggregate's sub-device has no signal and the
+        // global-tap → aggregate delivery path stays mute. See the
+        // pseudo-silent-for-a-whole-call reports around 2026-04-24.
+        const WATCHDOG_SILENCE_SECS: u64 = 45;
+        // Peak f32 amplitude below this counts as "silent enough to
+        // rebuild". Legit call audio peaks at ~0.05–0.5; this threshold
+        // only fires on truly zeroed buffers, not quiet speech.
+        const SILENCE_AMP_EPS: f32 = 0.002;
+        // After a rebuild, give the tap this long to deliver real audio
+        // before we consider another rebuild. Avoids ping-pong when the
+        // actual cause is that nothing is playing (e.g. user isn't in a
+        // call) rather than a broken anchor.
+        const REBUILD_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
+
+        let mut silence_started: Option<std::time::Instant> = None;
+        let mut last_rebuild: Option<std::time::Instant> = None;
+
         while !is_disconnected.load(Ordering::Relaxed) {
             std::thread::sleep(POLL);
+
+            // Watchdog: drain the peak-amp window and decide if we're silent.
+            let window_callbacks = TAP_WATCHDOG_CALLBACKS.swap(0, Ordering::Relaxed);
+            let window_peak = f32::from_bits(TAP_WATCHDOG_AMP_BITS.swap(0, Ordering::Relaxed));
+            let got_real_audio = window_callbacks > 0 && window_peak > SILENCE_AMP_EPS;
+
+            if got_real_audio {
+                silence_started = None;
+            } else if window_callbacks > 0 {
+                // Callback IS firing — buffers are just silent. Start (or
+                // continue) the silence window.
+                silence_started.get_or_insert_with(std::time::Instant::now);
+            }
+            // If window_callbacks == 0, the IO proc isn't firing at all —
+            // that's a different failure (handled by the next default-
+            // output check and/or logged by the main diagnostic tick).
+            // We don't trigger rebuild on pure stall because the existing
+            // device-change path already covers it, and rebuilding when
+            // the device is genuinely asleep will just fail.
+
+            let should_rebuild_for_silence = silence_started
+                .map(|t| t.elapsed().as_secs() >= WATCHDOG_SILENCE_SECS)
+                .unwrap_or(false)
+                && last_rebuild
+                    .map(|t| t.elapsed() >= REBUILD_COOLDOWN)
+                    .unwrap_or(true);
 
             // Check the current default output device UID.
             let new_uid = match ca::System::default_output_device().and_then(|d| d.uid()) {
@@ -335,14 +399,27 @@ pub fn spawn_process_tap_capture(
                 }
             };
 
-            if new_uid == current_uid {
+            let should_rebuild_for_switch = new_uid != current_uid;
+
+            if !should_rebuild_for_switch && !should_rebuild_for_silence {
                 continue;
             }
 
-            info!(
-                "Default output changed ({} → {}), respawning Process Tap",
-                current_uid, new_uid
-            );
+            if should_rebuild_for_silence && !should_rebuild_for_switch {
+                warn!(
+                    "Process Tap delivered only silence for {}s on '{}' \
+                     (callbacks firing, peak_amp < {:.3}). This often means \
+                     the user's per-app audio routing (Zoom/Meet → AirPods) \
+                     bypasses the system default output the aggregate is \
+                     anchored to. Rebuilding capture.",
+                    WATCHDOG_SILENCE_SECS, current_uid, SILENCE_AMP_EPS
+                );
+            } else {
+                info!(
+                    "Default output changed ({} → {}), respawning Process Tap",
+                    current_uid, new_uid
+                );
+            }
 
             // Drop the old capture BEFORE building the new one. The old
             // aggregate device is still bound to the previous sub-device
@@ -355,6 +432,8 @@ pub fn spawn_process_tap_capture(
                     info!("Process Tap re-anchored to '{}'", uid);
                     current = Some(cap);
                     current_uid = uid;
+                    silence_started = None;
+                    last_rebuild = Some(std::time::Instant::now());
                 }
                 Err(e) => {
                     // Rebuild failed — most commonly because the new device
@@ -367,6 +446,7 @@ pub fn spawn_process_tap_capture(
                         new_uid, e
                     );
                     current_uid = new_uid;
+                    last_rebuild = Some(std::time::Instant::now());
                 }
             }
         }

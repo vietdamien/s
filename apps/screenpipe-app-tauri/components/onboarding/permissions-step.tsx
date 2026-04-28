@@ -5,7 +5,7 @@
 "use client";
 
 import React, { useState, useEffect, useRef, useCallback } from "react";
-import { Monitor, Mic, Keyboard, Globe, Lock, Check } from "lucide-react";
+import { Monitor, Mic, Keyboard, Globe, Check } from "lucide-react";
 import { commands } from "@/lib/utils/tauri";
 import { usePlatform } from "@/lib/hooks/use-platform";
 import { motion } from "framer-motion";
@@ -137,23 +137,6 @@ export default function PermissionsStep({
       macOnly: true,
       optional: true,
     },
-    {
-      id: "keychain",
-      icon: <Lock className="w-3.5 h-3.5" strokeWidth={1.5} />,
-      title: "Encrypt your secrets",
-      subtitle: "Stores API keys and tokens in the macOS Keychain, never on disk in plaintext",
-      check: async () => {
-        const res = await commands.getKeychainStatus();
-        if (res.status === "ok" && res.data.state === "enabled") return "granted";
-        if (res.status === "ok" && res.data.state === "unavailable") return "granted";
-        return "denied";
-      },
-      request: async () => {
-        await commands.enableKeychainEncryption();
-      },
-      macOnly: true, // Windows/Linux: auto-enabled below (no modal needed)
-      optional: true,
-    },
   ];
 
   // Filter permissions for this platform
@@ -201,14 +184,10 @@ export default function PermissionsStep({
     commands.getInstalledBrowsers().then(setInstalledBrowsers).catch(() => {});
   }, [isPlatformLoading]);
 
-  // Non-mac: auto-enable encryption (no modal on Windows/Linux) then skip
   useEffect(() => {
     if (isPlatformLoading) return;
     if (!isMac && !hasAdvancedRef.current) {
       hasAdvancedRef.current = true;
-      // Silently enable keychain encryption — Windows Credential Manager
-      // and Linux Secret Service don't show permission modals
-      commands.enableKeychainEncryption().catch(() => {});
       handleNextSlide();
     }
   }, [isMac, isPlatformLoading, handleNextSlide]);

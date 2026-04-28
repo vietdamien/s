@@ -4,29 +4,37 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use specta::Type;
 use std::path::Path;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, RwLock};
 use tauri::AppHandle;
 use tauri_plugin_store::StoreBuilder;
 use tracing::{error, warn};
+use screenpipe_secrets::keychain;
 
 /// Process-lifetime cache for the resolved API auth key.
 ///
 /// `to_recording_config` is a sync function called many times per second
 /// (frontend polls `local_api_context_from_app`). Resolving the key —
-/// which requires async I/O against `db.sqlite` — happens once in
-/// `recording::spawn_screenpipe` via `screenpipe_engine::auth_key::resolve_api_auth_key`,
+/// which requires async I/O against `db.sqlite` — happens once per
+/// recording start via `screenpipe_engine::auth_key::resolve_api_auth_key`,
 /// and the result is seeded here so every subsequent sync read is cheap and
 /// every caller agrees on the same value.
-static RESOLVED_API_AUTH_KEY: OnceLock<String> = OnceLock::new();
+///
+/// Uses RwLock (not OnceLock) so the key can be updated on every restart
+/// within the same process — OnceLock would silently ignore the second
+/// seed call and keep the original key forever.
+static RESOLVED_API_AUTH_KEY: RwLock<Option<String>> = RwLock::new(None);
 
-/// Seed the resolved API auth key. No-op after the first call.
+/// Seed the resolved API auth key. Overwrites any previously seeded value
+/// so that "Apply & Restart" picks up the new key on the next server start.
 pub fn seed_api_auth_key(key: String) {
-    let _ = RESOLVED_API_AUTH_KEY.set(key);
+    if let Ok(mut guard) = RESOLVED_API_AUTH_KEY.write() {
+        *guard = Some(key);
+    }
 }
 
 /// Read the resolved API auth key if it has been seeded.
 pub fn resolved_api_auth_key() -> Option<String> {
-    RESOLVED_API_AUTH_KEY.get().cloned()
+    RESOLVED_API_AUTH_KEY.read().ok()?.clone()
 }
 
 /// Magic header for encrypted store.bin files.
@@ -42,7 +50,9 @@ fn decrypt_store_file(path: &Path) {
     if data.len() < 8 || &data[..8] != STORE_MAGIC {
         return; // already plain JSON (or empty)
     }
-    let key = match secrets::get_key() {
+    // File is encrypted, so user must have encryption enabled
+    // Use get_key_if_encryption_enabled to prevent prompts if encryption is somehow disabled
+    let key = match secrets::get_key_if_encryption_enabled() {
         secrets::KeyResult::Found(k) => k,
         secrets::KeyResult::AccessDenied => {
             tracing::warn!(
@@ -110,10 +120,13 @@ fn encrypt_store_file(path: &Path) {
     if data.len() >= 8 && &data[..8] == STORE_MAGIC {
         return; // already encrypted
     }
-    let key = match secrets::get_or_create_key() {
-        Some(k) => k,
-        None => {
-            // Keychain access denied or unavailable — disable encryption
+    // Use read-only get_key() instead of get_or_create_key() to avoid triggering
+    // keychain modal on every store save. The key should already exist if encryption
+    // was enabled; if not, we just skip encryption and leave the file unencrypted.
+    let key = match keychain::get_key() {
+        keychain::KeyResult::Found(k) => k,
+        keychain::KeyResult::AccessDenied => {
+            // Keychain access denied — disable encryption
             // and remove the opt-in flag so user isn't stuck in a broken state
             if let Some(parent) = path.parent() {
                 let flag = parent.join(".encrypt-store");
@@ -125,6 +138,10 @@ fn encrypt_store_file(path: &Path) {
                     );
                 }
             }
+            return;
+        }
+        keychain::KeyResult::NotFound | keychain::KeyResult::Unavailable => {
+            // Key doesn't exist or keychain unavailable — can't encrypt
             return;
         }
     };
@@ -1026,7 +1043,8 @@ pub fn init_store(app: &AppHandle) -> Result<SettingsStore, String> {
             // Fallback to defaults when deserialization fails (e.g., corrupted store)
             // DON'T save - preserve original store in case it can be manually recovered
             // This prevents crashes from invalid values like negative integers in u32 fields
-            error!(
+            // Non-fatal — logged as warn (not error) so Sentry doesn't pick it up.
+            warn!(
                 "Failed to deserialize settings, using defaults (store not overwritten): {}",
                 e
             );
@@ -1096,7 +1114,8 @@ pub fn init_onboarding_store(app: &AppHandle) -> Result<OnboardingStore, String>
         Err(e) => {
             // Fallback to defaults when deserialization fails
             // DON'T save - preserve original store
-            error!(
+            // Non-fatal — logged as warn (not error) so Sentry doesn't pick it up.
+            warn!(
                 "Failed to deserialize onboarding, using defaults (store not overwritten): {}",
                 e
             );

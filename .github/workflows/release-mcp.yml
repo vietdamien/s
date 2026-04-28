@@ -26,21 +26,21 @@ jobs:
           registry-url: "https://registry.npmjs.org"
 
       - name: Install dependencies
-        working-directory: crates/screenpipe-connect/screenpipe-mcp
+        working-directory: packages/screenpipe-mcp
         run: npm install
 
       - name: Build
-        working-directory: crates/screenpipe-connect/screenpipe-mcp
+        working-directory: packages/screenpipe-mcp
         run: npm run build
 
       - name: Publish to npm
-        working-directory: crates/screenpipe-connect/screenpipe-mcp
+        working-directory: packages/screenpipe-mcp
         run: npm publish --access public || echo "npm publish failed (version may already exist) — continuing"
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Sync manifest.json version from package.json
-        working-directory: crates/screenpipe-connect/screenpipe-mcp
+        working-directory: packages/screenpipe-mcp
         run: |
           VER=$(node -p "require('./package.json').version")
           jq --arg v "$VER" '.version = $v' manifest.json > manifest.tmp && mv manifest.tmp manifest.json
@@ -50,12 +50,12 @@ jobs:
         run: npm install -g @anthropic-ai/mcpb
 
       - name: Build mcpb bundle
-        working-directory: crates/screenpipe-connect/screenpipe-mcp
+        working-directory: packages/screenpipe-mcp
         run: mcpb pack
 
       - name: Get version
         id: version
-        working-directory: crates/screenpipe-connect/screenpipe-mcp
+        working-directory: packages/screenpipe-mcp
         run: |
           if [[ "$GITHUB_REF" == refs/tags/* ]]; then
             echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
@@ -76,6 +76,6 @@ jobs:
             --title "MCP Server $TAG" \
             --generate-notes \
             --prerelease \
-            crates/screenpipe-connect/screenpipe-mcp/screenpipe-mcp.mcpb \
+            packages/screenpipe-mcp/screenpipe-mcp.mcpb \
             || gh release upload "$TAG" \
-            crates/screenpipe-connect/screenpipe-mcp/screenpipe-mcp.mcpb --clobber
+            packages/screenpipe-mcp/screenpipe-mcp.mcpb --clobber

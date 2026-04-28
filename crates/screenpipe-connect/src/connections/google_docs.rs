@@ -17,11 +17,13 @@ static OAUTH: OAuthConfig = OAuthConfig {
     extra_auth_params: &[
         (
             "scope",
-            // documents.readonly — read full document content and structure
-            // drive.readonly — list and search documents via Drive API
+            // documents — read and write full document content and structure
+            // drive.file — create files + access files the user explicitly
+            //   opens with screenpipe (does NOT grant whole-Drive access;
+            //   this is intentional privacy design)
             // userinfo.email — identify the connected account for multi-instance
-            "https://www.googleapis.com/auth/documents.readonly \
-             https://www.googleapis.com/auth/drive.readonly \
+            "https://www.googleapis.com/auth/documents \
+             https://www.googleapis.com/auth/drive.file \
              https://www.googleapis.com/auth/userinfo.email",
         ),
         ("access_type", "offline"),
@@ -35,13 +37,17 @@ static DEF: IntegrationDef = IntegrationDef {
     name: "Google Docs",
     icon: "google-docs",
     category: Category::Productivity,
-    description: "Read-only access to Google Docs — full document content and Drive search. \
+    description: "Read and write access to Google Docs — full document content, \
+        Drive search (limited to app-created or app-opened files), and document \
+        creation/editing. \
         Proxy base: /connections/google-docs/proxy. \
         Useful endpoints: \
         GET /connections/google-docs/proxy/docs/v1/documents/{documentId} — fetch full document content (paragraphs, tables, headings). \
-        GET /connections/google-docs/proxy/drive/v3/files?q=mimeType='application/vnd.google-apps.document' — list all Google Docs. \
-        GET /connections/google-docs/proxy/drive/v3/files?q=fullText+contains+'query'+and+mimeType='application/vnd.google-apps.document' — full-text search across all Docs. \
-        GET /connections/google-docs/proxy/drive/v3/files/{fileId}/export?mimeType=text/plain — export a Doc as plain text.",
+        POST /connections/google-docs/proxy/docs/v1/documents — create a new Google Doc (body: {\"title\":\"...\"}). \
+        POST /connections/google-docs/proxy/docs/v1/documents/{documentId}:batchUpdate — edit an existing doc (requests: insertText, updateTextStyle, etc.). \
+        GET /connections/google-docs/proxy/drive/v3/files?q=mimeType='application/vnd.google-apps.document' — list Docs the app created or the user opened with screenpipe. \
+        GET /connections/google-docs/proxy/drive/v3/files/{fileId}/export?mimeType=text/plain — export a Doc as plain text. \
+        Uses drive.file scope — only files the user explicitly opens with screenpipe (e.g. by pasting a Doc URL) or that screenpipe creates are visible; this is intentional privacy design.",
     fields: &[],
 };
 

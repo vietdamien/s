@@ -339,7 +339,7 @@ function IntegrationCard({
 
   return (
     <div
-      className={`relative flex flex-col gap-1.5 border p-3 transition-colors duration-500 overflow-hidden ${
+      className={`relative flex flex-col gap-1.5 border p-3 transition-colors duration-500 overflow-hidden h-full ${
         isConnected
           ? "border-foreground/50 bg-foreground/[0.03]"
           : "border-border/50"
@@ -796,10 +796,11 @@ export default function ConnectApps({ handleNextSlide }: ConnectAppsProps) {
         /* Pro layout: pro section + divider + free section */
         <div className="w-full flex flex-col gap-3">
           {/* Pro cards */}
-          <div className="grid grid-cols-3 gap-2 w-full">
+          <div className="grid grid-cols-3 gap-2 w-full auto-rows-fr">
             {PRO_INTEGRATIONS.map((integration, i) => (
               <motion.div
                 key={integration.cardKey}
+                className="h-full"
                 initial={{ opacity: 0, y: 8 }}
                 animate={{ opacity: 1, y: 0 }}
                 transition={{ delay: 0.2 + i * 0.06, duration: 0.3 }}
@@ -831,10 +832,11 @@ export default function ConnectApps({ handleNextSlide }: ConnectAppsProps) {
           </motion.div>
 
           {/* Free cards */}
-          <div className="grid grid-cols-3 gap-2 w-full">
+          <div className="grid grid-cols-3 gap-2 w-full auto-rows-fr">
             {PRO_FREE_SECTION.map((integration, i) => (
               <motion.div
                 key={integration.cardKey}
+                className="h-full"
                 initial={{ opacity: 0, y: 8 }}
                 animate={{ opacity: 1, y: 0 }}
                 transition={{ delay: 0.42 + i * 0.06, duration: 0.3 }}
@@ -856,10 +858,11 @@ export default function ConnectApps({ handleNextSlide }: ConnectAppsProps) {
       ) : (
         /* Free layout: 2×2 — Cursor, Gmail (locked teaser), ChatGPT, Claude */
         <>
-          <div className="grid grid-cols-2 gap-2 w-full">
+          <div className="grid grid-cols-2 gap-2 w-full auto-rows-fr">
             {FREE_USER_ORDER.map((integration, i) => (
               <motion.div
                 key={integration.cardKey}
+                className="h-full"
                 initial={{ opacity: 0, y: 8 }}
                 animate={{ opacity: 1, y: 0 }}
                 transition={{ delay: 0.2 + i * 0.06, duration: 0.3 }}

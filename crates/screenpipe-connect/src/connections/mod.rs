@@ -11,6 +11,7 @@ pub mod airtable;
 pub mod asana;
 pub mod bitrix24;
 pub mod brex;
+pub mod browser;
 pub mod calcom;
 pub mod calendly;
 pub mod clickup;
@@ -44,6 +45,7 @@ pub mod obsidian;
 pub mod otter;
 pub mod perplexity;
 pub mod pipedrive;
+pub mod pocket;
 pub mod pushover;
 pub mod quickbooks;
 pub mod resend;
@@ -189,6 +191,7 @@ pub fn all_integrations() -> Vec<Box<dyn Integration>> {
         Box::new(hubspot::HubSpot),
         Box::new(bitrix24::Bitrix24),
         Box::new(limitless::Limitless),
+        Box::new(pocket::Pocket),
         Box::new(airtable::Airtable),
         Box::new(logseq::Logseq),
         Box::new(pushover::Pushover),
